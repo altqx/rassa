@@ -1,0 +1,415 @@
+use rassa_core::{ass, Rect, RassaError, RassaResult};
+use rassa_fonts::{FontMatch, FontProvider, FontQuery};
+use rassa_parse::{parse_dialogue_text, ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedSpanStyle, ParsedSpanTransform, ParsedTrack, ParsedVectorClip};
+use rassa_shape::{GlyphInfo, ShapeEngine, ShapeRequest, ShapingMode};
+use rassa_unicode::BidiDirection;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LayoutGlyphRun {
+    pub text: String,
+    pub direction: BidiDirection,
+    pub font_family: String,
+    pub font: FontMatch,
+    pub glyphs: Vec<GlyphInfo>,
+    pub width: f32,
+    pub style: ParsedSpanStyle,
+    pub transforms: Vec<ParsedSpanTransform>,
+    pub karaoke: Option<ParsedKaraokeSpan>,
+    pub drawing: Option<ParsedDrawing>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LayoutLine {
+    pub event_index: usize,
+    pub style_index: usize,
+    pub text: String,
+    pub direction: BidiDirection,
+    pub glyph_count: usize,
+    pub width: f32,
+    pub runs: Vec<LayoutGlyphRun>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LayoutEvent {
+    pub event_index: usize,
+    pub style_index: usize,
+    pub text: String,
+    pub font_family: String,
+    pub font: FontMatch,
+    pub alignment: i32,
+    pub justify: i32,
+    pub margin_l: i32,
+    pub margin_r: i32,
+    pub margin_v: i32,
+    pub position: Option<(i32, i32)>,
+    pub movement: Option<ParsedMovement>,
+    pub fade: Option<ParsedFade>,
+    pub clip_rect: Option<Rect>,
+    pub vector_clip: Option<ParsedVectorClip>,
+    pub inverse_clip: bool,
+    pub lines: Vec<LayoutLine>,
+}
+
+#[derive(Default)]
+pub struct LayoutEngine {
+    shaper: ShapeEngine,
+}
+
+impl LayoutEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn layout_track_event_with_mode<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        event_index: usize,
+        provider: &P,
+        shaping_mode: ShapingMode,
+    ) -> RassaResult<LayoutEvent> {
+        let event = track
+            .events
+            .get(event_index)
+            .ok_or_else(|| RassaError::new(format!("event index {event_index} out of range")))?;
+        let style_index = normalize_style_index(track, event);
+        let style = track.styles.get(style_index).unwrap_or(&track.styles[track.default_style as usize]);
+        let parsed_text = parse_dialogue_text(&event.text, style, &track.styles);
+        let font = provider.resolve(&FontQuery {
+            family: style.font_name.clone(),
+            style: None,
+        });
+        let lines = parsed_text
+            .lines
+            .iter()
+            .map(|line| layout_line_from_text(event_index, style_index, line, provider, &self.shaper, &track.language, shaping_mode))
+            .collect::<RassaResult<Vec<_>>>()?;
+
+        Ok(LayoutEvent {
+            event_index,
+            style_index,
+            text: parsed_text.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"),
+            font_family: font.family.clone(),
+            font: font.clone(),
+            alignment: parsed_text.alignment.unwrap_or(style.alignment),
+            justify: normalize_justify(style.justify, style.alignment),
+            margin_l: resolve_margin(event.margin_l, style.margin_l),
+            margin_r: resolve_margin(event.margin_r, style.margin_r),
+            margin_v: resolve_margin(event.margin_v, style.margin_v),
+            position: parsed_text.position,
+            movement: parsed_text.movement,
+            fade: parsed_text.fade,
+            clip_rect: parsed_text.clip_rect,
+            vector_clip: parsed_text.vector_clip,
+            inverse_clip: parsed_text.inverse_clip,
+            lines,
+        })
+    }
+
+    pub fn layout_track_event<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        event_index: usize,
+        provider: &P,
+    ) -> RassaResult<LayoutEvent> {
+        self.layout_track_event_with_mode(track, event_index, provider, ShapingMode::Complex)
+    }
+}
+
+fn layout_line_from_text<P: FontProvider>(
+    event_index: usize,
+    style_index: usize,
+    line: &rassa_parse::ParsedTextLine,
+    provider: &P,
+    shaper: &ShapeEngine,
+    language: &str,
+    shaping_mode: ShapingMode,
+) -> RassaResult<LayoutLine> {
+    let mut runs = Vec::new();
+    let mut line_direction = BidiDirection::LeftToRight;
+    for span in &line.spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        let font = provider.resolve(&FontQuery {
+            family: span.style.font_name.clone(),
+            style: font_style_name(&span.style),
+        });
+        if let Some(drawing) = &span.drawing {
+            let width = drawing.bounds().map(|bounds| bounds.width() as f32).unwrap_or_default();
+            runs.push(LayoutGlyphRun {
+                text: span.text.clone(),
+                direction: line_direction,
+                font_family: font.family.clone(),
+                font: font.clone(),
+                glyphs: Vec::new(),
+                width,
+                style: span.style.clone(),
+                transforms: span.transforms.clone(),
+                karaoke: span.karaoke,
+                drawing: Some(drawing.clone()),
+            });
+            continue;
+        }
+        let shaped = shaper.shape_text(
+            provider,
+            &ShapeRequest::new(&span.text, &span.style.font_name)
+                .with_style(font_style_name(&span.style).unwrap_or_default())
+                .with_language(language)
+                .with_mode(shaping_mode),
+        )?;
+        for shaped_run in shaped.runs {
+            line_direction = shaped_run.direction;
+            runs.push(LayoutGlyphRun {
+                text: shaped_run.text,
+                direction: shaped_run.direction,
+                font_family: font.family.clone(),
+                font: font.clone(),
+                width: shaped_run.glyphs.iter().map(|glyph| glyph.x_advance).sum(),
+                glyphs: shaped_run.glyphs,
+                style: span.style.clone(),
+                transforms: span.transforms.clone(),
+                karaoke: span.karaoke,
+                drawing: None,
+            });
+        }
+    }
+
+    let glyph_count = runs.iter().map(|run| run.glyphs.len()).sum();
+    let width = runs.iter().map(|run| run.width).sum();
+    Ok(LayoutLine {
+        event_index,
+        style_index,
+        text: line.text.clone(),
+        direction: line_direction,
+        glyph_count,
+        width,
+        runs,
+    })
+}
+
+fn font_style_name(style: &ParsedSpanStyle) -> Option<String> {
+    match (style.bold, style.italic) {
+        (true, true) => Some("Bold Italic".to_string()),
+        (true, false) => Some("Bold".to_string()),
+        (false, true) => Some("Italic".to_string()),
+        (false, false) => None,
+    }
+}
+
+fn normalize_style_index(track: &ParsedTrack, event: &ParsedEvent) -> usize {
+    if track.styles.is_empty() {
+        return 0;
+    }
+
+    let candidate = usize::try_from(event.style).unwrap_or(0);
+    if candidate < track.styles.len() {
+        candidate
+    } else {
+        usize::try_from(track.default_style)
+            .ok()
+            .filter(|index| *index < track.styles.len())
+            .unwrap_or(0)
+    }
+}
+
+fn resolve_margin(event_margin: i32, style_margin: i32) -> i32 {
+    if event_margin == 0 { style_margin } else { event_margin }
+}
+
+fn normalize_justify(justify: i32, alignment: i32) -> i32 {
+    if justify != ass::ASS_JUSTIFY_AUTO {
+        return justify;
+    }
+
+    match alignment & 0x3 {
+        ass::HALIGN_LEFT => ass::ASS_JUSTIFY_LEFT,
+        ass::HALIGN_RIGHT => ass::ASS_JUSTIFY_RIGHT,
+        _ => ass::ASS_JUSTIFY_CENTER,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rassa_fonts::{FontconfigProvider, NullFontProvider};
+    use rassa_parse::{parse_script_text, ParsedKaraokeMode, ParsedTrack};
+
+    fn parse_track(input: &str) -> ParsedTrack {
+        parse_script_text(input).expect("script should parse")
+    }
+
+    #[test]
+    fn layout_uses_style_font_and_event_margins() {
+        let track = parse_track("[Script Info]\nLanguage: en\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding, Justify\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,11,12,13,1,0\nStyle: Sign,DejaVu Sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,9,21,22,23,1,0\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Sign,,0030,0000,0040,,Visible text");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.style_index, 1);
+        assert_eq!(layout.font_family, "DejaVu Sans");
+        assert_eq!(layout.margin_l, 30);
+        assert_eq!(layout.margin_r, 22);
+        assert_eq!(layout.margin_v, 40);
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].glyph_count, "Visible text".chars().count());
+        assert_eq!(layout.lines[0].runs.len(), 1);
+    }
+
+    #[test]
+    fn layout_splits_lines_on_mandatory_breaks() {
+        let mut track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,seed");
+        track.events[0].text = "a\nb".to_string();
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].text, "a");
+        assert_eq!(layout.lines[1].text, "b");
+    }
+
+    #[test]
+    fn layout_applies_font_override_runs() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\fnDejaVu Sans}Hello{\\fnArial} world");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].runs.len(), 2);
+        assert_eq!(layout.lines[0].runs[0].style.font_name, "DejaVu Sans");
+        assert_eq!(layout.lines[0].runs[1].style.font_name, "Arial");
+    }
+
+    #[test]
+    fn layout_carries_clip_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\iclip(10,20,30,40)}Clip");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.clip_rect, Some(Rect { x_min: 10, y_min: 20, x_max: 30, y_max: 40 }));
+        assert!(layout.vector_clip.is_none());
+        assert!(layout.inverse_clip);
+    }
+
+    #[test]
+    fn layout_carries_vector_clip_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\clip(m 0 0 l 8 0 8 8 0 8)}Clip");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert!(layout.clip_rect.is_none());
+        assert!(layout.vector_clip.is_some());
+        assert!(!layout.inverse_clip);
+    }
+
+    #[test]
+    fn layout_carries_move_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\move(1,2,3,4,50,150)}Move");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.movement, Some(ParsedMovement {
+            start: (1, 2),
+            end: (3, 4),
+            t1_ms: 50,
+            t2_ms: 150,
+        }));
+    }
+
+    #[test]
+    fn layout_carries_fade_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\fad(100,200)}Fade");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.fade, Some(ParsedFade::Simple {
+            fade_in_ms: 100,
+            fade_out_ms: 200,
+        }));
+    }
+
+    #[test]
+    fn layout_carries_full_fade_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\fade(10,20,30,40,50,60,70)}Fade");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.fade, Some(ParsedFade::Complex {
+            alpha1: 10,
+            alpha2: 20,
+            alpha3: 30,
+            t1_ms: 40,
+            t2_ms: 50,
+            t3_ms: 60,
+            t4_ms: 70,
+        }));
+    }
+
+    #[test]
+    fn layout_carries_karaoke_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\k10}Ka{\\k20}ra");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.lines[0].runs.len(), 2);
+        assert_eq!(layout.lines[0].runs[0].karaoke, Some(ParsedKaraokeSpan {
+            start_ms: 0,
+            duration_ms: 100,
+            mode: ParsedKaraokeMode::FillSwap,
+        }));
+        assert_eq!(layout.lines[0].runs[1].karaoke, Some(ParsedKaraokeSpan {
+            start_ms: 100,
+            duration_ms: 200,
+            mode: ParsedKaraokeMode::FillSwap,
+        }));
+    }
+
+    #[test]
+    fn layout_carries_transform_metadata() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H000000FF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\t(0,1000,\\bord4\\1c&H00112233&)}Hi");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.lines[0].runs[0].transforms.len(), 1);
+        assert_eq!(layout.lines[0].runs[0].transforms[0].style.border, Some(4.0));
+        assert_eq!(layout.lines[0].runs[0].transforms[0].style.primary_colour, Some(0x0011_2233));
+    }
+
+    #[test]
+    fn layout_carries_drawing_runs() {
+        let track = parse_track("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p1}m 0 0 l 8 0 8 8 0 8");
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine.layout_track_event(&track, 0, &provider).expect("layout should succeed");
+
+        assert_eq!(layout.lines[0].runs.len(), 1);
+        assert!(layout.lines[0].runs[0].drawing.is_some());
+        assert_eq!(layout.lines[0].runs[0].width, 9.0);
+    }
+
+    #[test]
+    fn layout_accepts_explicit_shaping_mode() {
+        let track = parse_track("[Script Info]\nLanguage: en\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,36,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,office");
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let simple = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("simple layout should succeed");
+        let complex = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Complex)
+            .expect("complex layout should succeed");
+
+        assert_eq!(simple.lines.len(), 1);
+        assert_eq!(complex.lines.len(), 1);
+        assert_eq!(simple.lines[0].text, "office");
+        assert_eq!(complex.lines[0].text, "office");
+    }
+}

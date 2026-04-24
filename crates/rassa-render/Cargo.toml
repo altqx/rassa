@@ -1,0 +1,17 @@
+[package]
+name = "rassa-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rassa-core = { path = "../rassa-core" }
+rassa-fonts = { path = "../rassa-fonts" }
+rassa-layout = { path = "../rassa-layout" }
+rassa-parse = { path = "../rassa-parse" }
+rassa-raster = { path = "../rassa-raster" }
+rassa-shape = { path = "../rassa-shape" }
+
+[lib]
+path = "src/lib.rs"

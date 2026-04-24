@@ -1,0 +1,15 @@
+[package]
+name = "rassa-shape"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harfrust = "0.6.0"
+rassa-core = { path = "../rassa-core" }
+rassa-fonts = { path = "../rassa-fonts" }
+rassa-unicode = { path = "../rassa-unicode" }
+
+[lib]
+path = "src/lib.rs"

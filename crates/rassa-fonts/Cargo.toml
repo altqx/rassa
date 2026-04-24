@@ -1,0 +1,13 @@
+[package]
+name = "rassa-fonts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fontconfig = { package = "fontconfig-rs", version = "0.1.1" }
+freetype-rs = "0.38.0"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,25 @@
+[workspace]
+members = [
+	"crates/rassa-core",
+	"crates/rassa-parse",
+	"crates/rassa-unicode",
+	"crates/rassa-unibreak-sys",
+	"crates/rassa-unibreak",
+	"crates/rassa-fonts",
+	"crates/rassa-shape",
+	"crates/rassa-raster",
+	"crates/rassa-layout",
+	"crates/rassa-render",
+	"crates/rassa-capi",
+	"crates/rassa-test",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+rust-version = "1.85"
+
+[workspace.dependencies]
+libc = "0.2"
