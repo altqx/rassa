@@ -2,6 +2,53 @@
 
 Append new session entries at the top of this file.
 
+## 2026-04-28
+
+### Added This Session
+- Checked the current implementation stage against `master-plan.md`: the workspace is in late Component 9/10 with Component 11 validation started. The exported `rassa-capi` public function names now match the `libass/libass/ass.h` function inventory, but behavioral parity is still incomplete.
+- Implemented the next renderer-geometry parity gap from the previous session notes: `RendererConfig.storage` is now materially used by `rassa-render` when `pixel_aspect` is unset.
+- Added libass-aligned aspect derivation for storage/layout geometry: valid `LayoutResX`/`LayoutResY` takes precedence over both API storage size and explicit pixel aspect, otherwise valid `ass_set_storage_size` contributes to default pixel-aspect calculation from the frame content ratio.
+- Added renderer regression coverage for storage-derived aspect behavior and `LayoutRes*` precedence, plus a C ABI regression proving `ass_set_storage_size` changes rendered output through `ass_render_frame`.
+- Added a first pass at libass-style content-area mapping for configured margins when `use_margins` is disabled: render output now scales into the frame content area and applies left/top margin offsets instead of treating margins as clip-only metadata.
+- Added renderer and C ABI regression coverage for default margin mapping through `ass_set_margins`, `ass_set_use_margins`, and `ass_render_frame`.
+- Aligned C API shaper defaults and invalid-input behavior with upstream libass: renderers now default to complex shaping, and unsupported `ass_set_shaper` values normalize to complex instead of simple.
+- Extended C ABI shaping coverage to assert invalid shaper values render identically to explicit complex shaping.
+- Aligned more renderer-setting sanitization with upstream libass: invalid frame/storage size pairs now reset both dimensions, and negative pixel aspect values reset to default.
+- Added C ABI regressions for invalid frame size reset, invalid storage size reset, and negative pixel-aspect reset behavior.
+- Implemented the `ass_track_set_feature` post-render lock from the public `ass.h` contract: feature changes now return `-1` after a track has been rendered.
+- Added C ABI coverage for feature locking after `ass_render_frame`.
+- Aligned active-event/image ordering with upstream libass by sorting active events by `Layer`, then `ReadOrder`, before layout and image-list assembly.
+- Added renderer and C ABI regressions proving lower-layer images are emitted first even when the lower-layer event appears later in the track.
+- Aligned font-provider C API behavior with `ass.h`: `ass_get_available_font_providers` now reports providers in libass order, unsupported `ass_set_fonts` provider IDs behave like `ASS_FONTPROVIDER_NONE`, and `default_font` is used as a final file fallback when provider lookup cannot resolve a face.
+- Added provider and C ABI regressions for available-provider ordering, invalid-provider fallback, and rendering through `default_font` while system providers are disabled.
+- Replaced the simplified `ass_step_sub` start-time lookup with libass' event-selection behavior, including backward movement based on event end times and movement `0` resolving the nearest earlier subtitle start.
+- Extended dynamic-event C ABI coverage for `ass_step_sub` backward stepping and movement `0` behavior.
+- Tightened `ass_set_check_readorder` to match upstream's documented/implemented behavior: only `1` enables read-order checking, while other values disable it.
+- Extended C ABI read-order coverage for a non-`1` value.
+- Reworked per-event renderer output ordering to follow libass' `render_text` order: all shadow images first, then outlines, then character images, while keeping event ordering by `Layer` and `ReadOrder`.
+- Added renderer and C ABI regressions for within-event `ASS_Image` ordering.
+- Added first-pass `ScaledBorderAndShadow: no` compensation so border, shadow, and blur radii stay closer to device-space size when output geometry is scaled.
+- Added renderer regression coverage proving disabled scaled-border mode produces a smaller outline footprint under a 2x frame scale.
+- Improved raster behavior: glyph bitmaps are now cached by font path, glyph id, pixel size, and hinting mode; outline expansion uses a rounder mask; blur now expands bitmap bounds instead of only softening inside the original glyph box.
+- Added raster regressions for cache reuse and expanded blur bounds.
+
+### Verified
+- `cargo test` passes for the whole workspace after the storage-size, margin geometry, C API shaper, setting sanitization, feature-lock, image-ordering, font-provider, dynamic-event, scaled-border, output-ordering, and raster cache/blur updates.
+- Targeted font-provider tests pass: `cargo test -p rassa-test capi_available_font_providers_match_libass_order`, `cargo test -p rassa-test capi_invalid_font_provider_behaves_like_none`, `cargo test -p rassa-fonts default_font_file_provider_falls_back_to_configured_path`, and `cargo test -p rassa-test capi_default_font_path_renders_when_system_providers_are_disabled`.
+- Targeted dynamic-event test passes: `cargo test -p rassa-test capi_chunk_and_prune_manage_event_timeline`.
+- Targeted read-order test passes: `cargo test -p rassa-test capi_check_readorder_affects_chunk_insertions`.
+- Targeted renderer/raster tests pass: `cargo test -p rassa-render`, `cargo test -p rassa-raster`, and `cargo test -p rassa-test capi_render_frame_orders_shadow_outline_before_character`.
+
+### Current Gaps
+- Renderer geometry is improved, but still not fully libass-equivalent: full `use_margins` placement semantics, script-to-screen mapping, exact PAR compensation, exact libass `ScaledBorderAndShadow` anisotropic scaling, and explicit-position edge cases still need a deeper upstream-parity pass.
+- Event ordering now follows layer/read-order for image assembly, but collision handling remains basic and does not yet mirror libass' full per-layer collision placement and stacking behavior.
+- Font-provider parity is improved for C API defaults, invalid provider IDs, attachments, and default file fallback, but provider coverage is still Linux-first and lacks CoreText/DirectWrite backends.
+- Drawing, clipping, transform, karaoke, and raster behavior are broader than before, but still need upstream pixel-diff validation and exact libass outline stroking/blur/composite-cache parity.
+- Validation is still partial: there are corpus-backed smoke tests and ABI regressions, but no automated pixel-diff harness against upstream libass outputs, fuzz/property coverage, or generated parity report.
+
+### Recommended Next Step
+- Continue Component 11 by adding an upstream render diff harness for `libass/compare/test` fixtures, or continue the renderer-geometry branch by aligning full `use_margins` placement and `ScaledBorderAndShadow` scaling semantics with upstream `ass_render.c`.
+
 ## 2026-04-24
 
 ### Added This Session

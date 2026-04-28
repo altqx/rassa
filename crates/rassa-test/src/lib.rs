@@ -47,6 +47,7 @@ fn summarize_planes(planes: &[rassa_core::ImagePlane]) -> Vec<PlaneSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rassa_fonts::FontProvider;
     use std::{env, ffi::{c_char, CString}, fs, path::PathBuf, ptr, time::{SystemTime, UNIX_EPOCH}};
 
     const INLINE_OVERRIDE_FIXTURE: &str = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,36,&H00112233,&H00445566,&H000A0B0C,&H00101010,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)\\t(0,1000,\\1c&H00223344&)}{\\K100}Test";
@@ -100,6 +101,23 @@ mod tests {
         if min_y == i32::MAX { 0 } else { max_y - min_y }
     }
 
+    fn image_bounds(mut image: *mut rassa_capi::ASS_Image) -> Option<(i32, i32, i32, i32)> {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        unsafe {
+            while !image.is_null() {
+                min_x = min_x.min((*image).dst_x);
+                min_y = min_y.min((*image).dst_y);
+                max_x = max_x.max((*image).dst_x + (*image).w);
+                max_y = max_y.max((*image).dst_y + (*image).h);
+                image = (*image).next;
+            }
+        }
+        (min_x != i32::MAX).then_some((min_x, min_y, max_x, max_y))
+    }
+
     fn image_colors(mut image: *mut rassa_capi::ASS_Image) -> Vec<u32> {
         let mut colors = Vec::new();
         unsafe {
@@ -109,6 +127,17 @@ mod tests {
             }
         }
         colors
+    }
+
+    fn image_types(mut image: *mut rassa_capi::ASS_Image) -> Vec<i32> {
+        let mut types = Vec::new();
+        unsafe {
+            while !image.is_null() {
+                types.push((*image).type_);
+                image = (*image).next;
+            }
+        }
+        types
     }
     
     fn image_signatures(mut image: *mut rassa_capi::ASS_Image) -> Vec<(u32, i32, i32, i32, i32, Vec<u8>)> {
@@ -238,7 +267,9 @@ mod tests {
 
             assert_eq!((*track).n_events, 2);
             assert_eq!(rassa_capi::ass_step_sub(track, 1200, 1), 1800);
-            assert_eq!(rassa_capi::ass_step_sub(track, 3200, -1), -200);
+            assert_eq!(rassa_capi::ass_step_sub(track, 3200, -1), -2200);
+            assert_eq!(rassa_capi::ass_step_sub(track, 3200, 0), -200);
+            assert_eq!(rassa_capi::ass_step_sub(track, 3600, -2), -2600);
 
             rassa_capi::ass_prune_events(track, 2000);
 
@@ -314,6 +345,69 @@ mod tests {
     }
 
     #[test]
+    fn capi_render_frame_orders_images_by_layer_then_read_order() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 5,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\1c&H0000FF&}High\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,40)\\1c&H00FF00&}Low";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let colors = image_colors(images);
+
+            assert_eq!(colors.first().copied(), Some(0x0000_FF00));
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_orders_shadow_outline_before_character() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00111111,&H0000FFFF,&H00222222,&H00333333,0,0,0,0,100,100,0,0,1,2,2,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}Hi";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let types = image_types(images);
+            let first_shadow = types
+                .iter()
+                .position(|type_| *type_ == ass::ImageType::Shadow as i32)
+                .expect("shadow image");
+            let first_outline = types
+                .iter()
+                .position(|type_| *type_ == ass::ImageType::Outline as i32)
+                .expect("outline image");
+            let first_character = types
+                .iter()
+                .position(|type_| *type_ == ass::ImageType::Character as i32)
+                .expect("character image");
+
+            assert!(first_shadow < first_outline);
+            assert!(first_outline < first_character);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
     fn capi_font_scale_changes_rendered_image_size() {
         unsafe {
             let library = rassa_capi::ass_library_init();
@@ -372,6 +466,36 @@ mod tests {
     }
 
     #[test]
+    fn capi_invalid_frame_size_resets_both_dimensions() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_signature = image_signatures(baseline);
+
+            rassa_capi::ass_set_frame_size(renderer, 640, 360);
+            let scaled = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            assert_ne!(image_signatures(scaled), baseline_signature);
+
+            rassa_capi::ass_set_frame_size(renderer, -1, 360);
+            let reset = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            assert_eq!(image_signatures(reset), baseline_signature);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
     fn capi_pixel_aspect_widens_rendered_output() {
         unsafe {
             let library = rassa_capi::ass_library_init();
@@ -394,6 +518,104 @@ mod tests {
 
             assert!(baseline_area > 0);
             assert!(widened_area > baseline_area);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_negative_pixel_aspect_resets_to_default() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            rassa_capi::ass_set_frame_size(renderer, 640, 180);
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_signature = image_signatures(baseline);
+
+            rassa_capi::ass_set_pixel_aspect(renderer, 2.0);
+            let widened = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            assert_ne!(image_signatures(widened), baseline_signature);
+
+            rassa_capi::ass_set_pixel_aspect(renderer, -2.0);
+            let reset = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            assert_eq!(image_signatures(reset), baseline_signature);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_storage_size_affects_default_aspect_mapping() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(0,0)}Storage";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            rassa_capi::ass_set_frame_size(renderer, 400, 240);
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_area = total_image_area(baseline);
+            let baseline_signature = image_signatures(baseline);
+
+            rassa_capi::ass_set_storage_size(renderer, 400, 120);
+            let storage_adjusted = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let storage_adjusted_area = total_image_area(storage_adjusted);
+
+            assert!(baseline_area > 0);
+            assert!(storage_adjusted_area < baseline_area);
+
+            rassa_capi::ass_set_storage_size(renderer, 400, -1);
+            let reset = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            assert_eq!(image_signatures(reset), baseline_signature);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_margins_map_output_into_content_area_by_default() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let fixture = "[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(0,0)}I";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            rassa_capi::ass_set_frame_size(renderer, 120, 120);
+            rassa_capi::ass_set_margins(renderer, 10, 10, 10, 10);
+            rassa_capi::ass_set_use_margins(renderer, 0);
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let bounds = image_bounds(images).expect("rendered image bounds");
+
+            assert!(bounds.0 >= 10);
+            assert!(bounds.1 >= 10);
+            assert!(bounds.2 <= 110);
+            assert!(bounds.3 <= 110);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -561,6 +783,157 @@ mod tests {
     }
 
     #[test]
+    fn capi_available_font_providers_match_libass_order() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let mut providers = ptr::null_mut();
+            let mut size = 0usize;
+
+            rassa_capi::ass_get_available_font_providers(library, &mut providers, &mut size);
+
+            assert!(!providers.is_null());
+            assert_eq!(size, 3);
+            let values = std::slice::from_raw_parts(providers, size);
+            assert_eq!(
+                values,
+                &[
+                    ass::DefaultFontProvider::None as i32,
+                    ass::DefaultFontProvider::Autodetect as i32,
+                    ass::DefaultFontProvider::Fontconfig as i32,
+                ]
+            );
+
+            rassa_capi::ass_free(providers.cast());
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_invalid_font_provider_behaves_like_none() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_read_memory(
+                library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+            let none_renderer = rassa_capi::ass_renderer_init(library);
+            let invalid_renderer = rassa_capi::ass_renderer_init(library);
+
+            rassa_capi::ass_set_fonts(
+                none_renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as i32,
+                ptr::null(),
+                0,
+            );
+            rassa_capi::ass_set_fonts(
+                invalid_renderer,
+                ptr::null(),
+                ptr::null(),
+                99,
+                ptr::null(),
+                0,
+            );
+
+            let mut none_change = 0;
+            let none_images = rassa_capi::ass_render_frame(none_renderer, track, 500, &mut none_change);
+            let none_signature = image_signatures(none_images);
+            let mut invalid_change = 0;
+            let invalid_images = rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
+
+            assert!(none_change > 0);
+            assert!(invalid_change > 0);
+            assert_eq!(image_signatures(invalid_images), none_signature);
+
+            rassa_capi::ass_renderer_done(none_renderer);
+            rassa_capi::ass_renderer_done(invalid_renderer);
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_default_font_path_renders_when_system_providers_are_disabled() {
+        let system_font = FontconfigProvider::new()
+            .resolve_family("sans")
+            .path
+            .expect("system font path should exist");
+        let default_font = CString::new(system_font.to_string_lossy().as_bytes()).expect("font path cstring");
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_read_memory(
+                library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+            let no_default_renderer = rassa_capi::ass_renderer_init(library);
+            let default_renderer = rassa_capi::ass_renderer_init(library);
+
+            rassa_capi::ass_set_fonts(
+                no_default_renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as i32,
+                ptr::null(),
+                0,
+            );
+            rassa_capi::ass_set_fonts(
+                default_renderer,
+                default_font.as_ptr(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as i32,
+                ptr::null(),
+                0,
+            );
+
+            let mut no_default_change = 0;
+            let no_default_images = rassa_capi::ass_render_frame(no_default_renderer, track, 500, &mut no_default_change);
+            let mut default_change = 0;
+            let default_images = rassa_capi::ass_render_frame(default_renderer, track, 500, &mut default_change);
+
+            assert!(no_default_change > 0);
+            assert!(default_change > 0);
+            assert!(image_signatures(no_default_images).is_empty());
+            assert!(!image_signatures(default_images).is_empty());
+
+            rassa_capi::ass_renderer_done(no_default_renderer);
+            rassa_capi::ass_renderer_done(default_renderer);
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_track_features_are_locked_after_rendering() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 0, 1), 0);
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            assert!(!images.is_null());
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 0, 0), -1);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
     fn capi_alloc_and_free_style_event_slots_reset_state() {
         unsafe {
             let library = rassa_capi::ass_library_init();
@@ -611,6 +984,10 @@ mod tests {
             rassa_capi::ass_set_check_readorder(track, 1);
             rassa_capi::ass_process_chunk(track, b"one".as_ptr() as *const c_char, 3, 1400, 100);
             assert_eq!((*(*track).events.add(2)).ReadOrder, 2);
+
+            rassa_capi::ass_set_check_readorder(track, 2);
+            rassa_capi::ass_process_chunk(track, b"two".as_ptr() as *const c_char, 3, 1600, 100);
+            assert_eq!((*(*track).events.add(3)).ReadOrder, 0);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -737,24 +1114,34 @@ mod tests {
             );
             let simple_renderer = rassa_capi::ass_renderer_init(library);
             let complex_renderer = rassa_capi::ass_renderer_init(library);
+            let invalid_renderer = rassa_capi::ass_renderer_init(library);
 
             rassa_capi::ass_set_shaper(simple_renderer, ass::ShapingLevel::Simple as i32);
             rassa_capi::ass_set_shaper(complex_renderer, ass::ShapingLevel::Complex as i32);
+            rassa_capi::ass_set_shaper(invalid_renderer, 99);
 
             let mut simple_change = 0;
             let simple = rassa_capi::ass_render_frame(simple_renderer, track, 500, &mut simple_change);
             let mut complex_change = 0;
             let complex = rassa_capi::ass_render_frame(complex_renderer, track, 500, &mut complex_change);
+            let complex_signature = image_signatures(complex);
+            let mut invalid_change = 0;
+            let invalid = rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
+            let invalid_signature = image_signatures(invalid);
 
             assert!(!simple.is_null());
             assert!(!complex.is_null());
+            assert!(!invalid.is_null());
             assert!(simple_change > 0);
             assert!(complex_change > 0);
+            assert!(invalid_change > 0);
             assert!(!image_signatures(simple).is_empty());
-            assert!(!image_signatures(complex).is_empty());
+            assert!(!complex_signature.is_empty());
+            assert_eq!(invalid_signature, complex_signature);
 
             rassa_capi::ass_renderer_done(simple_renderer);
             rassa_capi::ass_renderer_done(complex_renderer);
+            rassa_capi::ass_renderer_done(invalid_renderer);
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
         }

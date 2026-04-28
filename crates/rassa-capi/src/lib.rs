@@ -10,7 +10,10 @@ use std::{
 
 use libc::{free, malloc};
 use rassa_core::{ass, Margins, RendererConfig, Size};
-use rassa_fonts::{AttachedFontProvider, FontAttachment as ProviderFontAttachment, FontProvider, FontconfigProvider, MergedFontProvider, NullFontProvider};
+use rassa_fonts::{
+    AttachedFontProvider, DefaultFontFileProvider, FontAttachment as ProviderFontAttachment, FontProvider,
+    FontconfigProvider, MergedFontProvider, NullFontProvider,
+};
 use rassa_parse::{parse_script_bytes, ParsedAttachment, ParsedEvent, ParsedStyle, ParsedTrack};
 use rassa_render::RenderEngine;
 
@@ -202,6 +205,7 @@ struct TrackState {
     features: [bool; 4],
     check_readorder: bool,
     prune_delay: Option<i64>,
+    rendered: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -320,7 +324,7 @@ impl Default for ASS_Renderer {
             margins: [0; 4],
             use_margins: false,
             pixel_aspect: 0.0,
-            shaping: ass::ShapingLevel::Simple as c_int,
+            shaping: ass::ShapingLevel::Complex as c_int,
             font_scale: 1.0,
             hinting: ass::Hinting::None as c_int,
             line_spacing: 0.0,
@@ -462,6 +466,7 @@ pub unsafe extern "C" fn ass_renderer_done(priv_: *mut ASS_Renderer) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_set_frame_size(priv_: *mut ASS_Renderer, w: c_int, h: c_int) {
     if let Some(renderer) = priv_.as_mut() {
+        let (w, h) = sanitize_size_pair(w, h);
         renderer.frame_width = w;
         renderer.frame_height = h;
     }
@@ -470,6 +475,7 @@ pub unsafe extern "C" fn ass_set_frame_size(priv_: *mut ASS_Renderer, w: c_int, 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_set_storage_size(priv_: *mut ASS_Renderer, w: c_int, h: c_int) {
     if let Some(renderer) = priv_.as_mut() {
+        let (w, h) = sanitize_size_pair(w, h);
         renderer.storage_width = w;
         renderer.storage_height = h;
     }
@@ -478,7 +484,11 @@ pub unsafe extern "C" fn ass_set_storage_size(priv_: *mut ASS_Renderer, w: c_int
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_set_shaper(priv_: *mut ASS_Renderer, level: c_int) {
     if let Some(renderer) = priv_.as_mut() {
-        renderer.shaping = level;
+        renderer.shaping = if level == ass::ShapingLevel::Simple as c_int || level == ass::ShapingLevel::Complex as c_int {
+            level
+        } else {
+            ass::ShapingLevel::Complex as c_int
+        };
     }
 }
 
@@ -505,7 +515,7 @@ pub unsafe extern "C" fn ass_set_use_margins(priv_: *mut ASS_Renderer, use_margi
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_set_pixel_aspect(priv_: *mut ASS_Renderer, par: c_double) {
     if let Some(renderer) = priv_.as_mut() {
-        renderer.pixel_aspect = par;
+        renderer.pixel_aspect = if par < 0.0 { 0.0 } else { par };
     }
 }
 
@@ -557,9 +567,9 @@ pub unsafe extern "C" fn ass_get_available_font_providers(
     }
 
     let values = [
+        ass::DefaultFontProvider::None as c_int,
         ass::DefaultFontProvider::Autodetect as c_int,
         ass::DefaultFontProvider::Fontconfig as c_int,
-        ass::DefaultFontProvider::None as c_int,
     ];
     let allocation_size = mem::size_of_val(&values);
     let allocation = malloc(allocation_size) as *mut c_int;
@@ -628,6 +638,10 @@ pub unsafe extern "C" fn ass_render_frame(
     let Some(renderer) = priv_.as_mut() else {
         return ptr::null_mut();
     };
+
+    if let Some(state) = track_state_mut(track) {
+        state.rendered = true;
+    }
 
     if let Some(delay) = track_state_mut(track).and_then(|state| state.prune_delay) {
         ass_prune_events(track, now - delay);
@@ -705,6 +719,9 @@ pub unsafe extern "C" fn ass_track_set_feature(track: *mut ASS_Track, feature: c
     let Some(state) = track_state_mut(track) else {
         return -1;
     };
+    if state.rendered {
+        return -1;
+    }
     let Some(slot) = state.features.get_mut(feature as usize) else {
         return -1;
     };
@@ -840,7 +857,7 @@ pub unsafe extern "C" fn ass_process_chunk(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_set_check_readorder(track: *mut ASS_Track, check_readorder: c_int) {
     if let Some(state) = track_state_mut(track) {
-        state.check_readorder = check_readorder != 0;
+        state.check_readorder = check_readorder == 1;
     }
 }
 
@@ -983,22 +1000,27 @@ pub unsafe extern "C" fn ass_clear_fonts(library: *mut ASS_Library) {
 }
 
 fn build_font_provider(renderer: &ASS_Renderer, library: *mut ASS_Library) -> Box<dyn FontProvider> {
+    let has_system_provider = matches!(
+        renderer.default_provider,
+        value if value == ass::DefaultFontProvider::Autodetect as c_int
+            || value == ass::DefaultFontProvider::Fontconfig as c_int
+    );
     let system_provider: Box<dyn FontProvider> = match renderer.default_provider {
-        value if value == ass::DefaultFontProvider::None as c_int => Box::new(NullFontProvider),
-        _ => {
+        _ if has_system_provider => {
             if let Some(fallback_family) = renderer.default_family.as_deref() {
                 Box::new(FontconfigProvider::with_fallback_family(fallback_family))
             } else {
                 Box::new(FontconfigProvider::new())
             }
         }
+        _ => Box::new(NullFontProvider),
     };
 
     let Some(library) = (unsafe { library.as_ref() }) else {
-        return system_provider;
+        return wrap_default_font_path(system_provider, renderer);
     };
     if library.fonts.is_empty() {
-        return system_provider;
+        return wrap_default_font_path(system_provider, renderer);
     }
 
     let attachments = library
@@ -1015,9 +1037,24 @@ fn build_font_provider(renderer: &ASS_Renderer, library: *mut ASS_Library) -> Bo
         AttachedFontProvider::from_attachments(&attachments)
     };
 
-    match renderer.default_provider {
-        value if value == ass::DefaultFontProvider::None as c_int => Box::new(attached),
-        _ => Box::new(MergedFontProvider::new(attached, system_provider)),
+    let provider: Box<dyn FontProvider> = if has_system_provider {
+        Box::new(MergedFontProvider::new(attached, system_provider))
+    } else {
+        Box::new(attached)
+    };
+    wrap_default_font_path(provider, renderer)
+}
+
+fn wrap_default_font_path(provider: Box<dyn FontProvider>, renderer: &ASS_Renderer) -> Box<dyn FontProvider> {
+    let Some(default_font) = renderer.default_font.as_deref() else {
+        return provider;
+    };
+
+    let fallback = DefaultFontFileProvider::new(provider, default_font);
+    if let Some(default_family) = renderer.default_family.as_deref() {
+        Box::new(fallback.with_family(default_family))
+    } else {
+        Box::new(fallback)
     }
 }
 
@@ -1049,8 +1086,9 @@ fn renderer_config(renderer: &ASS_Renderer, track: &ParsedTrack) -> RendererConf
             _ => ass::Hinting::None,
         },
         shaping: match renderer.shaping {
+            value if value == ass::ShapingLevel::Simple as c_int => ass::ShapingLevel::Simple,
             value if value == ass::ShapingLevel::Complex as c_int => ass::ShapingLevel::Complex,
-            _ => ass::ShapingLevel::Simple,
+            _ => ass::ShapingLevel::Complex,
         },
     }
 }
@@ -1154,6 +1192,14 @@ unsafe fn apply_style_override(style: &mut ASS_Style, field_name: &str, value: &
     }
 }
 
+fn sanitize_size_pair(w: c_int, h: c_int) -> (c_int, c_int) {
+    if w <= 0 || h <= 0 || i64::from(w) > i64::from(c_int::MAX) / i64::from(h) {
+        (0, 0)
+    } else {
+        (w, h)
+    }
+}
+
 fn parse_override_i32(value: &str, default: i32) -> i32 {
     value.trim().parse::<i32>().unwrap_or(default)
 }
@@ -1190,24 +1236,52 @@ pub unsafe extern "C" fn ass_step_sub(track: *mut ASS_Track, now: i64, movement:
     let Some(track_ref) = track.as_ref() else {
         return 0;
     };
-    let starts = event_starts(track_ref);
-    if starts.is_empty() || movement == 0 {
+    if track_ref.events.is_null() || track_ref.n_events <= 0 {
         return 0;
     }
 
-    if movement > 0 {
-        let index = movement as usize - 1;
-        if let Some(target) = starts.into_iter().filter(|start| *start > now).nth(index) {
-            return target - now;
+    let events = slice::from_raw_parts(track_ref.events, track_ref.n_events as usize);
+    let direction = movement.signum();
+    let mut remaining = movement;
+    let mut target = now;
+    let mut best_start = None;
+
+    loop {
+        let mut closest = None;
+        let mut closest_time = now;
+        for event in events {
+            if direction < 0 {
+                let end = event.Start.saturating_add(event.Duration);
+                if end < target && closest.is_none_or(|_| end > closest_time) {
+                    closest = Some(event.Start);
+                    closest_time = end;
+                }
+            } else if direction > 0 {
+                let start = event.Start;
+                if start > target && closest.is_none_or(|_| start < closest_time) {
+                    closest = Some(start);
+                    closest_time = start;
+                }
+            } else {
+                let start = event.Start;
+                if start < target && closest.is_none_or(|_| start >= closest_time) {
+                    closest = Some(start);
+                    closest_time = start;
+                }
+            }
         }
-    } else {
-        let index = (-movement) as usize - 1;
-        if let Some(target) = starts.into_iter().rev().filter(|start| *start < now).nth(index) {
-            return target - now;
+
+        target = closest_time + i64::from(direction);
+        remaining -= direction;
+        if let Some(start) = closest {
+            best_start = Some(start);
+        }
+        if remaining == 0 {
+            break;
         }
     }
 
-    0
+    best_start.map_or(0, |start| start - now)
 }
 
 #[unsafe(no_mangle)]
@@ -1619,18 +1693,4 @@ unsafe fn parsed_event_from_ffi(event: &ASS_Event) -> ParsedEvent {
         effect: string_option_from_ptr(event.Effect).unwrap_or_default(),
         text: string_option_from_ptr(event.Text).unwrap_or_default(),
     }
-}
-
-unsafe fn event_starts(track: &ASS_Track) -> Vec<i64> {
-    if track.events.is_null() || track.n_events <= 0 {
-        return Vec::new();
-    }
-
-    let mut starts = slice::from_raw_parts(track.events, track.n_events as usize)
-        .iter()
-        .map(|event| event.Start)
-        .collect::<Vec<_>>();
-    starts.sort_unstable();
-    starts.dedup();
-    starts
 }

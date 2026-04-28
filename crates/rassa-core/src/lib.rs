@@ -23,7 +23,7 @@ pub mod ass {
     pub const FONT_WIDTH_EXPANDED: i32 = 125;
 
     #[repr(i32)]
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub enum Hinting {
         #[default]
         None = 0,

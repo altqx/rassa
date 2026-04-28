@@ -40,6 +40,7 @@ pub enum FontProviderKind {
     Null,
     Fontconfig,
     Attached,
+    DefaultFile,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -233,6 +234,43 @@ impl<P: FontProvider, S: FontProvider> FontProvider for MergedFontProvider<P, S>
     }
 }
 
+pub struct DefaultFontFileProvider<P> {
+    primary: P,
+    path: PathBuf,
+    family: Option<String>,
+}
+
+impl<P> DefaultFontFileProvider<P> {
+    pub fn new(primary: P, path: impl Into<PathBuf>) -> Self {
+        Self {
+            primary,
+            path: path.into(),
+            family: None,
+        }
+    }
+
+    pub fn with_family(mut self, family: impl Into<String>) -> Self {
+        self.family = Some(family.into());
+        self
+    }
+}
+
+impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
+    fn resolve(&self, query: &FontQuery) -> FontMatch {
+        let primary = self.primary.resolve(query);
+        if primary.path.is_some() {
+            return primary;
+        }
+
+        FontMatch {
+            family: self.family.clone().unwrap_or_else(|| query.family.clone()),
+            path: Some(self.path.clone()),
+            style: query.style.clone(),
+            provider: FontProviderKind::DefaultFile,
+        }
+    }
+}
+
 impl AttachedFontRecord {
     fn from_attachment(attachment: &FontAttachment, root: &Path, library: Option<&Library>) -> Option<Self> {
         if attachment.data.is_empty() {
@@ -362,5 +400,15 @@ mod tests {
 
         assert_eq!(result.provider, FontProviderKind::Fontconfig);
         assert!(result.path.is_some());
+    }
+
+    #[test]
+    fn default_font_file_provider_falls_back_to_configured_path() {
+        let provider = DefaultFontFileProvider::new(NullFontProvider, "/tmp/default-font.ttf").with_family("Default");
+        let result = provider.resolve(&FontQuery::new("missing"));
+
+        assert_eq!(result.provider, FontProviderKind::DefaultFile);
+        assert_eq!(result.family, "Default");
+        assert_eq!(result.path, Some(PathBuf::from("/tmp/default-font.ttf")));
     }
 }

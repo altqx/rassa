@@ -1,3 +1,9 @@
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
+
 use freetype::{face::LoadFlag, Bitmap, Library};
 use rassa_core::{ass, RassaError, RassaResult};
 use rassa_fonts::FontMatch;
@@ -51,6 +57,21 @@ pub struct Rasterizer {
     options: RasterOptions,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RasterCacheStats {
+    pub glyph_entries: usize,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct GlyphCacheKey {
+    path: PathBuf,
+    glyph_id: u32,
+    pixel_height: u32,
+    hinting: ass::Hinting,
+}
+
+static GLYPH_CACHE: OnceLock<Mutex<HashMap<GlyphCacheKey, RasterGlyph>>> = OnceLock::new();
+
 impl Rasterizer {
     pub fn new() -> Self {
         Self::default()
@@ -88,12 +109,28 @@ impl Rasterizer {
         let mut rasterized = Vec::with_capacity(glyphs.len());
         let load_flags = load_flags_for_hinting(self.options.hinting);
         for glyph in glyphs {
+            let cache_key = GlyphCacheKey {
+                path: font_path.clone(),
+                glyph_id: glyph.glyph_id,
+                pixel_height: self.options.pixel_height,
+                hinting: self.options.hinting,
+            };
+            if let Some(cached) = glyph_cache().lock().expect("glyph cache mutex poisoned").get(&cache_key).cloned() {
+                rasterized.push(RasterGlyph {
+                    cluster: glyph.cluster,
+                    advance_x: cached.advance_x,
+                    advance_y: cached.advance_y,
+                    ..cached
+                });
+                continue;
+            }
+
             face.load_char(glyph.glyph_id as usize, load_flags)
                 .map_err(|error| RassaError::new(format!("failed to load glyph {}: {error:?}", glyph.glyph_id)))?;
             let slot = face.glyph();
             let bitmap = slot.bitmap();
             let stride = bitmap.pitch().abs();
-            rasterized.push(RasterGlyph {
+            let rendered = RasterGlyph {
                 glyph_id: glyph.glyph_id,
                 cluster: glyph.cluster,
                 width: bitmap.width(),
@@ -105,7 +142,12 @@ impl Rasterizer {
                 advance_y: (slot.advance().y >> 6) as i32,
                 pixel_mode: classify_pixel_mode(&bitmap),
                 bitmap: copy_bitmap_rows(&bitmap),
-            });
+            };
+            glyph_cache()
+                .lock()
+                .expect("glyph cache mutex poisoned")
+                .insert(cache_key, rendered.clone());
+            rasterized.push(rendered);
         }
 
         Ok(rasterized)
@@ -122,6 +164,20 @@ impl Rasterizer {
     pub fn blur_glyphs(&self, glyphs: &[RasterGlyph], radius: u32) -> Vec<RasterGlyph> {
         glyphs.iter().map(|glyph| blur_glyph(glyph, radius)).collect()
     }
+
+    pub fn clear_cache() {
+        glyph_cache().lock().expect("glyph cache mutex poisoned").clear();
+    }
+
+    pub fn cache_stats() -> RasterCacheStats {
+        RasterCacheStats {
+            glyph_entries: glyph_cache().lock().expect("glyph cache mutex poisoned").len(),
+        }
+    }
+}
+
+fn glyph_cache() -> &'static Mutex<HashMap<GlyphCacheKey, RasterGlyph>> {
+    GLYPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn load_flags_for_hinting(hinting: ass::Hinting) -> LoadFlag {
@@ -170,6 +226,7 @@ fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {
     }
 
     let radius = radius as usize;
+    let radius_squared = (radius * radius) as i32;
     let width = glyph.width as usize;
     let height = glyph.height as usize;
     let stride = glyph.stride as usize;
@@ -183,8 +240,15 @@ fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {
             if value == 0 {
                 continue;
             }
-            for outline_y in y..=(y + radius * 2) {
-                for outline_x in x..=(x + radius * 2) {
+            let center_x = x + radius;
+            let center_y = y + radius;
+            for outline_y in center_y.saturating_sub(radius)..=(center_y + radius).min(new_height - 1) {
+                for outline_x in center_x.saturating_sub(radius)..=(center_x + radius).min(new_width - 1) {
+                    let dx = outline_x as i32 - center_x as i32;
+                    let dy = outline_y as i32 - center_y as i32;
+                    if dx * dx + dy * dy > radius_squared {
+                        continue;
+                    }
                     let index = outline_y * new_width + outline_x;
                     bitmap[index] = bitmap[index].max(value);
                 }
@@ -212,27 +276,41 @@ fn blur_glyph(glyph: &RasterGlyph, radius: u32) -> RasterGlyph {
     let width = glyph.width as usize;
     let height = glyph.height as usize;
     let stride = glyph.stride as usize;
-    let mut bitmap = vec![0_u8; glyph.bitmap.len()];
+    let new_width = width + radius * 2;
+    let new_height = height + radius * 2;
+    let mut expanded = vec![0_u8; new_width * new_height];
 
     for y in 0..height {
-        let min_y = y.saturating_sub(radius);
-        let max_y = (y + radius).min(height - 1);
         for x in 0..width {
+            expanded[(y + radius) * new_width + x + radius] = glyph.bitmap[y * stride + x];
+        }
+    }
+
+    let mut bitmap = vec![0_u8; expanded.len()];
+    for y in 0..new_height {
+        let min_y = y.saturating_sub(radius);
+        let max_y = (y + radius).min(new_height - 1);
+        for x in 0..new_width {
             let min_x = x.saturating_sub(radius);
-            let max_x = (x + radius).min(width - 1);
+            let max_x = (x + radius).min(new_width - 1);
             let mut sum = 0_u32;
             let mut count = 0_u32;
             for sample_y in min_y..=max_y {
                 for sample_x in min_x..=max_x {
-                    sum += u32::from(glyph.bitmap[sample_y * stride + sample_x]);
+                    sum += u32::from(expanded[sample_y * new_width + sample_x]);
                     count += 1;
                 }
             }
-            bitmap[y * stride + x] = (sum / count.max(1)) as u8;
+            bitmap[y * new_width + x] = (sum / count.max(1)) as u8;
         }
     }
 
     RasterGlyph {
+        width: new_width as i32,
+        height: new_height as i32,
+        stride: new_width as i32,
+        left: glyph.left - radius as i32,
+        top: glyph.top + radius as i32,
         bitmap,
         ..glyph.clone()
     }
@@ -246,6 +324,7 @@ mod tests {
 
     #[test]
     fn rasterize_run_renders_system_font_bitmaps() {
+        Rasterizer::clear_cache();
         let provider = FontconfigProvider::new();
         let shaper = ShapeEngine::new();
         let shaped = shaper
@@ -264,6 +343,28 @@ mod tests {
         assert!(glyphs.iter().all(|glyph| glyph.height >= 0));
         assert!(glyphs.iter().all(|glyph| glyph.bitmap.len() == (glyph.stride * glyph.height) as usize));
         assert!(glyphs.iter().any(|glyph| !glyph.bitmap.is_empty()));
+    }
+
+    #[test]
+    fn rasterize_run_reuses_global_glyph_cache() {
+        Rasterizer::clear_cache();
+        let provider = FontconfigProvider::new();
+        let shaper = ShapeEngine::new();
+        let shaped = shaper
+            .shape_text(&provider, &ShapeRequest::new("AA", "sans"))
+            .expect("shaping should succeed");
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            pixel_height: 24,
+            hinting: ass::Hinting::Normal,
+        });
+
+        let first = rasterizer.rasterize_run(&shaped.runs[0]).expect("rasterization should succeed");
+        let entries_after_first = Rasterizer::cache_stats().glyph_entries;
+        let second = rasterizer.rasterize_run(&shaped.runs[0]).expect("rasterization should succeed");
+
+        assert_eq!(first, second);
+        assert!(entries_after_first > 0);
+        assert_eq!(Rasterizer::cache_stats().glyph_entries, entries_after_first);
     }
 
     #[test]
@@ -317,7 +418,12 @@ mod tests {
 
         let blurred = rasterizer.blur_glyphs(&[glyph], 1);
 
-        assert_eq!(blurred[0].bitmap, vec![127, 85, 127]);
+        assert_eq!(blurred[0].width, 5);
+        assert_eq!(blurred[0].height, 3);
+        assert_eq!(blurred[0].stride, 5);
+        assert_eq!(blurred[0].left, -1);
+        assert_eq!(blurred[0].top, 1);
+        assert!(blurred[0].bitmap.iter().any(|value| *value > 0 && *value < 255));
     }
 
     #[test]
