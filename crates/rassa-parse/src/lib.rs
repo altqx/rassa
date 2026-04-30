@@ -91,6 +91,9 @@ pub struct ParsedEvent {
 pub struct ParsedSpanStyle {
     pub font_name: String,
     pub font_size: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    pub spacing: f64,
     pub bold: bool,
     pub italic: bool,
     pub primary_colour: u32,
@@ -104,6 +107,10 @@ pub struct ParsedSpanStyle {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParsedAnimatedStyle {
+    pub font_size: Option<f64>,
+    pub scale_x: Option<f64>,
+    pub scale_y: Option<f64>,
+    pub spacing: Option<f64>,
     pub primary_colour: Option<u32>,
     pub secondary_colour: Option<u32>,
     pub outline_colour: Option<u32>,
@@ -115,7 +122,11 @@ pub struct ParsedAnimatedStyle {
 
 impl ParsedAnimatedStyle {
     fn is_empty(&self) -> bool {
-        self.primary_colour.is_none()
+        self.font_size.is_none()
+            && self.scale_x.is_none()
+            && self.scale_y.is_none()
+            && self.spacing.is_none()
+            && self.primary_colour.is_none()
             && self.secondary_colour.is_none()
             && self.outline_colour.is_none()
             && self.back_colour.is_none()
@@ -138,6 +149,9 @@ impl Default for ParsedSpanStyle {
         Self {
             font_name: ParsedStyle::default().font_name,
             font_size: ParsedStyle::default().font_size,
+            scale_x: ParsedStyle::default().scale_x,
+            scale_y: ParsedStyle::default().scale_y,
+            spacing: ParsedStyle::default().spacing,
             bold: false,
             italic: false,
             primary_colour: ParsedStyle::default().primary_colour,
@@ -156,6 +170,9 @@ impl ParsedSpanStyle {
         Self {
             font_name: style.font_name.clone(),
             font_size: style.font_size,
+            scale_x: style.scale_x,
+            scale_y: style.scale_y,
+            spacing: style.spacing,
             bold: style.bold,
             italic: style.italic,
             primary_colour: style.primary_colour,
@@ -829,6 +846,12 @@ fn apply_override_block(
                 });
                 *karaoke_cursor_ms += duration_ms;
             }
+        } else if let Some(rest) = tag.strip_prefix("fscx") {
+            current_style.scale_x = parse_scale(rest, current_style.scale_x);
+        } else if let Some(rest) = tag.strip_prefix("fscy") {
+            current_style.scale_y = parse_scale(rest, current_style.scale_y);
+        } else if let Some(rest) = tag.strip_prefix("fsp") {
+            current_style.spacing = parse_f64(rest, current_style.spacing);
         } else if let Some(rest) = tag.strip_prefix("fs") {
             current_style.font_size = parse_f64(rest, current_style.font_size);
         } else if let Some(rest) = tag.strip_prefix("iclip") {
@@ -1014,6 +1037,14 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
         style.outline_colour = with_alpha(style.outline_colour, parse_alpha_tag(rest, alpha_of(style.outline_colour)));
     } else if let Some(rest) = tag.strip_prefix("4a") {
         style.back_colour = with_alpha(style.back_colour, parse_alpha_tag(rest, alpha_of(style.back_colour)));
+    } else if let Some(rest) = tag.strip_prefix("fscx") {
+        style.scale_x = parse_scale(rest, style.scale_x);
+    } else if let Some(rest) = tag.strip_prefix("fscy") {
+        style.scale_y = parse_scale(rest, style.scale_y);
+    } else if let Some(rest) = tag.strip_prefix("fsp") {
+        style.spacing = parse_f64(rest, style.spacing);
+    } else if let Some(rest) = tag.strip_prefix("fs") {
+        style.font_size = parse_f64(rest, style.font_size);
     } else if let Some(rest) = tag.strip_prefix("bord") {
         style.border = parse_f64(rest, style.border);
     } else if let Some(rest) = tag.strip_prefix("shad") {
@@ -1025,6 +1056,10 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
 
 fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> ParsedAnimatedStyle {
     ParsedAnimatedStyle {
+        font_size: ((target.font_size - base.font_size).abs() > f64::EPSILON).then_some(target.font_size),
+        scale_x: ((target.scale_x - base.scale_x).abs() > f64::EPSILON).then_some(target.scale_x),
+        scale_y: ((target.scale_y - base.scale_y).abs() > f64::EPSILON).then_some(target.scale_y),
+        spacing: ((target.spacing - base.spacing).abs() > f64::EPSILON).then_some(target.spacing),
         primary_colour: (target.primary_colour != base.primary_colour).then_some(target.primary_colour),
         secondary_colour: (target.secondary_colour != base.secondary_colour).then_some(target.secondary_colour),
         outline_colour: (target.outline_colour != base.outline_colour).then_some(target.outline_colour),
@@ -1558,7 +1593,7 @@ mod tests {
             ..ParsedStyle::default()
         };
         let parsed = parse_dialogue_text(
-            "{\\fnLiberation Sans\\fs32\\an7}Hello{\\rAlt} world\\N{\\pos(120,48)}again",
+            "{\\fnLiberation Sans\\fs32\\fscx150\\fscy75\\fsp3\\an7}Hello{\\rAlt} world\\N{\\pos(120,48)}again",
             &base_style,
             &[base_style.clone(), alt_style.clone()],
         );
@@ -1569,6 +1604,9 @@ mod tests {
         assert_eq!(parsed.lines[0].spans.len(), 2);
         assert_eq!(parsed.lines[0].spans[0].style.font_name, "Liberation Sans");
         assert_eq!(parsed.lines[0].spans[0].style.font_size, 32.0);
+        assert_eq!(parsed.lines[0].spans[0].style.scale_x, 1.5);
+        assert_eq!(parsed.lines[0].spans[0].style.scale_y, 0.75);
+        assert_eq!(parsed.lines[0].spans[0].style.spacing, 3.0);
         assert_eq!(parsed.lines[0].spans[1].style.font_name, "DejaVu Sans");
         assert_eq!(parsed.lines[1].text, "again");
     }
@@ -1717,13 +1755,17 @@ mod tests {
     #[test]
     fn parses_timed_transform_overrides() {
         let base_style = ParsedStyle::default();
-        let parsed = parse_dialogue_text("{\\t(100,300,2,\\1c&H112233&\\bord6\\blur2)}Text", &base_style, &[]);
+        let parsed = parse_dialogue_text("{\\t(100,300,2,\\1c&H112233&\\fs48\\fscx150\\fscy50\\fsp4\\bord6\\blur2)}Text", &base_style, &[]);
 
         let transforms = &parsed.lines[0].spans[0].transforms;
         assert_eq!(transforms.len(), 1);
         assert_eq!(transforms[0].start_ms, 100);
         assert_eq!(transforms[0].end_ms, Some(300));
         assert_eq!(transforms[0].accel, 2.0);
+        assert_eq!(transforms[0].style.font_size, Some(48.0));
+        assert_eq!(transforms[0].style.scale_x, Some(1.5));
+        assert_eq!(transforms[0].style.scale_y, Some(0.5));
+        assert_eq!(transforms[0].style.spacing, Some(4.0));
         assert_eq!(transforms[0].style.primary_colour, Some(0x0011_2233));
         assert_eq!(transforms[0].style.border, Some(6.0));
         assert_eq!(transforms[0].style.blur, Some(2.0));

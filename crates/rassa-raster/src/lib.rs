@@ -351,20 +351,32 @@ mod tests {
         let provider = FontconfigProvider::new();
         let shaper = ShapeEngine::new();
         let shaped = shaper
-            .shape_text(&provider, &ShapeRequest::new("AA", "sans"))
+            .shape_text(&provider, &ShapeRequest::new("A", "sans"))
             .expect("shaping should succeed");
         let rasterizer = Rasterizer::with_options(RasterOptions {
-            pixel_height: 24,
+            pixel_height: 47,
             hinting: ass::Hinting::Normal,
         });
 
         let first = rasterizer.rasterize_run(&shaped.runs[0]).expect("rasterization should succeed");
-        let entries_after_first = Rasterizer::cache_stats().glyph_entries;
+        let entries_after_first = glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options);
         let second = rasterizer.rasterize_run(&shaped.runs[0]).expect("rasterization should succeed");
 
         assert_eq!(first, second);
         assert!(entries_after_first > 0);
-        assert_eq!(Rasterizer::cache_stats().glyph_entries, entries_after_first);
+        assert_eq!(glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options), entries_after_first);
+    }
+
+    fn glyph_cache_entries_for_run(run: &ShapedRun, options: RasterOptions) -> usize {
+        let Some(path) = run.font.path.as_ref() else {
+            return 0;
+        };
+        glyph_cache()
+            .lock()
+            .expect("glyph cache mutex poisoned")
+            .keys()
+            .filter(|key| key.path == *path && key.pixel_height == options.pixel_height && key.hinting == options.hinting)
+            .count()
     }
 
     #[test]

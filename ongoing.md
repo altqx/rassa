@@ -31,19 +31,33 @@ Append new session entries at the top of this file.
 - Added renderer regression coverage proving disabled scaled-border mode produces a smaller outline footprint under a 2x frame scale.
 - Improved raster behavior: glyph bitmaps are now cached by font path, glyph id, pixel size, and hinting mode; outline expansion uses a rounder mask; blur now expands bitmap bounds instead of only softening inside the original glyph box.
 - Added raster regressions for cache reuse and expanded blur bounds.
+- Aligned the basic collision pass with libass layer grouping: unpositioned events now only avoid collisions against earlier events in the same `Layer`, while different layers are allowed to overlap.
+- Added renderer and C ABI regressions proving cross-layer subtitles keep the same vertical placement while existing same-layer collision avoidance remains intact.
+- Extended timed transform support to include `\fs` font-size animation, carrying it through `ParsedAnimatedStyle` and applying it during render-time style interpolation.
+- Added parser and renderer regressions for `\t(...\fs...)`.
+- Checked another libass feature surface against the current implementation: style `ScaleX`/`ScaleY` were parsed into `ParsedStyle` but not carried into span style, layout, render, or C ABI render output.
+- Wired `ScaleX`/`ScaleY` and inline `\fscx`/`\fscy` through `ParsedSpanStyle`, timed transforms, layout width calculation, and glyph bitmap/advance scaling during render.
+- Added parser, renderer, and C ABI regressions proving `\fscx`/`\fscy` affect parsed spans and rendered bounds.
+- Extended the same `ScaleX`/`ScaleY` path to visible `\p` drawing geometry so drawing planes now scale their polygon bounds instead of only advancing the text pen.
+- Added renderer and C ABI regressions proving `\fscx`/`\fscy` change emitted drawing `ASS_Image` bounds.
+- Mirrored the next upstream style surface for text spacing: style `Spacing`, inline `\fsp`, and timed `\t(...\fsp...)` now flow through parsed span state, layout width, render-time interpolation, glyph advances, and public C API output.
+- Added parser, renderer, and C ABI regressions proving text spacing changes parsed transforms and rendered image width while remaining text-only, matching libass' non-drawing `\fsp` behavior.
 
 ### Verified
-- `cargo test` passes for the whole workspace after the storage-size, margin geometry, C API shaper, setting sanitization, feature-lock, image-ordering, font-provider, dynamic-event, scaled-border, output-ordering, and raster cache/blur updates.
+- `cargo test` passes for the whole workspace after the storage-size, margin geometry, C API shaper, setting sanitization, feature-lock, image-ordering, font-provider, dynamic-event, scaled-border, output-ordering, raster cache/blur, layer-collision, timed-font-size transform, text-scale, drawing-scale, and text-spacing updates.
 - Targeted font-provider tests pass: `cargo test -p rassa-test capi_available_font_providers_match_libass_order`, `cargo test -p rassa-test capi_invalid_font_provider_behaves_like_none`, `cargo test -p rassa-fonts default_font_file_provider_falls_back_to_configured_path`, and `cargo test -p rassa-test capi_default_font_path_renders_when_system_providers_are_disabled`.
 - Targeted dynamic-event test passes: `cargo test -p rassa-test capi_chunk_and_prune_manage_event_timeline`.
 - Targeted read-order test passes: `cargo test -p rassa-test capi_check_readorder_affects_chunk_insertions`.
 - Targeted renderer/raster tests pass: `cargo test -p rassa-render`, `cargo test -p rassa-raster`, and `cargo test -p rassa-test capi_render_frame_orders_shadow_outline_before_character`.
+- Targeted collision/transform tests pass: `cargo test -p rassa-render render_frame_allows_basic_collision_across_different_layers`, `cargo test -p rassa-test capi_render_frame_allows_collision_across_different_layers`, `cargo test -p rassa-parse parses_timed_transform_overrides`, and `cargo test -p rassa-render render_frame_applies_timed_transform_style`.
+- Targeted text-scale tests pass: `cargo test -p rassa-render render_frame_applies_text_scale_overrides`, `cargo test -p rassa-test capi_text_scale_overrides_change_rendered_bounds`, `cargo test -p rassa-parse parses_dialogue_overrides_into_spans_and_event_metadata`, and `cargo test -p rassa-parse parses_timed_transform_overrides`.
+- Targeted drawing-scale and spacing tests pass: `cargo test -p rassa-render render_frame_applies_drawing_scale_overrides`, `cargo test -p rassa-test capi_drawing_scale_overrides_change_rendered_bounds`, `cargo test -p rassa-render render_frame_applies_text_spacing_override`, and `cargo test -p rassa-test capi_text_spacing_override_changes_rendered_width`.
 
 ### Current Gaps
 - Renderer geometry is improved, but still not fully libass-equivalent: full `use_margins` placement semantics, script-to-screen mapping, exact PAR compensation, exact libass `ScaledBorderAndShadow` anisotropic scaling, and explicit-position edge cases still need a deeper upstream-parity pass.
-- Event ordering now follows layer/read-order for image assembly, but collision handling remains basic and does not yet mirror libass' full per-layer collision placement and stacking behavior.
+- Event ordering and collision layer grouping now follow libass more closely, but collision handling remains basic and does not yet mirror libass' persistent render-private placement reuse or full free-space fitting behavior.
 - Font-provider parity is improved for C API defaults, invalid provider IDs, attachments, and default file fallback, but provider coverage is still Linux-first and lacks CoreText/DirectWrite backends.
-- Drawing, clipping, transform, karaoke, and raster behavior are broader than before, but still need upstream pixel-diff validation and exact libass outline stroking/blur/composite-cache parity.
+- Drawing, clipping, transform, karaoke, and raster behavior are broader than before, but still need upstream pixel-diff validation, more animated override tags such as rotation/shear, and exact libass outline stroking/blur/composite-cache parity.
 - Validation is still partial: there are corpus-backed smoke tests and ABI regressions, but no automated pixel-diff harness against upstream libass outputs, fuzz/property coverage, or generated parity report.
 
 ### Recommended Next Step

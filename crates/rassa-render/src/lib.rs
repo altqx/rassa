@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rassa_core::{ass, ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size};
 use rassa_fonts::{FontProvider, FontconfigProvider};
 use rassa_layout::{LayoutEngine, LayoutEvent, LayoutGlyphRun};
@@ -95,7 +97,7 @@ impl RenderEngine {
     ) -> Vec<ImagePlane> {
         let prepared = self.prepare_frame_with_config(track, provider, now_ms, config);
         let mut planes = Vec::new();
-        let mut occupied_bounds = Vec::new();
+        let mut occupied_bounds_by_layer = HashMap::<i32, Vec<Rect>>::new();
 
         for event in &prepared.active_events {
             let Some(_style) = track.styles.get(event.style_index) else {
@@ -105,7 +107,9 @@ impl RenderEngine {
             let mut outline_planes = Vec::new();
             let mut character_planes = Vec::new();
             let effective_position = resolve_event_position(track, event, now_ms);
-            let vertical_layout = resolve_vertical_layout(track, event, effective_position, &occupied_bounds, config);
+            let layer = event_layer(track, event);
+            let occupied_bounds = occupied_bounds_by_layer.entry(layer).or_default();
+            let vertical_layout = resolve_vertical_layout(track, event, effective_position, occupied_bounds, config);
             let occupied_bound = effective_position.is_none().then(|| event_bounds(track, event, &vertical_layout, effective_position, config));
             for (line, line_top) in event.lines.iter().zip(vertical_layout.iter().copied()) {
                 let origin_x = compute_horizontal_origin(track, event, scaled_line_width(line.width, config), effective_position);
@@ -122,6 +126,8 @@ impl RenderEngine {
                             origin_x + line_pen_x,
                             line_top,
                             resolve_run_fill_color(run, &effective_style, track.events.get(event.event_index), now_ms),
+                            effective_style.scale_x,
+                            effective_style.scale_y,
                         ) {
                             if effective_style.border > 0.0 {
                                 let mut outline_glyph = plane_to_raster_glyph(&plane);
@@ -176,6 +182,12 @@ impl RenderEngine {
                         line_pen_x += run.width.round() as i32;
                         continue;
                     };
+                    let raster_glyphs = scale_raster_glyphs(
+                        raster_glyphs,
+                        effective_style.scale_x,
+                        effective_style.scale_y,
+                    );
+                    let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
                     if effective_style.border > 0.0 && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms) {
                         let mut outline_glyphs = rasterizer.outline_glyphs(&raster_glyphs, effective_style.border.round().max(1.0) as i32);
                         if effective_style.blur > 0.0 {
@@ -412,6 +424,18 @@ fn resolve_run_style(run: &LayoutGlyphRun, source_event: Option<&ParsedEvent>, n
             linear.powf(if transform.accel > 0.0 { transform.accel } else { 1.0 })
         };
 
+        if let Some(font_size) = transform.style.font_size {
+            style.font_size = interpolate_f64(style.font_size, font_size, progress);
+        }
+        if let Some(scale_x) = transform.style.scale_x {
+            style.scale_x = interpolate_f64(style.scale_x, scale_x, progress);
+        }
+        if let Some(scale_y) = transform.style.scale_y {
+            style.scale_y = interpolate_f64(style.scale_y, scale_y, progress);
+        }
+        if let Some(spacing) = transform.style.spacing {
+            style.spacing = interpolate_f64(style.spacing, spacing, progress);
+        }
         if let Some(color) = transform.style.primary_colour {
             style.primary_colour = interpolate_color(style.primary_colour, color, progress);
         }
@@ -442,6 +466,7 @@ fn apply_renderer_style_scale(mut style: ParsedSpanStyle, track: &ParsedTrack, c
     let scale = renderer_font_scale(config);
     if (scale - 1.0).abs() >= f64::EPSILON {
         style.font_size *= scale;
+        style.spacing *= scale;
         style.border *= scale;
         style.shadow *= scale;
         style.blur *= scale;
@@ -456,6 +481,28 @@ fn apply_renderer_style_scale(mut style: ParsedSpanStyle, track: &ParsedTrack, c
         }
     }
     style
+}
+
+fn apply_text_spacing(glyphs: Vec<RasterGlyph>, style: &ParsedSpanStyle) -> Vec<RasterGlyph> {
+    let spacing = text_spacing_advance(style);
+    if spacing == 0 {
+        return glyphs;
+    }
+
+    glyphs
+        .into_iter()
+        .map(|glyph| RasterGlyph {
+            advance_x: glyph.advance_x + spacing,
+            ..glyph
+        })
+        .collect()
+}
+
+fn text_spacing_advance(style: &ParsedSpanStyle) -> i32 {
+    if !style.spacing.is_finite() {
+        return 0;
+    }
+    (style.spacing * style_scale(style.scale_x)).round() as i32
 }
 
 fn renderer_font_scale(config: &RendererConfig) -> f64 {
@@ -479,6 +526,63 @@ fn border_shadow_compensation_scale(track: &ParsedTrack, config: &RendererConfig
 
 fn scaled_line_width(width: f32, config: &RendererConfig) -> i32 {
     (f64::from(width) * renderer_font_scale(config)).round() as i32
+}
+
+fn scale_raster_glyphs(glyphs: Vec<RasterGlyph>, scale_x: f64, scale_y: f64) -> Vec<RasterGlyph> {
+    let scale_x = style_scale(scale_x);
+    let scale_y = style_scale(scale_y);
+    if (scale_x - 1.0).abs() < f64::EPSILON && (scale_y - 1.0).abs() < f64::EPSILON {
+        return glyphs;
+    }
+
+    glyphs
+        .into_iter()
+        .map(|glyph| scale_raster_glyph(glyph, scale_x, scale_y))
+        .collect()
+}
+
+fn style_scale(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        1.0
+    }
+}
+
+fn scale_raster_glyph(glyph: RasterGlyph, scale_x: f64, scale_y: f64) -> RasterGlyph {
+    if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
+        return RasterGlyph {
+            advance_x: (f64::from(glyph.advance_x) * scale_x).round() as i32,
+            advance_y: (f64::from(glyph.advance_y) * scale_y).round() as i32,
+            ..glyph
+        };
+    }
+
+    let src_width = glyph.width as usize;
+    let src_height = glyph.height as usize;
+    let src_stride = glyph.stride.max(0) as usize;
+    let dst_width = (f64::from(glyph.width) * scale_x).round().max(1.0) as usize;
+    let dst_height = (f64::from(glyph.height) * scale_y).round().max(1.0) as usize;
+    let mut bitmap = vec![0_u8; dst_width * dst_height];
+    for row in 0..dst_height {
+        let src_row = ((row * src_height) / dst_height).min(src_height - 1);
+        for column in 0..dst_width {
+            let src_column = ((column * src_width) / dst_width).min(src_width - 1);
+            bitmap[row * dst_width + column] = glyph.bitmap[src_row * src_stride + src_column];
+        }
+    }
+
+    RasterGlyph {
+        width: dst_width as i32,
+        height: dst_height as i32,
+        stride: dst_width as i32,
+        left: (f64::from(glyph.left) * scale_x).round() as i32,
+        top: (f64::from(glyph.top) * scale_y).round() as i32,
+        advance_x: (f64::from(glyph.advance_x) * scale_x).round() as i32,
+        advance_y: (f64::from(glyph.advance_y) * scale_y).round() as i32,
+        bitmap,
+        ..glyph
+    }
 }
 
 fn interpolate_f64(from: f64, to: f64, progress: f64) -> f64 {
@@ -739,6 +843,10 @@ fn resolve_event_position(track: &ParsedTrack, event: &LayoutEvent, now_ms: i64)
     })
 }
 
+fn event_layer(track: &ParsedTrack, event: &LayoutEvent) -> i32 {
+    track.events.get(event.event_index).map(|source| source.layer).unwrap_or_default()
+}
+
 fn interpolate_move(movement: ParsedMovement, source_event: Option<&ParsedEvent>, now_ms: i64) -> (i32, i32) {
     let event_duration = source_event.map(|event| event.duration).unwrap_or_default().max(0) as i32;
     let event_elapsed = source_event
@@ -939,8 +1047,16 @@ fn image_planes_from_absolute_glyphs(glyphs: &[RasterGlyph], color: u32, kind: a
         .collect()
 }
 
-fn image_plane_from_drawing(drawing: &ParsedDrawing, origin_x: i32, line_top: i32, color: u32) -> Option<ImagePlane> {
-    let bounds = drawing.bounds()?;
+fn image_plane_from_drawing(
+    drawing: &ParsedDrawing,
+    origin_x: i32,
+    line_top: i32,
+    color: u32,
+    scale_x: f64,
+    scale_y: f64,
+) -> Option<ImagePlane> {
+    let polygons = scaled_drawing_polygons(drawing, scale_x, scale_y);
+    let bounds = drawing_bounds(&polygons)?;
     let width = bounds.width();
     let height = bounds.height();
     if width <= 0 || height <= 0 {
@@ -955,7 +1071,7 @@ fn image_plane_from_drawing(drawing: &ParsedDrawing, origin_x: i32, line_top: i3
         for column in 0..width as usize {
             let x = bounds.x_min + column as i32;
             let y = bounds.y_min + row as i32;
-            if drawing.polygons.iter().any(|polygon| point_in_polygon(x, y, polygon)) {
+            if polygons.iter().any(|polygon| point_in_polygon(x, y, polygon)) {
                 bitmap[row * stride + column] = 255;
                 any_visible = true;
             }
@@ -972,6 +1088,49 @@ fn image_plane_from_drawing(drawing: &ParsedDrawing, origin_x: i32, line_top: i3
         },
         kind: ass::ImageType::Character,
         bitmap,
+    })
+}
+
+fn scaled_drawing_polygons(drawing: &ParsedDrawing, scale_x: f64, scale_y: f64) -> Vec<Vec<Point>> {
+    let scale_x = style_scale(scale_x);
+    let scale_y = style_scale(scale_y);
+    if (scale_x - 1.0).abs() < f64::EPSILON && (scale_y - 1.0).abs() < f64::EPSILON {
+        return drawing.polygons.clone();
+    }
+
+    drawing
+        .polygons
+        .iter()
+        .map(|polygon| {
+            polygon
+                .iter()
+                .map(|point| Point {
+                    x: (f64::from(point.x) * scale_x).round() as i32,
+                    y: (f64::from(point.y) * scale_y).round() as i32,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn drawing_bounds(polygons: &[Vec<Point>]) -> Option<Rect> {
+    let mut points = polygons.iter().flat_map(|polygon| polygon.iter().copied());
+    let first = points.next()?;
+    let mut x_min = first.x;
+    let mut y_min = first.y;
+    let mut x_max = first.x;
+    let mut y_max = first.y;
+    for point in points {
+        x_min = x_min.min(point.x);
+        y_min = y_min.min(point.y);
+        x_max = x_max.max(point.x);
+        y_max = y_max.max(point.y);
+    }
+    Some(Rect {
+        x_min,
+        y_min,
+        x_max: x_max + 1,
+        y_max: y_max + 1,
     })
 }
 
@@ -1158,6 +1317,24 @@ mod tests {
             .max()
             .expect("plane");
         max_y - min_y
+    }
+
+    fn character_bounds(planes: &[ImagePlane]) -> Option<Rect> {
+        let mut character_planes = planes.iter().filter(|plane| plane.kind == ass::ImageType::Character);
+        let first = character_planes.next()?;
+        let mut bounds = Rect {
+            x_min: first.destination.x,
+            y_min: first.destination.y,
+            x_max: first.destination.x + first.size.width,
+            y_max: first.destination.y + first.size.height,
+        };
+        for plane in character_planes {
+            bounds.x_min = bounds.x_min.min(plane.destination.x);
+            bounds.y_min = bounds.y_min.min(plane.destination.y);
+            bounds.x_max = bounds.x_max.max(plane.destination.x + plane.size.width);
+            bounds.y_max = bounds.y_max.max(plane.destination.y + plane.size.height);
+        }
+        Some(bounds)
     }
     
     #[test]
@@ -1429,6 +1606,79 @@ mod tests {
     }
 
     #[test]
+    fn render_frame_applies_text_scale_overrides() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 140\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}Scale").expect("script should parse");
+        let stretched = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 140\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\fscx200\\fscy50}Scale").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let baseline = engine.render_frame_with_provider(&track, &provider, 500);
+        let scaled = engine.render_frame_with_provider(&stretched, &provider, 500);
+        let baseline_width = baseline
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .map(|plane| plane.destination.x + plane.size.width)
+            .max()
+            .expect("baseline max x")
+            - baseline
+                .iter()
+                .filter(|plane| plane.kind == ass::ImageType::Character)
+                .map(|plane| plane.destination.x)
+                .min()
+                .expect("baseline min x");
+        let scaled_width = scaled
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .map(|plane| plane.destination.x + plane.size.width)
+            .max()
+            .expect("scaled max x")
+            - scaled
+                .iter()
+                .filter(|plane| plane.kind == ass::ImageType::Character)
+                .map(|plane| plane.destination.x)
+                .min()
+                .expect("scaled min x");
+
+        assert!(scaled_width > baseline_width);
+        assert!(total_plane_area(&scaled) < total_plane_area(&baseline) * 2);
+    }
+
+    #[test]
+    fn render_frame_applies_drawing_scale_overrides() {
+        let baseline = parse_script_text("[Script Info]\nPlayResX: 120\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\p1}m 0 0 l 10 0 10 10 0 10").expect("script should parse");
+        let scaled = parse_script_text("[Script Info]\nPlayResX: 120\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\fscx200\\fscy50\\p1}m 0 0 l 10 0 10 10 0 10").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let baseline_planes = engine.render_frame_with_provider(&baseline, &provider, 500);
+        let scaled_planes = engine.render_frame_with_provider(&scaled, &provider, 500);
+        let baseline_plane = baseline_planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Character)
+            .expect("baseline drawing plane");
+        let scaled_plane = scaled_planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Character)
+            .expect("scaled drawing plane");
+
+        assert!(scaled_plane.size.width > baseline_plane.size.width);
+        assert!(scaled_plane.size.height < baseline_plane.size.height);
+        assert_eq!(scaled_plane.destination, Point { x: 10, y: 10 });
+    }
+
+    #[test]
+    fn render_frame_applies_text_spacing_override() {
+        let baseline = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}IIII").expect("script should parse");
+        let spaced = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\fsp8}IIII").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let baseline_planes = engine.render_frame_with_provider(&baseline, &provider, 500);
+        let spaced_planes = engine.render_frame_with_provider(&spaced, &provider, 500);
+        let baseline_width = character_bounds(&baseline_planes).expect("baseline bounds").width();
+        let spaced_width = character_bounds(&spaced_planes).expect("spaced bounds").width();
+
+        assert!(spaced_width > baseline_width);
+    }
+
+    #[test]
     fn render_frame_scales_output_to_frame_size() {
         let track = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Scale").expect("script should parse");
         let engine = RenderEngine::new();
@@ -1604,6 +1854,29 @@ mod tests {
     }
 
     #[test]
+    fn render_frame_allows_basic_collision_across_different_layers() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 1,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H00FF00&}Second").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+
+        let layer0_y = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x0000_00FF)
+            .map(|plane| plane.destination.y)
+            .min()
+            .expect("layer 0 character plane");
+        let layer1_y = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x0000_FF00)
+            .map(|plane| plane.destination.y)
+            .min()
+            .expect("layer 1 character plane");
+
+        assert_eq!(layer0_y, layer1_y);
+    }
+
+    #[test]
     fn render_frame_interpolates_move_position() {
         let track = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\move(0,0,100,0,0,1000)}Hi").expect("script should parse");
         let engine = RenderEngine::new();
@@ -1757,7 +2030,7 @@ mod tests {
 
     #[test]
     fn render_frame_applies_timed_transform_style() {
-        let track = parse_script_text("[Script Info]\nPlayResX: 160\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H000000FF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\t(0,1000,\\1c&H00112233&\\bord4)}Hi").expect("script should parse");
+        let track = parse_script_text("[Script Info]\nPlayResX: 160\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H000000FF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\t(0,1000,\\1c&H00112233&\\fs48\\bord4)}Hi").expect("script should parse");
         let engine = RenderEngine::new();
         let provider = FontconfigProvider::new();
         let start_planes = engine.render_frame_with_provider(&track, &provider, 0);
@@ -1771,5 +2044,6 @@ mod tests {
         let start_fill = start_planes.iter().find(|plane| plane.kind == ass::ImageType::Character).expect("start fill").color.0;
         let end_fill = end_planes.iter().find(|plane| plane.kind == ass::ImageType::Character).expect("end fill").color.0;
         assert_ne!(start_fill, end_fill);
+        assert!(total_plane_area(&end_planes) > total_plane_area(&start_planes));
     }
 }

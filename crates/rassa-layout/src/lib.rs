@@ -135,7 +135,10 @@ fn layout_line_from_text<P: FontProvider>(
             style: font_style_name(&span.style),
         });
         if let Some(drawing) = &span.drawing {
-            let width = drawing.bounds().map(|bounds| bounds.width() as f32).unwrap_or_default();
+            let width = drawing
+                .bounds()
+                .map(|bounds| bounds.width() as f32 * span.style.scale_x.max(0.0) as f32)
+                .unwrap_or_default();
             runs.push(LayoutGlyphRun {
                 text: span.text.clone(),
                 direction: line_direction,
@@ -164,7 +167,7 @@ fn layout_line_from_text<P: FontProvider>(
                 direction: shaped_run.direction,
                 font_family: font.family.clone(),
                 font: font.clone(),
-                width: shaped_run.glyphs.iter().map(|glyph| glyph.x_advance).sum(),
+                width: text_run_width(&shaped_run.glyphs, &span.style),
                 glyphs: shaped_run.glyphs,
                 style: span.style.clone(),
                 transforms: span.transforms.clone(),
@@ -185,6 +188,19 @@ fn layout_line_from_text<P: FontProvider>(
         width,
         runs,
     })
+}
+
+fn text_run_width(glyphs: &[GlyphInfo], style: &ParsedSpanStyle) -> f32 {
+    let scale_x = style.scale_x.max(0.0) as f32;
+    let spacing = if style.spacing.is_finite() {
+        style.spacing as f32 * scale_x
+    } else {
+        0.0
+    };
+    glyphs
+        .iter()
+        .map(|glyph| glyph.x_advance * scale_x + spacing)
+        .sum()
 }
 
 fn font_style_name(style: &ParsedSpanStyle) -> Option<String> {
