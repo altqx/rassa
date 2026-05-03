@@ -11,9 +11,5 @@ rassa-fonts = { path = "../rassa-fonts" }
 rassa-shape = { path = "../rassa-shape" }
 freetype-rs = "0.38.0"
 
-[build-dependencies]
-cc = "1.0"
-pkg-config = "0.3"
-
 [lib]
 path = "src/lib.rs"

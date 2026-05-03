@@ -379,9 +379,7 @@ dependencies = [
 name = "rassa-raster"
 version = "0.1.0"
 dependencies = [
- "cc",
  "freetype-rs",
- "pkg-config",
  "rassa-core",
  "rassa-fonts",
  "rassa-shape",
