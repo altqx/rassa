@@ -82,6 +82,14 @@ mod tests {
     const INLINE_OVERRIDE_FIXTURE: &str = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,36,&H00112233,&H00445566,&H000A0B0C,&H00101010,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)\\t(0,1000,\\1c&H00223344&)}{\\K100}Test";
     const STYLE_ONLY_FIXTURE: &str = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Alt,sans,18,&H00ABCDEF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,11,12,13,1";
 
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("rassa-test should live under crates/rassa-test")
+            .to_path_buf()
+    }
+
     fn write_temp_fixture(name: &str, content: &str) -> PathBuf {
         let mut path = env::temp_dir();
         let stamp = SystemTime::now()
@@ -1399,6 +1407,48 @@ mod tests {
             rassa_capi::ass_library_done(library);
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn libass_drop_in_pkg_config_metadata_is_present() {
+        let root = workspace_root();
+        let libass_pc = fs::read_to_string(root.join("pkgconfig/libass.pc"))
+            .expect("drop-in builds should provide pkgconfig/libass.pc");
+
+        assert!(
+            libass_pc.contains("Name: libass"),
+            "libass.pc should identify itself as libass for pkg-config consumers"
+        );
+        assert!(
+            libass_pc.contains("Libs: -L${libdir} -lass"),
+            "libass.pc should make pkg-config libass link with -lass"
+        );
+        assert!(
+            libass_pc.contains("Cflags: -I${includedir}"),
+            "libass.pc should expose include/ass/ass.h"
+        );
+    }
+
+    #[test]
+    fn workspace_builds_a_libass_named_capi_cdylib() {
+        let root = workspace_root();
+        let workspace_toml = fs::read_to_string(root.join("Cargo.toml"))
+            .expect("workspace Cargo.toml should be readable");
+        let libass_capi_toml = fs::read_to_string(root.join("crates/rassa-libass-capi/Cargo.toml"))
+            .expect("drop-in libass C API crate should exist");
+
+        assert!(
+            workspace_toml.contains("\"crates/rassa-libass-capi\""),
+            "workspace should include the libass-named C API crate"
+        );
+        assert!(
+            libass_capi_toml.contains("name = \"ass\""),
+            "drop-in C API cdylib should build target/release/libass.so"
+        );
+        assert!(
+            libass_capi_toml.contains("crate-type = [\"rlib\", \"cdylib\"]"),
+            "drop-in C API crate should expose a cdylib"
+        );
     }
 
     #[test]

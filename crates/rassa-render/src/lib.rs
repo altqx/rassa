@@ -295,6 +295,7 @@ impl RenderEngine {
                         effective_style.scale_y,
                     );
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
+                    let effective_blur = effective_style.blur.max(effective_style.be);
                     if effective_style.border > 0.0
                         && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms)
                     {
@@ -302,11 +303,9 @@ impl RenderEngine {
                             &raster_glyphs,
                             effective_style.border.round().max(1.0) as i32,
                         );
-                        if effective_style.blur > 0.0 {
-                            outline_glyphs = rasterizer.blur_glyphs(
-                                &outline_glyphs,
-                                renderer_blur_radius(effective_style.blur),
-                            );
+                        if effective_blur > 0.0 {
+                            outline_glyphs = rasterizer
+                                .blur_glyphs(&outline_glyphs, renderer_blur_radius(effective_blur));
                         }
                         outline_planes.extend(image_planes_from_glyphs_with_kind(
                             &outline_glyphs,
@@ -322,23 +321,21 @@ impl RenderEngine {
                         track.events.get(event.event_index),
                         now_ms,
                     );
-                    if run.karaoke.is_none() && effective_style.blur > 0.0 {
+                    if run.karaoke.is_none() && effective_blur > 0.0 {
                         if let Some(plane) = combined_image_plane_from_glyphs(
                             &raster_glyphs,
                             origin_x + line_pen_x,
                             line_top,
                             fill_color,
                             ass::ImageType::Character,
-                            renderer_blur_radius(effective_style.blur),
+                            renderer_blur_radius(effective_blur),
                         ) {
                             character_planes.push(plane);
                         }
                     } else {
-                        let fill_glyphs = if effective_style.blur > 0.0 {
-                            rasterizer.blur_glyphs(
-                                &raster_glyphs,
-                                renderer_blur_radius(effective_style.blur),
-                            )
+                        let fill_glyphs = if effective_blur > 0.0 {
+                            rasterizer
+                                .blur_glyphs(&raster_glyphs, renderer_blur_radius(effective_blur))
                         } else {
                             raster_glyphs.clone()
                         };
@@ -365,18 +362,29 @@ impl RenderEngine {
                             character_planes.extend(fill_planes);
                         }
                     }
-                    if effective_style.shadow > 0.0 {
+                    let run_advance = raster_glyphs
+                        .iter()
+                        .map(|glyph| glyph.advance_x)
+                        .sum::<i32>();
+                    character_planes.extend(text_decoration_planes(
+                        &effective_style,
+                        origin_x + line_pen_x,
+                        line_top,
+                        run_advance,
+                        fill_color,
+                    ));
+                    if effective_style.shadow_x.abs() > f64::EPSILON
+                        || effective_style.shadow_y.abs() > f64::EPSILON
+                    {
                         let mut shadow_glyphs = raster_glyphs.clone();
-                        if effective_style.blur > 0.0 {
-                            shadow_glyphs = rasterizer.blur_glyphs(
-                                &shadow_glyphs,
-                                renderer_blur_radius(effective_style.blur),
-                            );
+                        if effective_blur > 0.0 {
+                            shadow_glyphs = rasterizer
+                                .blur_glyphs(&shadow_glyphs, renderer_blur_radius(effective_blur));
                         }
                         shadow_planes.extend(image_planes_from_glyphs_with_kind(
                             &shadow_glyphs,
-                            origin_x + line_pen_x + effective_style.shadow.round() as i32,
-                            line_top + effective_style.shadow.round() as i32,
+                            origin_x + line_pen_x + effective_style.shadow_x.round() as i32,
+                            line_top + effective_style.shadow_y.round() as i32,
                             effective_style.back_colour,
                             ass::ImageType::Shadow,
                         ));
@@ -642,8 +650,20 @@ fn resolve_run_style(
         if let Some(spacing) = transform.style.spacing {
             style.spacing = interpolate_f64(style.spacing, spacing, progress);
         }
+        if let Some(rotation_x) = transform.style.rotation_x {
+            style.rotation_x = interpolate_f64(style.rotation_x, rotation_x, progress);
+        }
+        if let Some(rotation_y) = transform.style.rotation_y {
+            style.rotation_y = interpolate_f64(style.rotation_y, rotation_y, progress);
+        }
         if let Some(rotation_z) = transform.style.rotation_z {
             style.rotation_z = interpolate_f64(style.rotation_z, rotation_z, progress);
+        }
+        if let Some(shear_x) = transform.style.shear_x {
+            style.shear_x = interpolate_f64(style.shear_x, shear_x, progress);
+        }
+        if let Some(shear_y) = transform.style.shear_y {
+            style.shear_y = interpolate_f64(style.shear_y, shear_y, progress);
         }
         if let Some(color) = transform.style.primary_colour {
             style.primary_colour = interpolate_color(style.primary_colour, color, progress);
@@ -659,12 +679,31 @@ fn resolve_run_style(
         }
         if let Some(border) = transform.style.border {
             style.border = interpolate_f64(style.border, border, progress);
+            style.border_x = style.border;
+            style.border_y = style.border;
+        }
+        if let Some(border_x) = transform.style.border_x {
+            style.border_x = interpolate_f64(style.border_x, border_x, progress);
+        }
+        if let Some(border_y) = transform.style.border_y {
+            style.border_y = interpolate_f64(style.border_y, border_y, progress);
         }
         if let Some(blur) = transform.style.blur {
             style.blur = interpolate_f64(style.blur, blur, progress);
         }
+        if let Some(be) = transform.style.be {
+            style.be = interpolate_f64(style.be, be, progress);
+        }
         if let Some(shadow) = transform.style.shadow {
             style.shadow = interpolate_f64(style.shadow, shadow, progress);
+            style.shadow_x = style.shadow;
+            style.shadow_y = style.shadow;
+        }
+        if let Some(shadow_x) = transform.style.shadow_x {
+            style.shadow_x = interpolate_f64(style.shadow_x, shadow_x, progress);
+        }
+        if let Some(shadow_y) = transform.style.shadow_y {
+            style.shadow_y = interpolate_f64(style.shadow_y, shadow_y, progress);
         }
     }
 
@@ -682,16 +721,26 @@ fn apply_renderer_style_scale(
         style.font_size *= scale;
         style.spacing *= scale;
         style.border *= scale;
+        style.border_x *= scale;
+        style.border_y *= scale;
         style.shadow *= scale;
+        style.shadow_x *= scale;
+        style.shadow_y *= scale;
         style.blur *= scale;
+        style.be *= scale;
     }
 
     if !track.scaled_border_and_shadow {
         let geometry_scale = border_shadow_compensation_scale(track, config);
         if geometry_scale > 0.0 && (geometry_scale - 1.0).abs() >= f64::EPSILON {
             style.border /= geometry_scale;
+            style.border_x /= geometry_scale;
+            style.border_y /= geometry_scale;
             style.shadow /= geometry_scale;
+            style.shadow_x /= geometry_scale;
+            style.shadow_y /= geometry_scale;
             style.blur /= geometry_scale;
+            style.be /= geometry_scale;
         }
     }
     style
@@ -1464,6 +1513,44 @@ fn image_planes_from_glyphs(
     color: u32,
 ) -> Vec<ImagePlane> {
     image_planes_from_glyphs_with_kind(glyphs, origin_x, line_top, color, ass::ImageType::Character)
+}
+
+fn text_decoration_planes(
+    style: &ParsedSpanStyle,
+    origin_x: i32,
+    line_top: i32,
+    width: i32,
+    color: u32,
+) -> Vec<ImagePlane> {
+    if width <= 0 || !(style.underline || style.strike_out) {
+        return Vec::new();
+    }
+
+    let thickness = (style.font_size / 18.0).round().max(1.0) as i32;
+    let mut planes = Vec::new();
+    let mut push_decoration = |baseline_fraction: f64| {
+        let y = line_top + (style.font_size * baseline_fraction).round() as i32;
+        planes.push(ImagePlane {
+            size: Size {
+                width,
+                height: thickness,
+            },
+            stride: width,
+            color: rgba_color_from_ass(color),
+            destination: Point { x: origin_x, y },
+            kind: ass::ImageType::Character,
+            bitmap: vec![255; (width * thickness) as usize],
+        });
+    };
+
+    if style.underline {
+        push_decoration(0.82);
+    }
+    if style.strike_out {
+        push_decoration(0.48);
+    }
+
+    planes
 }
 
 fn image_planes_from_glyphs_with_kind(
@@ -2456,6 +2543,47 @@ mod tests {
         let planes = engine.render_frame_with_provider(&track, &provider, 500);
 
         assert!(!planes.is_empty());
+    }
+
+    #[test]
+    fn render_frame_uses_axis_specific_shadow_offsets() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 220\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(30,30)\\xshad9\\yshad3}Hi").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let character_planes = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .cloned()
+            .collect::<Vec<_>>();
+        let shadow_planes = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Shadow)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let character = visible_bounds(&character_planes).expect("character bounds");
+        let shadow = visible_bounds(&shadow_planes).expect("axis-specific shadow should render");
+        assert_eq!(shadow.x_min - character.x_min, 9);
+        assert_eq!(shadow.y_min - character.y_min, 3);
+    }
+
+    #[test]
+    fn render_frame_renders_underline_and_strikeout_decorations() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 220\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(30,30)\\u1\\s1}Hi").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let decoration_planes = planes
+            .iter()
+            .filter(|plane| {
+                plane.kind == ass::ImageType::Character
+                    && plane.size.height <= 3
+                    && plane.size.width > plane.size.height * 4
+            })
+            .collect::<Vec<_>>();
+
+        assert!(decoration_planes.len() >= 2);
     }
 
     #[test]

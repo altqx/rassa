@@ -1,0 +1,19 @@
+[package]
+name = "rassa-libass-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+libc.workspace = true
+rassa-core = { path = "../rassa-core" }
+rassa-fonts = { path = "../rassa-fonts" }
+rassa-parse = { path = "../rassa-parse" }
+rassa-render = { path = "../rassa-render" }
+
+[lib]
+name = "ass"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]

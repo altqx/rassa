@@ -94,7 +94,13 @@ pub struct ParsedSpanStyle {
     pub scale_x: f64,
     pub scale_y: f64,
     pub spacing: f64,
+    pub underline: bool,
+    pub strike_out: bool,
+    pub rotation_x: f64,
+    pub rotation_y: f64,
     pub rotation_z: f64,
+    pub shear_x: f64,
+    pub shear_y: f64,
     pub bold: bool,
     pub italic: bool,
     pub primary_colour: u32,
@@ -102,8 +108,14 @@ pub struct ParsedSpanStyle {
     pub outline_colour: u32,
     pub back_colour: u32,
     pub border: f64,
+    pub border_x: f64,
+    pub border_y: f64,
     pub shadow: f64,
+    pub shadow_x: f64,
+    pub shadow_y: f64,
     pub blur: f64,
+    pub be: f64,
+    pub pbo: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -112,14 +124,23 @@ pub struct ParsedAnimatedStyle {
     pub scale_x: Option<f64>,
     pub scale_y: Option<f64>,
     pub spacing: Option<f64>,
+    pub rotation_x: Option<f64>,
+    pub rotation_y: Option<f64>,
     pub rotation_z: Option<f64>,
+    pub shear_x: Option<f64>,
+    pub shear_y: Option<f64>,
     pub primary_colour: Option<u32>,
     pub secondary_colour: Option<u32>,
     pub outline_colour: Option<u32>,
     pub back_colour: Option<u32>,
     pub border: Option<f64>,
+    pub border_x: Option<f64>,
+    pub border_y: Option<f64>,
     pub shadow: Option<f64>,
+    pub shadow_x: Option<f64>,
+    pub shadow_y: Option<f64>,
     pub blur: Option<f64>,
+    pub be: Option<f64>,
 }
 
 impl ParsedAnimatedStyle {
@@ -128,14 +149,23 @@ impl ParsedAnimatedStyle {
             && self.scale_x.is_none()
             && self.scale_y.is_none()
             && self.spacing.is_none()
+            && self.rotation_x.is_none()
+            && self.rotation_y.is_none()
             && self.rotation_z.is_none()
+            && self.shear_x.is_none()
+            && self.shear_y.is_none()
             && self.primary_colour.is_none()
             && self.secondary_colour.is_none()
             && self.outline_colour.is_none()
             && self.back_colour.is_none()
             && self.border.is_none()
+            && self.border_x.is_none()
+            && self.border_y.is_none()
             && self.shadow.is_none()
+            && self.shadow_x.is_none()
+            && self.shadow_y.is_none()
             && self.blur.is_none()
+            && self.be.is_none()
     }
 }
 
@@ -155,7 +185,13 @@ impl Default for ParsedSpanStyle {
             scale_x: ParsedStyle::default().scale_x,
             scale_y: ParsedStyle::default().scale_y,
             spacing: ParsedStyle::default().spacing,
+            underline: false,
+            strike_out: false,
+            rotation_x: 0.0,
+            rotation_y: 0.0,
             rotation_z: ParsedStyle::default().angle,
+            shear_x: 0.0,
+            shear_y: 0.0,
             bold: false,
             italic: false,
             primary_colour: ParsedStyle::default().primary_colour,
@@ -163,8 +199,14 @@ impl Default for ParsedSpanStyle {
             outline_colour: ParsedStyle::default().outline_colour,
             back_colour: ParsedStyle::default().back_colour,
             border: ParsedStyle::default().outline,
+            border_x: ParsedStyle::default().outline,
+            border_y: ParsedStyle::default().outline,
             shadow: ParsedStyle::default().shadow,
+            shadow_x: ParsedStyle::default().shadow,
+            shadow_y: ParsedStyle::default().shadow,
             blur: ParsedStyle::default().blur,
+            be: 0.0,
+            pbo: 0.0,
         }
     }
 }
@@ -177,7 +219,13 @@ impl ParsedSpanStyle {
             scale_x: style.scale_x,
             scale_y: style.scale_y,
             spacing: style.spacing,
+            underline: style.underline,
+            strike_out: style.strike_out,
+            rotation_x: 0.0,
+            rotation_y: 0.0,
             rotation_z: style.angle,
+            shear_x: 0.0,
+            shear_y: 0.0,
             bold: style.bold,
             italic: style.italic,
             primary_colour: style.primary_colour,
@@ -185,8 +233,14 @@ impl ParsedSpanStyle {
             outline_colour: style.outline_colour,
             back_colour: style.back_colour,
             border: style.outline,
+            border_x: style.outline,
+            border_y: style.outline,
             shadow: style.shadow,
+            shadow_x: style.shadow,
+            shadow_y: style.shadow,
             blur: style.blur,
+            be: 0.0,
+            pbo: 0.0,
         }
     }
 }
@@ -216,6 +270,8 @@ pub struct ParsedDialogueText {
     pub clip_rect: Option<Rect>,
     pub vector_clip: Option<ParsedVectorClip>,
     pub inverse_clip: bool,
+    pub wrap_style: Option<i32>,
+    pub origin: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -925,8 +981,16 @@ fn apply_override_block(
             current_style.scale_y = parse_scale(rest, current_style.scale_y);
         } else if let Some(rest) = tag.strip_prefix("fsp") {
             current_style.spacing = parse_f64(rest, current_style.spacing);
+        } else if let Some(rest) = tag.strip_prefix("frx") {
+            current_style.rotation_x = parse_f64(rest, current_style.rotation_x);
+        } else if let Some(rest) = tag.strip_prefix("fry") {
+            current_style.rotation_y = parse_f64(rest, current_style.rotation_y);
         } else if let Some(rest) = tag.strip_prefix("frz").or_else(|| tag.strip_prefix("fr")) {
             current_style.rotation_z = parse_f64(rest, current_style.rotation_z);
+        } else if let Some(rest) = tag.strip_prefix("fax") {
+            current_style.shear_x = parse_f64(rest, current_style.shear_x);
+        } else if let Some(rest) = tag.strip_prefix("fay") {
+            current_style.shear_y = parse_f64(rest, current_style.shear_y);
         } else if let Some(rest) = tag.strip_prefix("fs") {
             current_style.font_size = parse_f64(rest, current_style.font_size);
         } else if let Some(rest) = tag.strip_prefix("iclip") {
@@ -984,16 +1048,34 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix("4a") {
             let alpha = parse_alpha_tag(rest, alpha_of(current_style.back_colour));
             current_style.back_colour = with_alpha(current_style.back_colour, alpha);
+        } else if let Some(rest) = tag.strip_prefix("xbord") {
+            current_style.border_x = parse_f64(rest, current_style.border_x);
+        } else if let Some(rest) = tag.strip_prefix("ybord") {
+            current_style.border_y = parse_f64(rest, current_style.border_y);
         } else if let Some(rest) = tag.strip_prefix("bord") {
             current_style.border = parse_f64(rest, current_style.border);
+            current_style.border_x = current_style.border;
+            current_style.border_y = current_style.border;
+        } else if let Some(rest) = tag.strip_prefix("xshad") {
+            current_style.shadow_x = parse_f64(rest, current_style.shadow_x);
+        } else if let Some(rest) = tag.strip_prefix("yshad") {
+            current_style.shadow_y = parse_f64(rest, current_style.shadow_y);
         } else if let Some(rest) = tag.strip_prefix("shad") {
             current_style.shadow = parse_f64(rest, current_style.shadow);
+            current_style.shadow_x = current_style.shadow;
+            current_style.shadow_y = current_style.shadow;
         } else if let Some(rest) = tag.strip_prefix("blur") {
             current_style.blur = parse_f64(rest, current_style.blur);
+        } else if let Some(rest) = tag.strip_prefix("be") {
+            current_style.be = parse_f64(rest, current_style.be);
         } else if let Some(rest) = tag.strip_prefix('t') {
             if let Some(transform) = parse_transform(rest, current_style) {
                 current_transforms.push(transform);
             }
+        } else if let Some(rest) = tag.strip_prefix('u') {
+            current_style.underline = parse_override_bool(rest, current_style.underline);
+        } else if let Some(rest) = tag.strip_prefix('s') {
+            current_style.strike_out = parse_override_bool(rest, current_style.strike_out);
         } else if let Some(rest) = tag.strip_prefix('b') {
             current_style.bold = parse_override_bool(rest, current_style.bold);
         } else if let Some(rest) = tag.strip_prefix('i') {
@@ -1002,13 +1084,24 @@ fn apply_override_block(
             if let Ok(value) = rest.trim().parse::<i32>() {
                 parsed.alignment = alignment_from_an(value);
             }
+        } else if let Some(rest) = tag.strip_prefix('a') {
+            if let Ok(value) = rest.trim().parse::<i32>() {
+                parsed.alignment = alignment_from_legacy_a(value);
+            }
+        } else if let Some(rest) = tag.strip_prefix('q') {
+            if let Ok(value) = rest.trim().parse::<i32>() {
+                parsed.wrap_style = Some(value.clamp(0, 3));
+            }
+        } else if let Some(rest) = tag.strip_prefix("org") {
+            parsed.origin = parse_pos(rest);
         } else if let Some(rest) = tag.strip_prefix("pos") {
             if parsed.position.is_none() && parsed.movement.is_none() {
                 if let Some(position) = parse_pos(rest) {
                     parsed.position = Some(position);
                 }
             }
-        } else if tag.starts_with("pbo") {
+        } else if let Some(rest) = tag.strip_prefix("pbo") {
+            current_style.pbo = parse_f64(rest, current_style.pbo);
         } else if let Some(rest) = tag.strip_prefix('p') {
             flush_span(
                 buffer,
@@ -1149,16 +1242,38 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
         style.scale_y = parse_scale(rest, style.scale_y);
     } else if let Some(rest) = tag.strip_prefix("fsp") {
         style.spacing = parse_f64(rest, style.spacing);
+    } else if let Some(rest) = tag.strip_prefix("frx") {
+        style.rotation_x = parse_f64(rest, style.rotation_x);
+    } else if let Some(rest) = tag.strip_prefix("fry") {
+        style.rotation_y = parse_f64(rest, style.rotation_y);
     } else if let Some(rest) = tag.strip_prefix("frz").or_else(|| tag.strip_prefix("fr")) {
         style.rotation_z = parse_f64(rest, style.rotation_z);
+    } else if let Some(rest) = tag.strip_prefix("fax") {
+        style.shear_x = parse_f64(rest, style.shear_x);
+    } else if let Some(rest) = tag.strip_prefix("fay") {
+        style.shear_y = parse_f64(rest, style.shear_y);
     } else if let Some(rest) = tag.strip_prefix("fs") {
         style.font_size = parse_f64(rest, style.font_size);
+    } else if let Some(rest) = tag.strip_prefix("xbord") {
+        style.border_x = parse_f64(rest, style.border_x);
+    } else if let Some(rest) = tag.strip_prefix("ybord") {
+        style.border_y = parse_f64(rest, style.border_y);
     } else if let Some(rest) = tag.strip_prefix("bord") {
         style.border = parse_f64(rest, style.border);
+        style.border_x = style.border;
+        style.border_y = style.border;
+    } else if let Some(rest) = tag.strip_prefix("xshad") {
+        style.shadow_x = parse_f64(rest, style.shadow_x);
+    } else if let Some(rest) = tag.strip_prefix("yshad") {
+        style.shadow_y = parse_f64(rest, style.shadow_y);
     } else if let Some(rest) = tag.strip_prefix("shad") {
         style.shadow = parse_f64(rest, style.shadow);
+        style.shadow_x = style.shadow;
+        style.shadow_y = style.shadow;
     } else if let Some(rest) = tag.strip_prefix("blur") {
         style.blur = parse_f64(rest, style.blur);
+    } else if let Some(rest) = tag.strip_prefix("be") {
+        style.be = parse_f64(rest, style.be);
     }
 }
 
@@ -1169,8 +1284,14 @@ fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> Pars
         scale_x: ((target.scale_x - base.scale_x).abs() > f64::EPSILON).then_some(target.scale_x),
         scale_y: ((target.scale_y - base.scale_y).abs() > f64::EPSILON).then_some(target.scale_y),
         spacing: ((target.spacing - base.spacing).abs() > f64::EPSILON).then_some(target.spacing),
+        rotation_x: ((target.rotation_x - base.rotation_x).abs() > f64::EPSILON)
+            .then_some(target.rotation_x),
+        rotation_y: ((target.rotation_y - base.rotation_y).abs() > f64::EPSILON)
+            .then_some(target.rotation_y),
         rotation_z: ((target.rotation_z - base.rotation_z).abs() > f64::EPSILON)
             .then_some(target.rotation_z),
+        shear_x: ((target.shear_x - base.shear_x).abs() > f64::EPSILON).then_some(target.shear_x),
+        shear_y: ((target.shear_y - base.shear_y).abs() > f64::EPSILON).then_some(target.shear_y),
         primary_colour: (target.primary_colour != base.primary_colour)
             .then_some(target.primary_colour),
         secondary_colour: (target.secondary_colour != base.secondary_colour)
@@ -1179,8 +1300,17 @@ fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> Pars
             .then_some(target.outline_colour),
         back_colour: (target.back_colour != base.back_colour).then_some(target.back_colour),
         border: ((target.border - base.border).abs() > f64::EPSILON).then_some(target.border),
+        border_x: ((target.border_x - base.border_x).abs() > f64::EPSILON)
+            .then_some(target.border_x),
+        border_y: ((target.border_y - base.border_y).abs() > f64::EPSILON)
+            .then_some(target.border_y),
         shadow: ((target.shadow - base.shadow).abs() > f64::EPSILON).then_some(target.shadow),
+        shadow_x: ((target.shadow_x - base.shadow_x).abs() > f64::EPSILON)
+            .then_some(target.shadow_x),
+        shadow_y: ((target.shadow_y - base.shadow_y).abs() > f64::EPSILON)
+            .then_some(target.shadow_y),
         blur: ((target.blur - base.blur).abs() > f64::EPSILON).then_some(target.blur),
+        be: ((target.be - base.be).abs() > f64::EPSILON).then_some(target.be),
     }
 }
 
@@ -1241,6 +1371,23 @@ fn alignment_from_an(value: i32) -> Option<i32> {
         9 => ass::VALIGN_TOP | ass::HALIGN_RIGHT,
         _ => return None,
     })
+}
+
+fn alignment_from_legacy_a(value: i32) -> Option<i32> {
+    let halign = match value & 0x3 {
+        1 => ass::HALIGN_LEFT,
+        2 => ass::HALIGN_CENTER,
+        3 => ass::HALIGN_RIGHT,
+        _ => return None,
+    };
+    let valign = if value & 0x4 != 0 {
+        ass::VALIGN_TOP
+    } else if value & 0x8 != 0 {
+        ass::VALIGN_CENTER
+    } else {
+        ass::VALIGN_SUB
+    };
+    Some(valign | halign)
 }
 
 fn parse_pos(value: &str) -> Option<(i32, i32)> {
@@ -2043,6 +2190,40 @@ mod tests {
         assert_eq!(parsed.lines[0].spans[0].style.back_colour, 0x0044_5566);
         assert_eq!(parsed.lines[0].spans[0].style.shadow, 3.5);
         assert_eq!(parsed.lines[0].spans[0].style.blur, 1.5);
+    }
+
+    #[test]
+    fn parses_missing_override_metadata_tags() {
+        let base_style = ParsedStyle {
+            underline: false,
+            strike_out: false,
+            ..ParsedStyle::default()
+        };
+        let parsed = parse_dialogue_text(
+            "{\\u1\\s1\\a10\\q2\\org(320,240)\\frx12\\fry-8\\fax0.25\\fay-0.5\\xbord3\\ybord4\\xshad5\\yshad-6\\be2\\pbo7}Meta",
+            &base_style,
+            &[],
+        );
+
+        assert_eq!(
+            parsed.alignment,
+            Some(ass::VALIGN_CENTER | ass::HALIGN_CENTER)
+        );
+        assert_eq!(parsed.wrap_style, Some(2));
+        assert_eq!(parsed.origin, Some((320, 240)));
+        let style = &parsed.lines[0].spans[0].style;
+        assert!(style.underline);
+        assert!(style.strike_out);
+        assert_eq!(style.rotation_x, 12.0);
+        assert_eq!(style.rotation_y, -8.0);
+        assert_eq!(style.shear_x, 0.25);
+        assert_eq!(style.shear_y, -0.5);
+        assert_eq!(style.border_x, 3.0);
+        assert_eq!(style.border_y, 4.0);
+        assert_eq!(style.shadow_x, 5.0);
+        assert_eq!(style.shadow_y, -6.0);
+        assert_eq!(style.be, 2.0);
+        assert_eq!(style.pbo, 7.0);
     }
 
     #[test]

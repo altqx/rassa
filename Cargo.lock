@@ -369,6 +369,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rassa-libass-capi"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rassa-core",
+ "rassa-fonts",
+ "rassa-parse",
+ "rassa-render",
+]
+
+[[package]]
 name = "rassa-parse"
 version = "0.1.0"
 dependencies = [

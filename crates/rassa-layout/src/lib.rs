@@ -50,6 +50,8 @@ pub struct LayoutEvent {
     pub clip_rect: Option<Rect>,
     pub vector_clip: Option<ParsedVectorClip>,
     pub inverse_clip: bool,
+    pub wrap_style: Option<i32>,
+    pub origin: Option<(i32, i32)>,
     pub lines: Vec<LayoutLine>,
 }
 
@@ -122,6 +124,8 @@ impl LayoutEngine {
             clip_rect: parsed_text.clip_rect,
             vector_clip: parsed_text.vector_clip,
             inverse_clip: parsed_text.inverse_clip,
+            wrap_style: parsed_text.wrap_style,
+            origin: parsed_text.origin,
             lines,
         })
     }
@@ -508,6 +512,35 @@ mod tests {
         assert_eq!(layout.lines[0].runs.len(), 1);
         assert!(layout.lines[0].runs[0].drawing.is_some());
         assert_eq!(layout.lines[0].runs[0].width, 9.0);
+    }
+
+    #[test]
+    fn layout_carries_missing_override_metadata() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\u1\\s1\\a10\\q2\\org(320,240)\\frx12\\fry-8\\fax0.25\\fay-0.5\\xbord3\\ybord4\\xshad5\\yshad-6\\be2\\pbo7}Meta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.alignment, ass::VALIGN_CENTER | ass::HALIGN_CENTER);
+        assert_eq!(layout.wrap_style, Some(2));
+        assert_eq!(layout.origin, Some((320, 240)));
+        let style = &layout.lines[0].runs[0].style;
+        assert!(style.underline);
+        assert!(style.strike_out);
+        assert_eq!(style.rotation_x, 12.0);
+        assert_eq!(style.rotation_y, -8.0);
+        assert_eq!(style.shear_x, 0.25);
+        assert_eq!(style.shear_y, -0.5);
+        assert_eq!(style.border_x, 3.0);
+        assert_eq!(style.border_y, 4.0);
+        assert_eq!(style.shadow_x, 5.0);
+        assert_eq!(style.shadow_y, -6.0);
+        assert_eq!(style.be, 2.0);
+        assert_eq!(style.pbo, 7.0);
     }
 
     #[test]
