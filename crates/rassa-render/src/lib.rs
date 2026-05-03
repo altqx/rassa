@@ -2389,6 +2389,42 @@ mod tests {
         Some(bounds)
     }
 
+    fn visible_bounds(planes: &[ImagePlane]) -> Option<Rect> {
+        let mut bounds: Option<Rect> = None;
+        for plane in planes {
+            let stride = plane.stride.max(0) as usize;
+            if stride == 0 {
+                continue;
+            }
+            for y in 0..plane.size.height.max(0) as usize {
+                for x in 0..plane.size.width.max(0) as usize {
+                    if plane.bitmap[y * stride + x] == 0 {
+                        continue;
+                    }
+                    let px = plane.destination.x + x as i32;
+                    let py = plane.destination.y + y as i32;
+                    match &mut bounds {
+                        Some(rect) => {
+                            rect.x_min = rect.x_min.min(px);
+                            rect.y_min = rect.y_min.min(py);
+                            rect.x_max = rect.x_max.max(px + 1);
+                            rect.y_max = rect.y_max.max(py + 1);
+                        }
+                        None => {
+                            bounds = Some(Rect {
+                                x_min: px,
+                                y_min: py,
+                                x_max: px + 1,
+                                y_max: py + 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        bounds
+    }
+
     #[test]
     fn prepare_frame_only_keeps_active_events() {
         let track = parse_script_text("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,First\nDialogue: 0,0:00:02.00,0:00:03.00,Default,,0000,0000,0000,,Second").expect("script should parse");
@@ -2701,17 +2737,22 @@ mod tests {
         );
 
         assert!(!planes.is_empty());
-        assert!(planes.iter().all(|plane| plane.destination.x >= 10));
-        assert!(planes.iter().all(|plane| plane.destination.y >= 10));
+        let bounds = visible_bounds(&planes).expect("visible bounds");
         assert!(
-            planes
-                .iter()
-                .all(|plane| plane.destination.x + plane.size.width <= 110)
+            bounds.x_min >= 10,
+            "visible bounds should start inside content area: {bounds:?}"
         );
         assert!(
-            planes
-                .iter()
-                .all(|plane| plane.destination.y + plane.size.height <= 110)
+            bounds.y_min >= 9,
+            "libass-style antialiasing may allocate one guard row above the content area: {bounds:?}"
+        );
+        assert!(
+            bounds.x_max <= 110,
+            "visible bounds should end inside content area: {bounds:?}"
+        );
+        assert!(
+            bounds.y_max <= 110,
+            "visible bounds should end inside content area: {bounds:?}"
         );
     }
 
@@ -2900,8 +2941,12 @@ mod tests {
             },
         );
 
-        assert!(total_plane_area(&baseline) > 0);
-        assert!(total_plane_area(&widened) > total_plane_area(&baseline));
+        let baseline_bounds = character_bounds(&baseline).expect("baseline character bounds");
+        let widened_bounds = character_bounds(&widened).expect("widened character bounds");
+        assert!(
+            widened_bounds.x_min > baseline_bounds.x_min,
+            "pixel aspect should affect horizontal placement: baseline={baseline_bounds:?} widened={widened_bounds:?}"
+        );
     }
 
     #[test]

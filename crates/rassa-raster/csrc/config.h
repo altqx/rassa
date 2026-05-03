@@ -1,0 +1,8 @@
+#pragma once
+#define CONFIG_FREETYPE 1
+#define CONFIG_FONTCONFIG 1
+#define CONFIG_FRIBIDI 1
+#define CONFIG_HARFBUZZ 1
+#define ARCH_X86 1
+#define ARCH_AARCH64 0
+#define DEBUG_LEVEL 0

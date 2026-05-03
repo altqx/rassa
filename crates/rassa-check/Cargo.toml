@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rassa-core = { path = "../rassa-core" }
 rassa-fonts = { path = "../rassa-fonts" }
 rassa-parse = { path = "../rassa-parse" }

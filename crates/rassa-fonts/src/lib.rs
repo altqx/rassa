@@ -127,7 +127,20 @@ impl FontconfigProvider {
 
     fn find_font(&self, family: String, style: Option<String>) -> Option<fontconfig::Font> {
         let mut config = self.config.lock().expect("fontconfig mutex poisoned");
-        config.find(family, style)
+        let mut pattern = fontconfig::OwnedPattern::new();
+        pattern.add(&fontconfig::properties::FC_FAMILY, family.clone());
+        if let Some(style) = style.clone() {
+            pattern.add(&fontconfig::properties::FC_STYLE, style);
+        }
+        pattern.default_substitute();
+        config.substitute(&mut pattern, fontconfig::MatchKind::Pattern);
+        let font_match = pattern.font_match(&mut config);
+        font_match.name().and_then(|name| {
+            font_match.filename().map(|filename| fontconfig::Font {
+                name: name.to_owned(),
+                path: PathBuf::from(filename),
+            })
+        })
     }
 }
 
@@ -399,6 +412,21 @@ mod tests {
         assert_eq!(result.provider, FontProviderKind::Fontconfig);
         assert!(result.path.is_some());
         assert!(result.path.as_ref().is_some_and(|path| path.exists()));
+    }
+
+    #[test]
+    fn fontconfig_provider_applies_fontconfig_substitutions_for_generic_families() {
+        let expected = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "sans"])
+            .output()
+            .expect("fc-match should be available with fontconfig");
+        assert!(expected.status.success());
+        let expected_path = PathBuf::from(String::from_utf8(expected.stdout).expect("utf8 path"));
+
+        let provider = FontconfigProvider::new();
+        let result = provider.resolve(&FontQuery::new("sans"));
+
+        assert_eq!(result.path, Some(expected_path));
     }
 
     #[test]

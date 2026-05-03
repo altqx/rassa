@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use freetype::{Bitmap, Library, face::LoadFlag, ffi};
+use freetype::{Bitmap, Library, RenderMode, StrokerLineCap, StrokerLineJoin, face::LoadFlag, ffi};
 use rassa_core::{RassaError, RassaResult, ass};
 use rassa_fonts::FontMatch;
 use rassa_shape::{GlyphInfo, ShapedRun};
@@ -113,7 +113,8 @@ impl Rasterizer {
         request_real_dim_size(&mut face, self.options.size_26_6.max(64))?;
 
         let mut rasterized = Vec::with_capacity(glyphs.len());
-        let load_flags = load_flags_for_hinting(self.options.hinting);
+        let mut load_flags = load_flags_for_hinting(self.options.hinting);
+        load_flags.remove(LoadFlag::RENDER);
         for glyph in glyphs {
             let cache_key = GlyphCacheKey {
                 path: font_path.clone(),
@@ -130,7 +131,7 @@ impl Rasterizer {
                 rasterized.push(RasterGlyph {
                     cluster: glyph.cluster,
                     offset_x: glyph.x_offset.round() as i32,
-                    offset_y: (-glyph.y_offset).round() as i32,
+                    offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
                     advance_x: cached.advance_x,
                     advance_y: cached.advance_y,
                     ..cached
@@ -146,22 +147,47 @@ impl Rasterizer {
                     ))
                 })?;
             let slot = face.glyph();
-            let bitmap = slot.bitmap();
-            let stride = bitmap.pitch().abs();
+            let advance = slot.advance();
+            let rendered_outline = slot
+                .outline()
+                .map(|_| rasterize_outline_to_gray_bitmap(library.raw(), &slot.raw().outline))
+                .transpose()?;
+            let used_outline_rasterizer = rendered_outline.is_some();
+            let (width, height, stride, left, top, bitmap) =
+                if let Some(rendered) = rendered_outline {
+                    (
+                        rendered.width,
+                        rendered.height,
+                        rendered.stride,
+                        rendered.left,
+                        rendered.top,
+                        rendered.bitmap,
+                    )
+                } else {
+                    let bitmap = slot.bitmap();
+                    (
+                        bitmap.width(),
+                        bitmap.rows(),
+                        bitmap.pitch().abs(),
+                        slot.bitmap_left(),
+                        slot.bitmap_top(),
+                        copy_bitmap_rows(&bitmap),
+                    )
+                };
             let rendered = RasterGlyph {
                 glyph_id: glyph.glyph_id,
                 cluster: glyph.cluster,
-                width: bitmap.width(),
-                height: bitmap.rows(),
+                width,
+                height,
                 stride,
-                left: slot.bitmap_left(),
-                top: slot.bitmap_top(),
+                left,
+                top,
                 offset_x: glyph.x_offset.round() as i32,
-                offset_y: (-glyph.y_offset).round() as i32,
-                advance_x: (slot.advance().x >> 6) as i32,
-                advance_y: (slot.advance().y >> 6) as i32,
-                pixel_mode: classify_pixel_mode(&bitmap),
-                bitmap: copy_bitmap_rows(&bitmap),
+                offset_y: (-glyph.y_offset).round() as i32 - i32::from(used_outline_rasterizer),
+                advance_x: (advance.x >> 6) as i32,
+                advance_y: (advance.y >> 6) as i32,
+                pixel_mode: RasterPixelMode::Gray,
+                bitmap,
             };
             glyph_cache()
                 .lock()
@@ -182,6 +208,91 @@ impl Rasterizer {
             .iter()
             .map(|glyph| expand_outline(glyph, radius))
             .collect()
+    }
+
+    pub fn rasterize_outline_glyphs(
+        &self,
+        font: &FontMatch,
+        glyphs: &[GlyphInfo],
+        radius: i32,
+    ) -> RassaResult<Vec<RasterGlyph>> {
+        if radius <= 0 {
+            return self.rasterize_glyphs(font, glyphs);
+        }
+
+        let font_path = font
+            .path
+            .as_ref()
+            .ok_or_else(|| RassaError::new(format!("font '{}' is unresolved", font.family)))?;
+        let library = Library::init()
+            .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
+        let mut face = library.new_face(font_path, 0).map_err(|error| {
+            RassaError::new(format!(
+                "failed to load font '{}': {error:?}",
+                font_path.display()
+            ))
+        })?;
+        request_real_dim_size(&mut face, self.options.size_26_6.max(64))?;
+        let stroker = library
+            .new_stroker()
+            .map_err(|error| RassaError::new(format!("freetype stroker init failed: {error:?}")))?;
+        stroker.set(
+            (radius.max(1) * 64).into(),
+            StrokerLineCap::Round,
+            StrokerLineJoin::Round,
+            0,
+        );
+
+        let mut load_flags = load_flags_for_hinting(self.options.hinting);
+        load_flags.remove(LoadFlag::RENDER);
+        let mut outlined = Vec::with_capacity(glyphs.len());
+        for glyph in glyphs {
+            face.load_glyph(glyph.glyph_id, load_flags)
+                .map_err(|error| {
+                    RassaError::new(format!(
+                        "failed to load outline glyph {}: {error:?}",
+                        glyph.glyph_id
+                    ))
+                })?;
+            let slot = face.glyph();
+            let advance = slot.advance();
+            let stroked = slot
+                .get_glyph()
+                .and_then(|glyph| glyph.stroke(&stroker))
+                .map_err(|error| {
+                    RassaError::new(format!(
+                        "failed to stroke outline glyph {}: {error:?}",
+                        glyph.glyph_id
+                    ))
+                })?;
+            let bitmap_glyph = stroked
+                .to_bitmap(RenderMode::Normal, None)
+                .map_err(|error| {
+                    RassaError::new(format!(
+                        "failed to render outline glyph {}: {error:?}",
+                        glyph.glyph_id
+                    ))
+                })?;
+            let bitmap = bitmap_glyph.bitmap();
+            let stride = bitmap.pitch().abs();
+            outlined.push(RasterGlyph {
+                glyph_id: glyph.glyph_id,
+                cluster: glyph.cluster,
+                width: bitmap.width(),
+                height: bitmap.rows(),
+                stride,
+                left: bitmap_glyph.left(),
+                top: bitmap_glyph.top(),
+                offset_x: glyph.x_offset.round() as i32,
+                offset_y: (-glyph.y_offset).round() as i32,
+                advance_x: (advance.x >> 6) as i32,
+                advance_y: (advance.y >> 6) as i32,
+                pixel_mode: classify_pixel_mode(&bitmap),
+                bitmap: copy_bitmap_rows(&bitmap),
+            });
+        }
+
+        Ok(outlined)
     }
 
     pub fn blur_glyphs(&self, glyphs: &[RasterGlyph], radius: u32) -> Vec<RasterGlyph> {
@@ -278,6 +389,80 @@ fn copy_bitmap_rows(bitmap: &Bitmap) -> Vec<u8> {
     }
 
     buffer
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OutlineBitmap {
+    width: i32,
+    height: i32,
+    stride: i32,
+    left: i32,
+    top: i32,
+    bitmap: Vec<u8>,
+}
+
+#[repr(C)]
+struct LibassBitmap {
+    width: i32,
+    height: i32,
+    stride: i32,
+    left: i32,
+    top: i32,
+    buffer: *mut u8,
+}
+
+unsafe extern "C" {
+    fn rassa_libass_rasterize_outline(
+        source: *const ffi::FT_Outline,
+        out: *mut LibassBitmap,
+    ) -> i32;
+    fn rassa_libass_free_bitmap(buffer: *mut u8);
+}
+
+fn rasterize_outline_to_gray_bitmap(
+    _library: ffi::FT_Library,
+    outline: &ffi::FT_Outline,
+) -> RassaResult<OutlineBitmap> {
+    if outline.n_points <= 0 || outline.n_contours <= 0 {
+        return Ok(OutlineBitmap::default());
+    }
+
+    let mut rendered = LibassBitmap {
+        width: 0,
+        height: 0,
+        stride: 0,
+        left: 0,
+        top: 0,
+        buffer: std::ptr::null_mut(),
+    };
+    let ok = unsafe { rassa_libass_rasterize_outline(outline, &mut rendered) };
+    if ok == 0 {
+        return Err(RassaError::new("libass outline rasterizer failed"));
+    }
+    if rendered.buffer.is_null()
+        || rendered.width <= 0
+        || rendered.height <= 0
+        || rendered.stride <= 0
+    {
+        return Ok(OutlineBitmap::default());
+    }
+
+    let len = (rendered.stride * rendered.height) as usize;
+    let bitmap = unsafe {
+        let slice = std::slice::from_raw_parts(rendered.buffer, len);
+        let bitmap = slice.to_vec();
+        rassa_libass_free_bitmap(rendered.buffer);
+        bitmap
+    };
+
+    Ok(OutlineBitmap {
+        width: rendered.width,
+        height: rendered.height,
+        stride: rendered.stride,
+        left: rendered.left,
+        top: rendered.top,
+        bitmap,
+    })
 }
 
 fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {

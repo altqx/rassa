@@ -1,11 +1,15 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use rassa_check::{DEFAULT_SCRIPT, render_report_to_pgm, render_script, render_script_file_to_pgm};
+use rassa_check::{
+    DEFAULT_SCRIPT, ImageFormat, render_report_to_image_bytes, render_script,
+    render_script_file_to_image,
+};
 
 #[derive(Debug)]
 struct Args {
     input: Option<PathBuf>,
     output: PathBuf,
+    format: Option<ImageFormat>,
     time_ms: i64,
     width: i32,
     height: i32,
@@ -17,7 +21,7 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("rassa-check: {error}");
             eprintln!(
-                "usage: rassa-check [--input file.ass] [--output out.pgm] [--time-ms 500] [--width 640] [--height 360]"
+                "usage: rassa-check [--input file.ass] [--output out.png|out.jpg|out.pgm] [--format png|jpg|pgm] [--time-ms 500] [--width 640] [--height 360]"
             );
             ExitCode::FAILURE
         }
@@ -26,19 +30,34 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args(env::args().skip(1))?;
+    let format = args
+        .format
+        .or_else(|| ImageFormat::from_path(&args.output))
+        .ok_or_else(|| format!("cannot infer output format from {}", args.output.display()))?;
+
     let report = if let Some(input) = &args.input {
-        render_script_file_to_pgm(input, &args.output, args.time_ms, args.width, args.height)
-            .map_err(|error| error.to_string())?
+        render_script_file_to_image(
+            input,
+            &args.output,
+            args.time_ms,
+            args.width,
+            args.height,
+            format,
+        )
+        .map_err(|error| error.to_string())?
     } else {
         let report = render_script(DEFAULT_SCRIPT, args.time_ms, args.width, args.height)
             .map_err(|error| error.to_string())?;
-        std::fs::write(&args.output, render_report_to_pgm(&report))
+        let image =
+            render_report_to_image_bytes(&report, format).map_err(|error| error.to_string())?;
+        std::fs::write(&args.output, image)
             .map_err(|error| format!("failed to write {}: {error}", args.output.display()))?;
         report
     };
 
     println!(
-        "render ok: planes={} lit_pixels={} bounds={:?} output={}",
+        "render ok: format={:?} planes={} lit_pixels={} bounds={:?} output={}",
+        format,
         report.plane_count,
         report.lit_pixels,
         report.bounds,
@@ -50,7 +69,8 @@ fn run() -> Result<(), String> {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut parsed = Args {
         input: None,
-        output: PathBuf::from("rassa-check.pgm"),
+        output: PathBuf::from("rassa-check.png"),
+        format: None,
         time_ms: 500,
         width: 640,
         height: 360,
@@ -61,6 +81,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--input" | "-i" => parsed.input = Some(next_path(&mut args, &arg)?),
             "--output" | "-o" => parsed.output = next_path(&mut args, &arg)?,
+            "--format" | "-f" => {
+                let value = next_value(&mut args, &arg)?;
+                parsed.format = Some(
+                    ImageFormat::parse(&value)
+                        .ok_or_else(|| format!("unsupported --format: {value}"))?,
+                );
+            }
             "--time-ms" | "-t" => {
                 parsed.time_ms = next_value(&mut args, &arg)?
                     .parse()
