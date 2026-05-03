@@ -1434,6 +1434,8 @@ mod tests {
         let root = workspace_root();
         let workspace_toml = fs::read_to_string(root.join("Cargo.toml"))
             .expect("workspace Cargo.toml should be readable");
+        let rassa_capi_toml = fs::read_to_string(root.join("crates/rassa-capi/Cargo.toml"))
+            .expect("internal C API implementation crate should exist");
         let libass_capi_toml = fs::read_to_string(root.join("crates/rassa-libass-capi/Cargo.toml"))
             .expect("drop-in libass C API crate should exist");
 
@@ -1449,6 +1451,59 @@ mod tests {
             libass_capi_toml.contains("crate-type = [\"rlib\", \"cdylib\"]"),
             "drop-in C API crate should expose a cdylib"
         );
+        assert!(
+            rassa_capi_toml.contains("crate-type = [\"rlib\"]"),
+            "rassa-capi should remain an internal Rust rlib implementation, not a second public C cdylib"
+        );
+        assert!(
+            !root.join("pkgconfig/rassa.pc").exists(),
+            "rassa Rust ABI should be exposed through Cargo, not a misleading pkg-config C ABI"
+        );
+    }
+
+    #[test]
+    fn workspace_exposes_rassa_rust_abi_facade() {
+        let root = workspace_root();
+        let workspace_toml = fs::read_to_string(root.join("Cargo.toml"))
+            .expect("workspace Cargo.toml should be readable");
+        let rassa_toml = fs::read_to_string(root.join("crates/rassa/Cargo.toml"))
+            .expect("rassa Rust API crate should exist");
+
+        assert!(
+            workspace_toml.contains("\"crates/rassa\""),
+            "workspace should include the rassa Rust API facade crate"
+        );
+        assert!(
+            rassa_toml.contains("name = \"rassa\""),
+            "public Rust API crate should be the cargo package named rassa"
+        );
+        assert!(
+            rassa_toml.contains("path = \"src/lib.rs\""),
+            "rassa Rust API should build as a normal Rust library"
+        );
+        assert!(
+            !rassa_toml.contains("cdylib"),
+            "rassa Rust ABI should not be exposed as another C ABI artifact"
+        );
+    }
+
+    #[test]
+    fn rassa_rust_abi_parses_and_renders_without_c_pointers() {
+        let script = rassa::Script::parse(INLINE_OVERRIDE_FIXTURE).expect("script should parse");
+        let renderer = rassa::Renderer::new();
+        let frame = renderer
+            .render_frame(&script, 500)
+            .expect("safe Rust render API should return a frame");
+
+        assert_eq!(
+            script.play_res(),
+            Size {
+                width: 320,
+                height: 180
+            }
+        );
+        assert_eq!(frame.now_ms, 500);
+        assert!(frame.planes.iter().any(|plane| !plane.bitmap.is_empty()));
     }
 
     #[test]

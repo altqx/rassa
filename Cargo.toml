@@ -10,6 +10,7 @@ members = [
 	"crates/rassa-raster",
 	"crates/rassa-layout",
 	"crates/rassa-render",
+	"crates/rassa",
 	"crates/rassa-capi",
 	"crates/rassa-libass-capi",
 	"crates/rassa-check",

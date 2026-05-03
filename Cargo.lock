@@ -323,6 +323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rassa"
+version = "0.1.0"
+dependencies = [
+ "rassa-core",
+ "rassa-fonts",
+ "rassa-parse",
+ "rassa-render",
+]
+
+[[package]]
 name = "rassa-capi"
 version = "0.1.0"
 dependencies = [
@@ -423,6 +433,7 @@ name = "rassa-test"
 version = "0.1.0"
 dependencies = [
  "png 0.17.16",
+ "rassa",
  "rassa-capi",
  "rassa-core",
  "rassa-fonts",

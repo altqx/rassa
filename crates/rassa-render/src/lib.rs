@@ -1113,7 +1113,7 @@ fn rotate_point(x: f64, y: f64, center_x: f64, center_y: f64, sin: f64, cos: f64
     )
 }
 
-fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {
+pub fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {
     RendererConfig {
         frame: Size {
             width: track.play_res_x,
