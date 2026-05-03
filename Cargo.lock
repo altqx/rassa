@@ -269,6 +269,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rassa-check"
+version = "0.1.0"
+dependencies = [
+ "rassa-core",
+ "rassa-fonts",
+ "rassa-parse",
+ "rassa-render",
+]
+
+[[package]]
 name = "rassa-core"
 version = "0.1.0"
 

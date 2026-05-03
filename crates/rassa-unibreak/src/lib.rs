@@ -79,9 +79,10 @@ fn fallback_word_breaks(text: &str) -> Vec<WordBreakOpportunity> {
         .iter()
         .enumerate()
         .map(|(index, character)| {
-            if character.is_whitespace() || is_basic_word_boundary(*character) {
-                WordBreakOpportunity::Break
-            } else if index + 1 == chars.len() {
+            if character.is_whitespace()
+                || is_basic_word_boundary(*character)
+                || index + 1 == chars.len()
+            {
                 WordBreakOpportunity::Break
             } else {
                 WordBreakOpportunity::NoBreak

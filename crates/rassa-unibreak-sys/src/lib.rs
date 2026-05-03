@@ -38,6 +38,15 @@ unsafe extern "C" {
     );
 }
 
+/// Analyze Unicode line-break opportunities using libunibreak when available.
+///
+/// # Safety
+///
+/// `s` must point to at least `len` valid UTF-32 code units, `brks` must point
+/// to writable storage for at least `len` break markers, and `lang` must either
+/// be null or point to a valid NUL-terminated C string for the duration of the
+/// call. The pointers must not alias in a way that violates Rust's aliasing
+/// rules.
 pub unsafe fn analyze_linebreaks_utf32(
     s: *const utf32_t,
     len: usize,
@@ -60,6 +69,15 @@ pub unsafe fn analyze_linebreaks_utf32(
     }
 }
 
+/// Analyze Unicode word-break opportunities using libunibreak when available.
+///
+/// # Safety
+///
+/// `s` must point to at least `len` valid UTF-32 code units, `brks` must point
+/// to writable storage for at least `len` break markers, and `lang` must either
+/// be null or point to a valid NUL-terminated C string for the duration of the
+/// call. The pointers must not alias in a way that violates Rust's aliasing
+/// rules.
 pub unsafe fn analyze_wordbreaks_utf32(
     s: *const utf32_t,
     len: usize,

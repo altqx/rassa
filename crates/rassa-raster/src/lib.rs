@@ -9,17 +9,12 @@ use rassa_core::{RassaError, RassaResult, ass};
 use rassa_fonts::FontMatch;
 use rassa_shape::{GlyphInfo, ShapedRun};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RasterPixelMode {
     Mono,
+    #[default]
     Gray,
     Other,
-}
-
-impl Default for RasterPixelMode {
-    fn default() -> Self {
-        Self::Gray
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -262,7 +257,7 @@ fn classify_pixel_mode(bitmap: &Bitmap) -> RasterPixelMode {
 }
 
 fn copy_bitmap_rows(bitmap: &Bitmap) -> Vec<u8> {
-    let stride = bitmap.pitch().abs() as usize;
+    let stride = bitmap.pitch().unsigned_abs() as usize;
     let rows = bitmap.rows().max(0) as usize;
     let source = bitmap.buffer();
     let mut buffer = vec![0; stride * rows];

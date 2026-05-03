@@ -100,7 +100,7 @@ pub fn analyze_bidi(text: &str) -> RassaResult<BidiAnalysis> {
 
     #[cfg(fribidi_available)]
     {
-        return analyze_bidi_with_fribidi(text);
+        analyze_bidi_with_fribidi(text)
     }
 
     #[cfg(not(fribidi_available))]
@@ -228,7 +228,7 @@ fn segment_by_mandatory_breaks(text: &str, analysis: &BreakAnalysis) -> Vec<Text
 
     segments
         .into_iter()
-        .filter(|segment| !(segment.text.is_empty() && !text.is_empty()))
+        .filter(|segment| !segment.text.is_empty() || text.is_empty())
         .collect()
 }
 

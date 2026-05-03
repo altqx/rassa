@@ -11,6 +11,7 @@ members = [
 	"crates/rassa-layout",
 	"crates/rassa-render",
 	"crates/rassa-capi",
+	"crates/rassa-check",
 	"crates/rassa-test",
 ]
 resolver = "2"

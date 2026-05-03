@@ -527,7 +527,7 @@ pub fn parse_dialogue_text(
         match character {
             '{' => {
                 let mut tag_block = String::new();
-                while let Some(next) = characters.next() {
+                for next in characters.by_ref() {
                     if next == '}' {
                         break;
                     }
@@ -860,6 +860,7 @@ fn parse_style_reference(value: &str, styles: &[ParsedStyle]) -> i32 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_override_block(
     block: &str,
     base_style: &ParsedStyle,
@@ -1193,9 +1194,7 @@ fn parse_karaoke_duration(value: &str) -> Option<i32> {
 
 fn parse_override_color(value: &str, fallback: u32) -> u32 {
     let trimmed = value.trim();
-    let trimmed = trimmed
-        .trim_matches('&')
-        .trim_start_matches(|character| character == 'H' || character == 'h');
+    let trimmed = trimmed.trim_matches('&').trim_start_matches(['H', 'h']);
     if trimmed.is_empty() {
         return fallback;
     }
@@ -1205,9 +1204,7 @@ fn parse_override_color(value: &str, fallback: u32) -> u32 {
 
 fn parse_alpha_tag(value: &str, fallback: u8) -> u8 {
     let trimmed = value.trim();
-    let trimmed = trimmed
-        .trim_matches('&')
-        .trim_start_matches(|character| character == 'H' || character == 'h');
+    let trimmed = trimmed.trim_matches('&').trim_start_matches(['H', 'h']);
     if trimmed.is_empty() {
         return fallback;
     }
@@ -1383,9 +1380,7 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 index = next_index;
             }
             "p" => {
-                let Some(state) = spline_state.as_mut() else {
-                    return None;
-                };
+                let state = spline_state.as_mut()?;
                 index += 1;
                 let mut consumed = false;
                 while let Some((point, next_index)) =
@@ -1408,9 +1403,7 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 }
             }
             "c" => {
-                let Some(state) = spline_state.take() else {
-                    return None;
-                };
+                let state = spline_state.take()?;
                 for point in state.first_three {
                     let len = state.history.len();
                     current.extend(approximate_spline_segment(

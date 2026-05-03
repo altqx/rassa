@@ -738,10 +738,6 @@ fn border_shadow_compensation_scale(track: &ParsedTrack, config: &RendererConfig
     }
 }
 
-fn scaled_line_width(width: f32, config: &RendererConfig) -> i32 {
-    (f64::from(width) * renderer_font_scale(config)).round() as i32
-}
-
 fn scale_glyph_infos(glyphs: &[GlyphInfo], scale_x: f64, scale_y: f64) -> Vec<GlyphInfo> {
     let scale_x = style_scale(scale_x) as f32;
     let scale_y = style_scale(scale_y) as f32;
@@ -874,6 +870,7 @@ fn compute_fad_alpha(fade: ParsedFade, source_event: Option<&ParsedEvent>, now_m
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interpolate_alpha(
     now: i64,
     t1: i32,
@@ -1182,65 +1179,6 @@ fn translate_planes(mut planes: Vec<ImagePlane>, offset: Point) -> Vec<ImagePlan
         plane.destination.y += offset.y;
     }
     planes
-}
-
-fn scale_output_planes(
-    planes: Vec<ImagePlane>,
-    track: &ParsedTrack,
-    config: &RendererConfig,
-) -> Vec<ImagePlane> {
-    let scale_x = output_scale_x(track, config);
-    let scale_y = output_scale_y(track, config);
-    let offset = output_offset(config);
-    if (scale_x - 1.0).abs() < f64::EPSILON
-        && (scale_y - 1.0).abs() < f64::EPSILON
-        && offset == Point::default()
-    {
-        return planes;
-    }
-
-    planes
-        .into_iter()
-        .filter_map(|plane| scale_plane(plane, scale_x, scale_y, offset))
-        .collect()
-}
-
-fn scale_plane(plane: ImagePlane, scale_x: f64, scale_y: f64, offset: Point) -> Option<ImagePlane> {
-    let src_width = plane.size.width.max(0) as usize;
-    let src_height = plane.size.height.max(0) as usize;
-    if src_width == 0 || src_height == 0 || plane.bitmap.is_empty() {
-        return None;
-    }
-
-    let left = (f64::from(plane.destination.x) * scale_x).round() as i32 + offset.x;
-    let top = (f64::from(plane.destination.y) * scale_y).round() as i32 + offset.y;
-    let right =
-        (f64::from(plane.destination.x + plane.size.width) * scale_x).round() as i32 + offset.x;
-    let bottom =
-        (f64::from(plane.destination.y + plane.size.height) * scale_y).round() as i32 + offset.y;
-    let dst_width = (right - left).max(1) as usize;
-    let dst_height = (bottom - top).max(1) as usize;
-    let src_stride = plane.stride.max(0) as usize;
-    let mut bitmap = vec![0_u8; dst_width * dst_height];
-
-    for row in 0..dst_height {
-        let src_row = ((row * src_height) / dst_height).min(src_height - 1);
-        for column in 0..dst_width {
-            let src_column = ((column * src_width) / dst_width).min(src_width - 1);
-            bitmap[row * dst_width + column] = plane.bitmap[src_row * src_stride + src_column];
-        }
-    }
-
-    Some(ImagePlane {
-        size: Size {
-            width: dst_width as i32,
-            height: dst_height as i32,
-        },
-        stride: dst_width as i32,
-        destination: Point { x: left, y: top },
-        bitmap,
-        ..plane
-    })
 }
 
 fn frame_clip_rect(
@@ -1839,18 +1777,19 @@ fn calc_matrix_libass(mat: &mut [[f64; 8]; 8], mat_freq: &[f64], n: usize) {
     for k in 0..n {
         let z = 1.0 / mat[k][k];
         mat[k][k] = 1.0;
-        for i in 0..n {
+        let pivot_row = mat[k];
+        for (i, row) in mat.iter_mut().enumerate().take(n) {
             if i == k {
                 continue;
             }
-            let mul = mat[i][k] * z;
-            mat[i][k] = 0.0;
+            let mul = row[k] * z;
+            row[k] = 0.0;
             for j in 0..n {
-                mat[i][j] -= mat[k][j] * mul;
+                row[j] -= pivot_row[j] * mul;
             }
         }
-        for j in 0..n {
-            mat[k][j] *= z;
+        for value in mat[k].iter_mut().take(n) {
+            *value *= z;
         }
     }
 }
@@ -3342,7 +3281,7 @@ mod tests {
             .expect("drawing plane");
         assert_eq!(plane.destination.x, 10);
         assert_eq!(plane.destination.y, 10);
-        assert!(plane.bitmap.iter().any(|value| *value == 255));
+        assert!(plane.bitmap.contains(&255));
     }
 
     #[test]
@@ -3356,7 +3295,7 @@ mod tests {
             .iter()
             .find(|plane| plane.kind == ass::ImageType::Character)
             .expect("drawing plane");
-        assert!(plane.bitmap.iter().any(|value| *value == 255));
+        assert!(plane.bitmap.contains(&255));
         assert!(plane.size.width >= 8);
         assert!(plane.size.height >= 8);
     }
@@ -3391,7 +3330,7 @@ mod tests {
             .iter()
             .find(|plane| plane.kind == ass::ImageType::Character)
             .expect("drawing plane");
-        assert!(plane.bitmap.iter().any(|value| *value == 255));
+        assert!(plane.bitmap.contains(&255));
         assert!(plane.size.width >= 10);
         assert!(plane.size.height >= 10);
     }
@@ -3407,7 +3346,7 @@ mod tests {
             .iter()
             .find(|plane| plane.kind == ass::ImageType::Character)
             .expect("drawing plane");
-        assert!(plane.bitmap.iter().any(|value| *value == 255));
+        assert!(plane.bitmap.contains(&255));
         assert!(plane.size.width >= 28);
         assert!(plane.size.height >= 28);
     }

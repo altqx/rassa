@@ -1,0 +1,19 @@
+[package]
+name = "rassa-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rassa-core = { path = "../rassa-core" }
+rassa-fonts = { path = "../rassa-fonts" }
+rassa-parse = { path = "../rassa-parse" }
+rassa-render = { path = "../rassa-render" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rassa-check"
+path = "src/main.rs"

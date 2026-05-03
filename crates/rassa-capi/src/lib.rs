@@ -1,5 +1,7 @@
 #![allow(
     dead_code,
+    clippy::missing_safety_doc,
+    clippy::vec_box,
     non_camel_case_types,
     non_snake_case,
     unsafe_op_in_unsafe_fn
