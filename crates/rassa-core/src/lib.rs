@@ -33,11 +33,16 @@ pub mod ass {
     }
 
     #[repr(i32)]
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ShapingLevel {
-        #[default]
         Simple = 0,
         Complex = 1,
+    }
+
+    impl Default for ShapingLevel {
+        fn default() -> Self {
+            Self::Complex
+        }
     }
 
     #[repr(i32)]

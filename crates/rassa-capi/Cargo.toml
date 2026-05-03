@@ -13,5 +13,6 @@ rassa-parse = { path = "../rassa-parse" }
 rassa-render = { path = "../rassa-render" }
 
 [lib]
+name = "rassa"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]

@@ -2,6 +2,46 @@
 
 Append new session entries at the top of this file.
 
+## 2026-05-03
+
+### Pixel-Parity Continuation
+- Tightened the strict upstream `libass/compare/test/sub2-153000.png` parity harness with richer diagnostics for differing pixels, emitted plane summaries, nontransparent counts, bboxes, and first-diff samples.
+- Fixed additional root causes exposed by the strict harness: ASS style `Alignment` values are now normalized through `\an`-style libass alignment bits; renderer default shaping now follows the C API's complex-shaping default; HarfBuzz advances/offsets are scaled from font units by the requested span font size; glyph rasterization now uses HarfBuzz glyph indices on the complex path; `\blur` is now applied to fill planes, not only outline/shadow planes; and large-font centered layout now uses a font-size-derived line height instead of the fixed `40px` placeholder.
+- Current strict `sub2-153000` parity status is much closer but still not pixel-perfect: bbox improved from approximately `actual=(163,70,320,127)` vs `target=(38,62,288,137)` to `actual=(38,62,288,138)` vs `target=(38,62,288,137)`. Remaining mismatch is now mainly blur/filter/composition intensity and a one-pixel vertical extent, not gross placement or glyph-selection.
+
+### Pixel-Parity Verification This Pass
+- Focused parser alignment regression passed earlier: `cargo test -p rassa-parse normalizes_style_alignment_numbers_to_libass_bits -- --nocapture`.
+- Focused strict parity still fails as expected while tracking the remaining blur/composition delta: `cargo test -p rassa-test upstream_compare_reference_sub2_is_pixel_perfect -- --nocapture`.
+- Latest diagnostic: `planes=[x=38..288], actual_nontransparent=7675, target_nontransparent=7257, actual_bbox=Some((38, 62, 288, 138)), target_bbox=Some((38, 62, 288, 137)), first_diff=Some((19878, [0,0,771,64764], [0,0,0,65535]))`.
+
+### Added This Session
+- Cloned `altqx/rassa` into `~/Work/rassa` and cloned upstream `libass/libass` into `~/Work/rassa/libass` as the local parity reference.
+- Fixed the renderer fade-alpha regression by applying computed `\fad`/`\fade` event alpha directly to emitted image-plane colors while preserving color channels.
+- Exported the previously internal `ass_flush_events` symbol, completing the current public `libass/libass/ass.h` function-symbol inventory.
+- Renamed the `rassa-capi` cdylib output to `libass.so` so release builds produce a library with the expected drop-in linker name.
+- Kept Rust tests importing the C API crate through a package alias after the library name change.
+- Added drop-in include headers under `include/ass/` from the local upstream reference and added a `pkgconfig/libass.pc` file pointing at `target/release/libass.so` and `include`.
+- Added the first automated `libass/compare/test` validation harness in `rassa-test`: it loads upstream `sub1.ass`/`sub2.ass`, reads the bundled reference PNG dimensions directly from IHDR bytes, renders the corresponding frame timestamps, and asserts generated image planes are non-empty, visible, time-varying, and inside the reference frame.
+- Closed the newly reproduced rotation gap by parsing inline/style `\frz`/`\fr` Z-rotation and timed `\t(...\frz...)` transforms, interpolating rotation at render time, and rotating all event image planes around the event bounds before clipping/fade/output scaling.
+
+### Verified
+- `cargo fmt` completed successfully after the parser/renderer/harness changes.
+- Focused parser coverage passes: `cargo test -p rassa-parse parses_z_rotation_overrides_and_transforms -- --nocapture`.
+- Focused renderer coverage passes: `cargo test -p rassa-render render_frame_applies_z_rotation_to_event_planes -- --nocapture` and `cargo test -p rassa-render render_frame_interpolates_z_rotation_transform -- --nocapture`.
+- Upstream fixture harness passes: `cargo test -p rassa-test upstream_compare_reference_png_matrix_renders_within_frame -- --nocapture`.
+- `cargo test` passes for the full workspace.
+- `cargo build --release -p rassa-capi` produces `target/release/libass.so`.
+- Exported-symbol inventory matches upstream `ass.h`: 50 prototypes, 50 exported `ass_*` symbols, no missing/extra public function symbols.
+- A C smoke program including `<ass/ass.h>` links against `target/release/libass.so`, initializes/frees library/renderer/track objects, and runs successfully with output `24133632`.
+
+### Current Gaps
+- The currently automated gap checks all pass, including the new upstream compare-fixture smoke harness and Z-rotation regressions.
+- Full libass parity is still not complete in the strict pixel-exact sense: the new harness validates fixture coverage and image-list sanity, but does not yet compare rendered pixels against upstream `libass` output byte-for-byte. Broader exact pixel parity, full layout/collision parity, and exhaustive validation corpus comparison remain future hardening work.
+- The included headers are copied from the checked-out upstream reference; keep them in sync when changing the C ABI surface.
+
+### Recommended Next Step
+- Upgrade the `libass/compare/test` harness from image-list/frame sanity checks to an upstream-vs-rassa pixel diff once rassa has a stable RGBA composition path or a dependency-light PNG decoder/encoder in the test stack.
+
 ## 2026-04-28
 
 ### Added This Session

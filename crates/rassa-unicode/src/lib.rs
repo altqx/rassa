@@ -3,7 +3,7 @@
 use std::{ops::Range, os::raw::c_int};
 
 use rassa_core::RassaResult;
-use rassa_unibreak::{analyze_breaks, BreakAnalysis, LineBreakOpportunity, WordBreakOpportunity};
+use rassa_unibreak::{BreakAnalysis, LineBreakOpportunity, WordBreakOpportunity, analyze_breaks};
 
 const FRIBIDI_MASK_RTL: u32 = 0x0000_0001;
 const FRIBIDI_MASK_WEAK: u32 = 0x0000_0020;
@@ -84,7 +84,11 @@ impl UnicodePipeline {
         })
     }
 
-    pub fn segment_text(&self, text: &str, language: Option<&str>) -> RassaResult<Vec<TextSegment>> {
+    pub fn segment_text(
+        &self,
+        text: &str,
+        language: Option<&str>,
+    ) -> RassaResult<Vec<TextSegment>> {
         Ok(self.analyze_text(text, language)?.segments)
     }
 }
@@ -172,7 +176,10 @@ fn map_bidi_direction(value: u32) -> BidiDirection {
 }
 
 fn normalize_indices(indices: &[i32]) -> Vec<usize> {
-    indices.iter().map(|index| (*index).max(0) as usize).collect()
+    indices
+        .iter()
+        .map(|index| (*index).max(0) as usize)
+        .collect()
 }
 
 fn utf32_to_string(codepoints: &[u32]) -> String {
@@ -189,17 +196,34 @@ fn segment_by_mandatory_breaks(text: &str, analysis: &BreakAnalysis) -> Vec<Text
     let chars = text.char_indices().collect::<Vec<_>>();
 
     for (index, (byte_index, character)) in chars.iter().copied().enumerate() {
-        let should_break = matches!(analysis.line_breaks.get(index), Some(LineBreakOpportunity::Mandatory));
+        let should_break = matches!(
+            analysis.line_breaks.get(index),
+            Some(LineBreakOpportunity::Mandatory)
+        );
         if should_break {
             let end_byte = byte_index + character.len_utf8();
-            segments.push(build_segment(text, analysis, byte_start, end_byte, char_start, index + 1));
+            segments.push(build_segment(
+                text,
+                analysis,
+                byte_start,
+                end_byte,
+                char_start,
+                index + 1,
+            ));
             byte_start = end_byte;
             char_start = index + 1;
         }
     }
 
     if char_start < chars.len() || text.is_empty() {
-        segments.push(build_segment(text, analysis, byte_start, text.len(), char_start, chars.len()));
+        segments.push(build_segment(
+            text,
+            analysis,
+            byte_start,
+            text.len(),
+            char_start,
+            chars.len(),
+        ));
     }
 
     segments

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::ffi::{c_char, CString};
+use std::ffi::{CString, c_char};
 
 use rassa_core::{RassaError, RassaResult};
 use rassa_unibreak_sys as sys;
@@ -40,11 +40,17 @@ pub fn analyze_breaks(text: &str, language: Option<&str>) -> RassaResult<BreakAn
     })
 }
 
-pub fn classify_line_breaks(text: &str, language: Option<&str>) -> RassaResult<Vec<LineBreakOpportunity>> {
+pub fn classify_line_breaks(
+    text: &str,
+    language: Option<&str>,
+) -> RassaResult<Vec<LineBreakOpportunity>> {
     classify_line_breaks_with_libunibreak(text, language)
 }
 
-pub fn classify_word_breaks(text: &str, language: Option<&str>) -> RassaResult<Vec<WordBreakOpportunity>> {
+pub fn classify_word_breaks(
+    text: &str,
+    language: Option<&str>,
+) -> RassaResult<Vec<WordBreakOpportunity>> {
     classify_word_breaks_with_libunibreak(text, language)
 }
 
@@ -85,14 +91,20 @@ fn fallback_word_breaks(text: &str) -> Vec<WordBreakOpportunity> {
 }
 
 fn is_basic_word_boundary(character: char) -> bool {
-    matches!(character, '-' | '/' | '\\' | '.' | ',' | ';' | ':' | '!' | '?')
+    matches!(
+        character,
+        '-' | '/' | '\\' | '.' | ',' | ';' | ':' | '!' | '?'
+    )
 }
 
 fn to_utf32(text: &str) -> Vec<u32> {
     text.chars().map(u32::from).collect()
 }
 
-fn classify_line_breaks_with_libunibreak(text: &str, language: Option<&str>) -> RassaResult<Vec<LineBreakOpportunity>> {
+fn classify_line_breaks_with_libunibreak(
+    text: &str,
+    language: Option<&str>,
+) -> RassaResult<Vec<LineBreakOpportunity>> {
     let codepoints = to_utf32(text);
     let mut output = vec![sys::LINEBREAK_NOBREAK; codepoints.len()];
     let language = make_lang_cstring(language)?;
@@ -101,7 +113,9 @@ fn classify_line_breaks_with_libunibreak(text: &str, language: Option<&str>) -> 
         sys::analyze_linebreaks_utf32(
             codepoints.as_ptr(),
             codepoints.len(),
-            language.as_ref().map_or(std::ptr::null(), |lang| lang.as_ptr()),
+            language
+                .as_ref()
+                .map_or(std::ptr::null(), |lang| lang.as_ptr()),
             output.as_mut_ptr(),
         )
     };
@@ -113,7 +127,10 @@ fn classify_line_breaks_with_libunibreak(text: &str, language: Option<&str>) -> 
     Ok(output.into_iter().map(map_line_break).collect())
 }
 
-fn classify_word_breaks_with_libunibreak(text: &str, language: Option<&str>) -> RassaResult<Vec<WordBreakOpportunity>> {
+fn classify_word_breaks_with_libunibreak(
+    text: &str,
+    language: Option<&str>,
+) -> RassaResult<Vec<WordBreakOpportunity>> {
     let codepoints = to_utf32(text);
     let mut output = vec![sys::WORDBREAK_NOBREAK; codepoints.len()];
     let language = make_lang_cstring(language)?;
@@ -122,7 +139,9 @@ fn classify_word_breaks_with_libunibreak(text: &str, language: Option<&str>) -> 
         sys::analyze_wordbreaks_utf32(
             codepoints.as_ptr(),
             codepoints.len(),
-            language.as_ref().map_or(std::ptr::null(), |lang| lang.as_ptr()),
+            language
+                .as_ref()
+                .map_or(std::ptr::null(), |lang| lang.as_ptr()),
             output.as_mut_ptr(),
         )
     };
@@ -137,7 +156,10 @@ fn classify_word_breaks_with_libunibreak(text: &str, language: Option<&str>) -> 
 fn make_lang_cstring(language: Option<&str>) -> RassaResult<Option<CString>> {
     language
         .filter(|language| !language.is_empty())
-        .map(|language| CString::new(language).map_err(|_| RassaError::new("language contains interior NUL byte")))
+        .map(|language| {
+            CString::new(language)
+                .map_err(|_| RassaError::new("language contains interior NUL byte"))
+        })
         .transpose()
 }
 
@@ -172,7 +194,8 @@ mod tests {
 
     #[test]
     fn newline_is_always_mandatory_break() {
-        let breaks = classify_line_breaks("a\nb", Some("en")).expect("line break analysis should succeed");
+        let breaks =
+            classify_line_breaks("a\nb", Some("en")).expect("line break analysis should succeed");
         assert_eq!(breaks[1], LineBreakOpportunity::Mandatory);
     }
 }

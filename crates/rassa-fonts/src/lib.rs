@@ -52,7 +52,11 @@ pub struct FontMatch {
 }
 
 impl FontMatch {
-    pub fn unresolved(family: impl Into<String>, style: Option<String>, provider: FontProviderKind) -> Self {
+    pub fn unresolved(
+        family: impl Into<String>,
+        style: Option<String>,
+        provider: FontProviderKind,
+    ) -> Self {
         Self {
             family: family.into(),
             path: None,
@@ -87,7 +91,11 @@ pub struct NullFontProvider;
 
 impl FontProvider for NullFontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
-        FontMatch::unresolved(query.family.clone(), query.style.clone(), FontProviderKind::Null)
+        FontMatch::unresolved(
+            query.family.clone(),
+            query.style.clone(),
+            FontProviderKind::Null,
+        )
     }
 }
 
@@ -145,7 +153,11 @@ impl FontProvider for FontconfigProvider {
             }
         }
 
-        FontMatch::unresolved(query.family.clone(), query.style.clone(), FontProviderKind::Fontconfig)
+        FontMatch::unresolved(
+            query.family.clone(),
+            query.style.clone(),
+            FontProviderKind::Fontconfig,
+        )
     }
 }
 
@@ -167,7 +179,10 @@ impl AttachedFontProvider {
         Self::from_attachments_in_dir(attachments, None::<&Path>)
     }
 
-    pub fn from_attachments_in_dir(attachments: &[FontAttachment], base_dir: Option<impl AsRef<Path>>) -> Self {
+    pub fn from_attachments_in_dir(
+        attachments: &[FontAttachment],
+        base_dir: Option<impl AsRef<Path>>,
+    ) -> Self {
         let root = base_dir
             .as_ref()
             .map(|path| path.as_ref().to_path_buf())
@@ -176,7 +191,9 @@ impl AttachedFontProvider {
         let library = Library::init().ok();
         let fonts = attachments
             .iter()
-            .filter_map(|attachment| AttachedFontRecord::from_attachment(attachment, &root, library.as_ref()))
+            .filter_map(|attachment| {
+                AttachedFontRecord::from_attachment(attachment, &root, library.as_ref())
+            })
             .collect();
 
         Self { fonts }
@@ -190,9 +207,9 @@ impl FontProvider for AttachedFontProvider {
 
         let exact = self.fonts.iter().find(|font| {
             font.aliases.iter().any(|alias| alias == &family_key)
-                && style_key
-                    .as_ref()
-                    .is_none_or(|style| font.style.as_deref().map(normalize_font_key).as_ref() == Some(style))
+                && style_key.as_ref().is_none_or(|style| {
+                    font.style.as_deref().map(normalize_font_key).as_ref() == Some(style)
+                })
         });
         let fallback = self
             .fonts
@@ -208,7 +225,11 @@ impl FontProvider for AttachedFontProvider {
             };
         }
 
-        FontMatch::unresolved(query.family.clone(), query.style.clone(), FontProviderKind::Attached)
+        FontMatch::unresolved(
+            query.family.clone(),
+            query.style.clone(),
+            FontProviderKind::Attached,
+        )
     }
 }
 
@@ -272,7 +293,11 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
 }
 
 impl AttachedFontRecord {
-    fn from_attachment(attachment: &FontAttachment, root: &Path, library: Option<&Library>) -> Option<Self> {
+    fn from_attachment(
+        attachment: &FontAttachment,
+        root: &Path,
+        library: Option<&Library>,
+    ) -> Option<Self> {
         if attachment.data.is_empty() {
             return None;
         }
@@ -281,8 +306,8 @@ impl AttachedFontRecord {
         let fallback_name = attachment_file_stem(attachment)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| attachment.name.clone());
-        let (family, style) = load_face_metadata(library, &path)
-            .unwrap_or_else(|| (fallback_name.clone(), None));
+        let (family, style) =
+            load_face_metadata(library, &path).unwrap_or_else(|| (fallback_name.clone(), None));
         let mut aliases = vec![normalize_font_key(&family)];
         if let Some(stem) = attachment_file_stem(attachment) {
             aliases.push(normalize_font_key(&stem));
@@ -382,7 +407,11 @@ mod tests {
         let path = system.path.expect("system font path should exist");
         let data = fs::read(&path).expect("font bytes should be readable");
         let provider = AttachedFontProvider::from_attachments(&[FontAttachment {
-            name: path.file_name().expect("font filename").to_string_lossy().into_owned(),
+            name: path
+                .file_name()
+                .expect("font filename")
+                .to_string_lossy()
+                .into_owned(),
             data,
         }]);
 
@@ -390,7 +419,12 @@ mod tests {
 
         assert_eq!(result.provider, FontProviderKind::Attached);
         assert!(result.path.is_some());
-        assert!(result.path.as_ref().is_some_and(|materialized| materialized.exists()));
+        assert!(
+            result
+                .path
+                .as_ref()
+                .is_some_and(|materialized| materialized.exists())
+        );
     }
 
     #[test]
@@ -404,7 +438,8 @@ mod tests {
 
     #[test]
     fn default_font_file_provider_falls_back_to_configured_path() {
-        let provider = DefaultFontFileProvider::new(NullFontProvider, "/tmp/default-font.ttf").with_family("Default");
+        let provider = DefaultFontFileProvider::new(NullFontProvider, "/tmp/default-font.ttf")
+            .with_family("Default");
         let result = provider.resolve(&FontQuery::new("missing"));
 
         assert_eq!(result.provider, FontProviderKind::DefaultFile);

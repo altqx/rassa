@@ -6,8 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+png = "0.17"
 rassa-core = { path = "../rassa-core" }
-rassa-capi = { path = "../rassa-capi" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi" }
 rassa-fonts = { path = "../rassa-fonts" }
 rassa-parse = { path = "../rassa-parse" }
 rassa-render = { path = "../rassa-render" }

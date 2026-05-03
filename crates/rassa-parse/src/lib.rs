@@ -1,6 +1,6 @@
 use rassa_core::{
+    Point, RassaResult, Rect,
     ass::{self, TrackType, YCbCrMatrix},
-    Point, Rect, RassaResult,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,6 +94,7 @@ pub struct ParsedSpanStyle {
     pub scale_x: f64,
     pub scale_y: f64,
     pub spacing: f64,
+    pub rotation_z: f64,
     pub bold: bool,
     pub italic: bool,
     pub primary_colour: u32,
@@ -111,6 +112,7 @@ pub struct ParsedAnimatedStyle {
     pub scale_x: Option<f64>,
     pub scale_y: Option<f64>,
     pub spacing: Option<f64>,
+    pub rotation_z: Option<f64>,
     pub primary_colour: Option<u32>,
     pub secondary_colour: Option<u32>,
     pub outline_colour: Option<u32>,
@@ -126,6 +128,7 @@ impl ParsedAnimatedStyle {
             && self.scale_x.is_none()
             && self.scale_y.is_none()
             && self.spacing.is_none()
+            && self.rotation_z.is_none()
             && self.primary_colour.is_none()
             && self.secondary_colour.is_none()
             && self.outline_colour.is_none()
@@ -152,6 +155,7 @@ impl Default for ParsedSpanStyle {
             scale_x: ParsedStyle::default().scale_x,
             scale_y: ParsedStyle::default().scale_y,
             spacing: ParsedStyle::default().spacing,
+            rotation_z: ParsedStyle::default().angle,
             bold: false,
             italic: false,
             primary_colour: ParsedStyle::default().primary_colour,
@@ -173,6 +177,7 @@ impl ParsedSpanStyle {
             scale_x: style.scale_x,
             scale_y: style.scale_y,
             spacing: style.spacing,
+            rotation_z: style.angle,
             bold: style.bold,
             italic: style.italic,
             primary_colour: style.primary_colour,
@@ -357,7 +362,12 @@ pub fn parse_script_text(text: &str) -> RassaResult<ParsedTrack> {
         }
 
         if section == "fonts" {
-            process_font_line(line, &mut track, &mut pending_font_name, &mut pending_font_data);
+            process_font_line(
+                line,
+                &mut track,
+                &mut pending_font_name,
+                &mut pending_font_data,
+            );
             continue;
         }
 
@@ -394,7 +404,12 @@ pub fn parse_script_text(text: &str) -> RassaResult<ParsedTrack> {
                             track.event_format = event_format.join(", ");
                         }
                     }
-                    if let Some(event) = parse_event_line(value, &event_format, track.events.len() as i32, &track.styles) {
+                    if let Some(event) = parse_event_line(
+                        value,
+                        &event_format,
+                        track.events.len() as i32,
+                        &track.styles,
+                    ) {
                         track.events.push(event);
                     }
                 }
@@ -493,7 +508,11 @@ fn decode_chars(src: &[u8], dst: &mut Vec<u8>) {
     }
 }
 
-pub fn parse_dialogue_text(text: &str, base_style: &ParsedStyle, styles: &[ParsedStyle]) -> ParsedDialogueText {
+pub fn parse_dialogue_text(
+    text: &str,
+    base_style: &ParsedStyle,
+    styles: &[ParsedStyle],
+) -> ParsedDialogueText {
     let mut parsed = ParsedDialogueText::default();
     let mut current_style = ParsedSpanStyle::from_style(base_style);
     let mut active_line = ParsedTextLine::default();
@@ -528,26 +547,38 @@ pub fn parse_dialogue_text(text: &str, base_style: &ParsedStyle, styles: &[Parse
                     &mut current_transforms,
                 );
             }
-            '\\' => {
-                match characters.peek().copied() {
-                    Some('N') | Some('n') => {
-                        characters.next();
-                        flush_span(&mut buffer, &current_style, pending_karaoke, drawing_scale, &current_transforms, &mut active_line);
-                        push_line(&mut parsed, &mut active_line);
-                    }
-                    Some('h') => {
-                        characters.next();
-                        buffer.push('\u{00A0}');
-                    }
-                    Some(next) => {
-                        characters.next();
-                        buffer.push(next);
-                    }
-                    None => buffer.push(character),
+            '\\' => match characters.peek().copied() {
+                Some('N') | Some('n') => {
+                    characters.next();
+                    flush_span(
+                        &mut buffer,
+                        &current_style,
+                        pending_karaoke,
+                        drawing_scale,
+                        &current_transforms,
+                        &mut active_line,
+                    );
+                    push_line(&mut parsed, &mut active_line);
                 }
-            }
+                Some('h') => {
+                    characters.next();
+                    buffer.push('\u{00A0}');
+                }
+                Some(next) => {
+                    characters.next();
+                    buffer.push(next);
+                }
+                None => buffer.push(character),
+            },
             '\n' => {
-                flush_span(&mut buffer, &current_style, pending_karaoke, drawing_scale, &current_transforms, &mut active_line);
+                flush_span(
+                    &mut buffer,
+                    &current_style,
+                    pending_karaoke,
+                    drawing_scale,
+                    &current_transforms,
+                    &mut active_line,
+                );
                 push_line(&mut parsed, &mut active_line);
             }
             '\r' => {}
@@ -555,7 +586,14 @@ pub fn parse_dialogue_text(text: &str, base_style: &ParsedStyle, styles: &[Parse
         }
     }
 
-    flush_span(&mut buffer, &current_style, pending_karaoke, drawing_scale, &current_transforms, &mut active_line);
+    flush_span(
+        &mut buffer,
+        &current_style,
+        pending_karaoke,
+        drawing_scale,
+        &current_transforms,
+        &mut active_line,
+    );
     push_line(&mut parsed, &mut active_line);
     if parsed.lines.is_empty() {
         parsed.lines.push(ParsedTextLine::default());
@@ -611,16 +649,7 @@ fn default_style_format() -> Vec<String> {
 
 fn default_event_format() -> Vec<String> {
     [
-        "Layer",
-        "Start",
-        "End",
-        "Style",
-        "Name",
-        "MarginL",
-        "MarginR",
-        "MarginV",
-        "Effect",
-        "Text",
+        "Layer", "Start", "End", "Style", "Name", "MarginL", "MarginR", "MarginV", "Effect", "Text",
     ]
     .into_iter()
     .map(str::to_string)
@@ -640,10 +669,18 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
             "name" => style.name = raw_value.trim().to_string(),
             "fontname" => style.font_name = raw_value.trim().to_string(),
             "fontsize" => style.font_size = parse_f64(raw_value, style.font_size),
-            "primarycolour" | "primarycolor" => style.primary_colour = parse_color(raw_value, style.primary_colour),
-            "secondarycolour" | "secondarycolor" => style.secondary_colour = parse_color(raw_value, style.secondary_colour),
-            "outlinecolour" | "outlinecolor" => style.outline_colour = parse_color(raw_value, style.outline_colour),
-            "backcolour" | "backcolor" => style.back_colour = parse_color(raw_value, style.back_colour),
+            "primarycolour" | "primarycolor" => {
+                style.primary_colour = parse_color(raw_value, style.primary_colour)
+            }
+            "secondarycolour" | "secondarycolor" => {
+                style.secondary_colour = parse_color(raw_value, style.secondary_colour)
+            }
+            "outlinecolour" | "outlinecolor" => {
+                style.outline_colour = parse_color(raw_value, style.outline_colour)
+            }
+            "backcolour" | "backcolor" => {
+                style.back_colour = parse_color(raw_value, style.back_colour)
+            }
             "bold" => style.bold = parse_bool(raw_value, style.bold),
             "italic" => style.italic = parse_bool(raw_value, style.italic),
             "underline" => style.underline = parse_bool(raw_value, style.underline),
@@ -655,13 +692,17 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
             "borderstyle" => style.border_style = parse_i32(raw_value, style.border_style),
             "outline" => style.outline = parse_f64(raw_value, style.outline),
             "shadow" => style.shadow = parse_f64(raw_value, style.shadow),
-            "alignment" => style.alignment = parse_i32(raw_value, style.alignment),
+            "alignment" => {
+                let raw_alignment = parse_i32(raw_value, style.alignment);
+                style.alignment = alignment_from_an(raw_alignment).unwrap_or(style.alignment);
+            }
             "marginl" => style.margin_l = parse_i32(raw_value, style.margin_l),
             "marginr" => style.margin_r = parse_i32(raw_value, style.margin_r),
             "marginv" => style.margin_v = parse_i32(raw_value, style.margin_v),
             "encoding" => style.encoding = parse_i32(raw_value, style.encoding),
             "treat_fontname_as_pattern" => {
-                style.treat_fontname_as_pattern = parse_i32(raw_value, style.treat_fontname_as_pattern)
+                style.treat_fontname_as_pattern =
+                    parse_i32(raw_value, style.treat_fontname_as_pattern)
             }
             "blur" => style.blur = parse_f64(raw_value, style.blur),
             "justify" => style.justify = parse_i32(raw_value, style.justify),
@@ -672,7 +713,12 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
     Some(style)
 }
 
-fn parse_event_line(value: &str, format: &[String], read_order: i32, styles: &[ParsedStyle]) -> Option<ParsedEvent> {
+fn parse_event_line(
+    value: &str,
+    format: &[String],
+    read_order: i32,
+    styles: &[ParsedStyle],
+) -> Option<ParsedEvent> {
     let fields = split_fields(value, format.len());
     if fields.len() != format.len() {
         return None;
@@ -764,12 +810,19 @@ fn parse_f64(value: &str, fallback: f64) -> f64 {
 
 fn parse_scale(value: &str, fallback: f64) -> f64 {
     let parsed = parse_f64(value, fallback * 100.0);
-    if parsed > 10.0 { parsed / 100.0 } else { parsed }
+    if parsed > 10.0 {
+        parsed / 100.0
+    } else {
+        parsed
+    }
 }
 
 fn parse_color(value: &str, fallback: u32) -> u32 {
     let trimmed = value.trim();
-    if let Some(hex) = trimmed.strip_prefix("&H").or_else(|| trimmed.strip_prefix("&h")) {
+    if let Some(hex) = trimmed
+        .strip_prefix("&H")
+        .or_else(|| trimmed.strip_prefix("&h"))
+    {
         let hex = hex.trim_end_matches('&');
         u32::from_str_radix(hex, 16).unwrap_or(fallback)
     } else {
@@ -784,7 +837,10 @@ fn parse_timestamp(value: &str) -> Option<i64> {
     let seconds = parts.next()?.trim();
     let (seconds, centiseconds) = if let Some((seconds, fraction)) = seconds.split_once('.') {
         let fraction = format!("{fraction:0<2}");
-        (seconds.trim().parse::<i64>().ok()?, fraction[..2].parse::<i64>().ok()?)
+        (
+            seconds.trim().parse::<i64>().ok()?,
+            fraction[..2].parse::<i64>().ok()?,
+        )
     } else {
         (seconds.parse::<i64>().ok()?, 0)
     };
@@ -833,11 +889,27 @@ fn apply_override_block(
         } else if let Some((rest, mode)) = tag
             .strip_prefix("kf")
             .map(|rest| (rest, ParsedKaraokeMode::Sweep))
-            .or_else(|| tag.strip_prefix("ko").map(|rest| (rest, ParsedKaraokeMode::OutlineToggle)))
-            .or_else(|| tag.strip_prefix('K').map(|rest| (rest, ParsedKaraokeMode::Sweep)))
-            .or_else(|| tag.strip_prefix('k').map(|rest| (rest, ParsedKaraokeMode::FillSwap)))
+            .or_else(|| {
+                tag.strip_prefix("ko")
+                    .map(|rest| (rest, ParsedKaraokeMode::OutlineToggle))
+            })
+            .or_else(|| {
+                tag.strip_prefix('K')
+                    .map(|rest| (rest, ParsedKaraokeMode::Sweep))
+            })
+            .or_else(|| {
+                tag.strip_prefix('k')
+                    .map(|rest| (rest, ParsedKaraokeMode::FillSwap))
+            })
         {
-            flush_span(buffer, &previous, *pending_karaoke, *drawing_scale, &previous_transforms, active_line);
+            flush_span(
+                buffer,
+                &previous,
+                *pending_karaoke,
+                *drawing_scale,
+                &previous_transforms,
+                active_line,
+            );
             if let Some(duration_ms) = parse_karaoke_duration(rest) {
                 *pending_karaoke = Some(ParsedKaraokeSpan {
                     start_ms: *karaoke_cursor_ms,
@@ -852,6 +924,8 @@ fn apply_override_block(
             current_style.scale_y = parse_scale(rest, current_style.scale_y);
         } else if let Some(rest) = tag.strip_prefix("fsp") {
             current_style.spacing = parse_f64(rest, current_style.spacing);
+        } else if let Some(rest) = tag.strip_prefix("frz").or_else(|| tag.strip_prefix("fr")) {
+            current_style.rotation_z = parse_f64(rest, current_style.rotation_z);
         } else if let Some(rest) = tag.strip_prefix("fs") {
             current_style.font_size = parse_f64(rest, current_style.font_size);
         } else if let Some(rest) = tag.strip_prefix("iclip") {
@@ -885,7 +959,8 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix("1c").or_else(|| tag.strip_prefix('c')) {
             current_style.primary_colour = parse_override_color(rest, current_style.primary_colour);
         } else if let Some(rest) = tag.strip_prefix("2c") {
-            current_style.secondary_colour = parse_override_color(rest, current_style.secondary_colour);
+            current_style.secondary_colour =
+                parse_override_color(rest, current_style.secondary_colour);
         } else if let Some(rest) = tag.strip_prefix("3c") {
             current_style.outline_colour = parse_override_color(rest, current_style.outline_colour);
         } else if let Some(rest) = tag.strip_prefix("4c") {
@@ -934,7 +1009,14 @@ fn apply_override_block(
             }
         } else if tag.starts_with("pbo") {
         } else if let Some(rest) = tag.strip_prefix('p') {
-            flush_span(buffer, &previous, *pending_karaoke, *drawing_scale, &previous_transforms, active_line);
+            flush_span(
+                buffer,
+                &previous,
+                *pending_karaoke,
+                *drawing_scale,
+                &previous_transforms,
+                active_line,
+            );
             *drawing_scale = parse_i32(rest, *drawing_scale).max(0);
         } else if let Some(rest) = tag.strip_prefix('r') {
             *current_style = resolve_reset_style(rest, base_style, styles);
@@ -942,7 +1024,14 @@ fn apply_override_block(
         }
 
         if *current_style != previous || *current_transforms != previous_transforms {
-            flush_span(buffer, &previous, *pending_karaoke, *drawing_scale, &previous_transforms, active_line);
+            flush_span(
+                buffer,
+                &previous,
+                *pending_karaoke,
+                *drawing_scale,
+                &previous_transforms,
+                active_line,
+            );
         }
     }
 }
@@ -960,7 +1049,11 @@ fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<Parse
     let (start_ms, end_ms, accel) = match params.as_slice() {
         [] => (0, None, 1.0),
         [accel] => (0, None, parse_f64(accel, 1.0)),
-        [start, end] => (parse_i32(start, 0).max(0), Some(parse_i32(end, 0).max(parse_i32(start, 0))), 1.0),
+        [start, end] => (
+            parse_i32(start, 0).max(0),
+            Some(parse_i32(end, 0).max(parse_i32(start, 0))),
+            1.0,
+        ),
         [start, end, accel, ..] => (
             parse_i32(start, 0).max(0),
             Some(parse_i32(end, 0).max(parse_i32(start, 0))),
@@ -1030,19 +1123,33 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
         style.outline_colour = with_alpha(style.outline_colour, alpha);
         style.back_colour = with_alpha(style.back_colour, alpha);
     } else if let Some(rest) = tag.strip_prefix("1a") {
-        style.primary_colour = with_alpha(style.primary_colour, parse_alpha_tag(rest, alpha_of(style.primary_colour)));
+        style.primary_colour = with_alpha(
+            style.primary_colour,
+            parse_alpha_tag(rest, alpha_of(style.primary_colour)),
+        );
     } else if let Some(rest) = tag.strip_prefix("2a") {
-        style.secondary_colour = with_alpha(style.secondary_colour, parse_alpha_tag(rest, alpha_of(style.secondary_colour)));
+        style.secondary_colour = with_alpha(
+            style.secondary_colour,
+            parse_alpha_tag(rest, alpha_of(style.secondary_colour)),
+        );
     } else if let Some(rest) = tag.strip_prefix("3a") {
-        style.outline_colour = with_alpha(style.outline_colour, parse_alpha_tag(rest, alpha_of(style.outline_colour)));
+        style.outline_colour = with_alpha(
+            style.outline_colour,
+            parse_alpha_tag(rest, alpha_of(style.outline_colour)),
+        );
     } else if let Some(rest) = tag.strip_prefix("4a") {
-        style.back_colour = with_alpha(style.back_colour, parse_alpha_tag(rest, alpha_of(style.back_colour)));
+        style.back_colour = with_alpha(
+            style.back_colour,
+            parse_alpha_tag(rest, alpha_of(style.back_colour)),
+        );
     } else if let Some(rest) = tag.strip_prefix("fscx") {
         style.scale_x = parse_scale(rest, style.scale_x);
     } else if let Some(rest) = tag.strip_prefix("fscy") {
         style.scale_y = parse_scale(rest, style.scale_y);
     } else if let Some(rest) = tag.strip_prefix("fsp") {
         style.spacing = parse_f64(rest, style.spacing);
+    } else if let Some(rest) = tag.strip_prefix("frz").or_else(|| tag.strip_prefix("fr")) {
+        style.rotation_z = parse_f64(rest, style.rotation_z);
     } else if let Some(rest) = tag.strip_prefix("fs") {
         style.font_size = parse_f64(rest, style.font_size);
     } else if let Some(rest) = tag.strip_prefix("bord") {
@@ -1056,13 +1163,19 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
 
 fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> ParsedAnimatedStyle {
     ParsedAnimatedStyle {
-        font_size: ((target.font_size - base.font_size).abs() > f64::EPSILON).then_some(target.font_size),
+        font_size: ((target.font_size - base.font_size).abs() > f64::EPSILON)
+            .then_some(target.font_size),
         scale_x: ((target.scale_x - base.scale_x).abs() > f64::EPSILON).then_some(target.scale_x),
         scale_y: ((target.scale_y - base.scale_y).abs() > f64::EPSILON).then_some(target.scale_y),
         spacing: ((target.spacing - base.spacing).abs() > f64::EPSILON).then_some(target.spacing),
-        primary_colour: (target.primary_colour != base.primary_colour).then_some(target.primary_colour),
-        secondary_colour: (target.secondary_colour != base.secondary_colour).then_some(target.secondary_colour),
-        outline_colour: (target.outline_colour != base.outline_colour).then_some(target.outline_colour),
+        rotation_z: ((target.rotation_z - base.rotation_z).abs() > f64::EPSILON)
+            .then_some(target.rotation_z),
+        primary_colour: (target.primary_colour != base.primary_colour)
+            .then_some(target.primary_colour),
+        secondary_colour: (target.secondary_colour != base.secondary_colour)
+            .then_some(target.secondary_colour),
+        outline_colour: (target.outline_colour != base.outline_colour)
+            .then_some(target.outline_colour),
         back_colour: (target.back_colour != base.back_colour).then_some(target.back_colour),
         border: ((target.border - base.border).abs() > f64::EPSILON).then_some(target.border),
         shadow: ((target.shadow - base.shadow).abs() > f64::EPSILON).then_some(target.shadow),
@@ -1071,12 +1184,18 @@ fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> Pars
 }
 
 fn parse_karaoke_duration(value: &str) -> Option<i32> {
-    value.trim().parse::<i32>().ok().map(|centiseconds| centiseconds.max(0) * 10)
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .map(|centiseconds| centiseconds.max(0) * 10)
 }
 
 fn parse_override_color(value: &str, fallback: u32) -> u32 {
     let trimmed = value.trim();
-    let trimmed = trimmed.trim_matches('&').trim_start_matches(|character| character == 'H' || character == 'h');
+    let trimmed = trimmed
+        .trim_matches('&')
+        .trim_start_matches(|character| character == 'H' || character == 'h');
     if trimmed.is_empty() {
         return fallback;
     }
@@ -1086,7 +1205,9 @@ fn parse_override_color(value: &str, fallback: u32) -> u32 {
 
 fn parse_alpha_tag(value: &str, fallback: u8) -> u8 {
     let trimmed = value.trim();
-    let trimmed = trimmed.trim_matches('&').trim_start_matches(|character| character == 'H' || character == 'h');
+    let trimmed = trimmed
+        .trim_matches('&')
+        .trim_start_matches(|character| character == 'H' || character == 'h');
     if trimmed.is_empty() {
         return fallback;
     }
@@ -1199,7 +1320,9 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 let (point, next_index) = parse_drawing_point(&tokens, index, scale)?;
                 current.push(point);
                 index = next_index;
-                while let Some((point, next_index)) = parse_drawing_point_optional(&tokens, index, scale) {
+                while let Some((point, next_index)) =
+                    parse_drawing_point_optional(&tokens, index, scale)
+                {
                     current.push(point);
                     index = next_index;
                 }
@@ -1211,7 +1334,9 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 }
                 index += 1;
                 let mut consumed = false;
-                while let Some((point, next_index)) = parse_drawing_point_optional(&tokens, index, scale) {
+                while let Some((point, next_index)) =
+                    parse_drawing_point_optional(&tokens, index, scale)
+                {
                     current.push(point);
                     index = next_index;
                     consumed = true;
@@ -1227,7 +1352,9 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 }
                 index += 1;
                 let mut consumed = false;
-                while let Some(((control1, control2, end), next_index)) = parse_bezier_segment(&tokens, index, scale) {
+                while let Some(((control1, control2, end), next_index)) =
+                    parse_bezier_segment(&tokens, index, scale)
+                {
                     let start = *current.last()?;
                     current.extend(approximate_cubic_bezier(start, control1, control2, end, 16));
                     index = next_index;
@@ -1246,7 +1373,9 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 let (point2, next_index) = parse_drawing_point(&tokens, next_index, scale)?;
                 let (point3, next_index) = parse_drawing_point(&tokens, next_index, scale)?;
                 let start = *current.last()?;
-                current.extend(approximate_spline_segment(start, point1, point2, point3, 16));
+                current.extend(approximate_spline_segment(
+                    start, point1, point2, point3, 16,
+                ));
                 spline_state = Some(SplineState {
                     first_three: [point1, point2, point3],
                     history: vec![start, point1, point2, point3],
@@ -1259,7 +1388,9 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 };
                 index += 1;
                 let mut consumed = false;
-                while let Some((point, next_index)) = parse_drawing_point_optional(&tokens, index, scale) {
+                while let Some((point, next_index)) =
+                    parse_drawing_point_optional(&tokens, index, scale)
+                {
                     let len = state.history.len();
                     current.extend(approximate_spline_segment(
                         state.history[len - 3],
@@ -1315,23 +1446,39 @@ fn parse_drawing_point(tokens: &[&str], index: usize, scale: i32) -> Option<(Poi
     Some((scale_drawing_point(x, y, scale), index + 2))
 }
 
-fn parse_drawing_point_optional(tokens: &[&str], index: usize, scale: i32) -> Option<(Point, usize)> {
+fn parse_drawing_point_optional(
+    tokens: &[&str],
+    index: usize,
+    scale: i32,
+) -> Option<(Point, usize)> {
     let x = tokens.get(index)?;
     let y = tokens.get(index + 1)?;
-    if x.chars().any(|character| character.is_ascii_alphabetic()) || y.chars().any(|character| character.is_ascii_alphabetic()) {
+    if x.chars().any(|character| character.is_ascii_alphabetic())
+        || y.chars().any(|character| character.is_ascii_alphabetic())
+    {
         return None;
     }
     parse_drawing_point(tokens, index, scale)
 }
 
-fn parse_bezier_segment(tokens: &[&str], index: usize, scale: i32) -> Option<((Point, Point, Point), usize)> {
+fn parse_bezier_segment(
+    tokens: &[&str],
+    index: usize,
+    scale: i32,
+) -> Option<((Point, Point, Point), usize)> {
     let (control1, next_index) = parse_drawing_point(tokens, index, scale)?;
     let (control2, next_index) = parse_drawing_point(tokens, next_index, scale)?;
     let (end, next_index) = parse_drawing_point(tokens, next_index, scale)?;
     Some(((control1, control2, end), next_index))
 }
 
-fn approximate_cubic_bezier(start: Point, control1: Point, control2: Point, end: Point, segments: usize) -> Vec<Point> {
+fn approximate_cubic_bezier(
+    start: Point,
+    control1: Point,
+    control2: Point,
+    end: Point,
+    segments: usize,
+) -> Vec<Point> {
     let segments = segments.max(1);
     let mut points = Vec::with_capacity(segments);
     for step in 1..=segments {
@@ -1356,7 +1503,13 @@ fn approximate_cubic_bezier(start: Point, control1: Point, control2: Point, end:
     points
 }
 
-fn approximate_spline_segment(previous: Point, point1: Point, point2: Point, point3: Point, segments: usize) -> Vec<Point> {
+fn approximate_spline_segment(
+    previous: Point,
+    point1: Point,
+    point2: Point,
+    point3: Point,
+    segments: usize,
+) -> Vec<Point> {
     let x01 = (point1.x - previous.x) / 3;
     let y01 = (point1.y - previous.y) / 3;
     let x12 = (point2.x - point1.x) / 3;
@@ -1385,7 +1538,10 @@ fn approximate_spline_segment(previous: Point, point1: Point, point2: Point, poi
 }
 
 fn scale_drawing_point(x: i32, y: i32, scale: i32) -> Point {
-    let factor = 1_i32.checked_shl(scale.saturating_sub(1) as u32).unwrap_or(1).max(1);
+    let factor = 1_i32
+        .checked_shl(scale.saturating_sub(1) as u32)
+        .unwrap_or(1)
+        .max(1);
     Point {
         x: x / factor,
         y: y / factor,
@@ -1485,7 +1641,11 @@ fn parse_fade(value: &str) -> Option<ParsedFade> {
     })
 }
 
-fn resolve_reset_style(value: &str, base_style: &ParsedStyle, styles: &[ParsedStyle]) -> ParsedSpanStyle {
+fn resolve_reset_style(
+    value: &str,
+    base_style: &ParsedStyle,
+    styles: &[ParsedStyle],
+) -> ParsedSpanStyle {
     let name = value.trim();
     if name.is_empty() {
         return ParsedSpanStyle::from_style(base_style);
@@ -1567,6 +1727,21 @@ mod tests {
         assert_eq!(track.events[0].duration, 2500);
         assert_eq!(track.events[0].style, 0);
         assert_eq!(track.events[0].text, "Hello, world!");
+        assert_eq!(
+            track.styles[0].alignment,
+            ass::VALIGN_SUB | ass::HALIGN_CENTER
+        );
+    }
+
+    #[test]
+    fn normalizes_style_alignment_numbers_to_libass_bits() {
+        let input = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Mid,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1";
+        let track = parse_script_text(input).expect("script should parse");
+
+        assert_eq!(
+            track.styles[0].alignment,
+            ass::VALIGN_CENTER | ass::HALIGN_CENTER
+        );
     }
 
     #[test]
@@ -1617,9 +1792,25 @@ mod tests {
         let parsed = parse_dialogue_text("{\\clip(10,20,30,40)}Clip", &base_style, &[]);
         let inverse = parse_dialogue_text("{\\iclip(1,2,3,4)}Clip", &base_style, &[]);
 
-        assert_eq!(parsed.clip_rect, Some(Rect { x_min: 10, y_min: 20, x_max: 30, y_max: 40 }));
+        assert_eq!(
+            parsed.clip_rect,
+            Some(Rect {
+                x_min: 10,
+                y_min: 20,
+                x_max: 30,
+                y_max: 40
+            })
+        );
         assert!(!parsed.inverse_clip);
-        assert_eq!(inverse.clip_rect, Some(Rect { x_min: 1, y_min: 2, x_max: 3, y_max: 4 }));
+        assert_eq!(
+            inverse.clip_rect,
+            Some(Rect {
+                x_min: 1,
+                y_min: 2,
+                x_max: 3,
+                y_max: 4
+            })
+        );
         assert!(inverse.inverse_clip);
     }
 
@@ -1629,15 +1820,18 @@ mod tests {
         let parsed = parse_dialogue_text("{\\clip(m 0 0 l 10 0 10 10 0 10)}Clip", &base_style, &[]);
 
         assert!(parsed.clip_rect.is_none());
-        assert_eq!(parsed.vector_clip, Some(ParsedVectorClip {
-            scale: 1,
-            polygons: vec![vec![
-                Point { x: 0, y: 0 },
-                Point { x: 10, y: 0 },
-                Point { x: 10, y: 10 },
-                Point { x: 0, y: 10 },
-            ]],
-        }));
+        assert_eq!(
+            parsed.vector_clip,
+            Some(ParsedVectorClip {
+                scale: 1,
+                polygons: vec![vec![
+                    Point { x: 0, y: 0 },
+                    Point { x: 10, y: 0 },
+                    Point { x: 10, y: 10 },
+                    Point { x: 0, y: 10 },
+                ]],
+            })
+        );
         assert!(!parsed.inverse_clip);
     }
 
@@ -1646,12 +1840,15 @@ mod tests {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\move(10,20,110,220,50,150)}Move", &base_style, &[]);
 
-        assert_eq!(parsed.movement, Some(ParsedMovement {
-            start: (10, 20),
-            end: (110, 220),
-            t1_ms: 50,
-            t2_ms: 150,
-        }));
+        assert_eq!(
+            parsed.movement,
+            Some(ParsedMovement {
+                start: (10, 20),
+                end: (110, 220),
+                t1_ms: 50,
+                t2_ms: 150,
+            })
+        );
         assert!(parsed.position.is_none());
     }
 
@@ -1660,10 +1857,13 @@ mod tests {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\fad(120,240)}Fade", &base_style, &[]);
 
-        assert_eq!(parsed.fade, Some(ParsedFade::Simple {
-            fade_in_ms: 120,
-            fade_out_ms: 240,
-        }));
+        assert_eq!(
+            parsed.fade,
+            Some(ParsedFade::Simple {
+                fade_in_ms: 120,
+                fade_out_ms: 240,
+            })
+        );
     }
 
     #[test]
@@ -1671,15 +1871,18 @@ mod tests {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\fade(10,20,30,40,50,60,70)}Fade", &base_style, &[]);
 
-        assert_eq!(parsed.fade, Some(ParsedFade::Complex {
-            alpha1: 10,
-            alpha2: 20,
-            alpha3: 30,
-            t1_ms: 40,
-            t2_ms: 50,
-            t3_ms: 60,
-            t4_ms: 70,
-        }));
+        assert_eq!(
+            parsed.fade,
+            Some(ParsedFade::Complex {
+                alpha1: 10,
+                alpha2: 20,
+                alpha3: 30,
+                t1_ms: 40,
+                t2_ms: 50,
+                t3_ms: 60,
+                t4_ms: 70,
+            })
+        );
     }
 
     #[test]
@@ -1689,21 +1892,30 @@ mod tests {
 
         assert_eq!(parsed.lines.len(), 1);
         assert_eq!(parsed.lines[0].spans.len(), 3);
-        assert_eq!(parsed.lines[0].spans[0].karaoke, Some(ParsedKaraokeSpan {
-            start_ms: 0,
-            duration_ms: 100,
-            mode: ParsedKaraokeMode::FillSwap,
-        }));
-        assert_eq!(parsed.lines[0].spans[1].karaoke, Some(ParsedKaraokeSpan {
-            start_ms: 100,
-            duration_ms: 200,
-            mode: ParsedKaraokeMode::Sweep,
-        }));
-        assert_eq!(parsed.lines[0].spans[2].karaoke, Some(ParsedKaraokeSpan {
-            start_ms: 300,
-            duration_ms: 300,
-            mode: ParsedKaraokeMode::OutlineToggle,
-        }));
+        assert_eq!(
+            parsed.lines[0].spans[0].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 0,
+                duration_ms: 100,
+                mode: ParsedKaraokeMode::FillSwap,
+            })
+        );
+        assert_eq!(
+            parsed.lines[0].spans[1].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 100,
+                duration_ms: 200,
+                mode: ParsedKaraokeMode::Sweep,
+            })
+        );
+        assert_eq!(
+            parsed.lines[0].spans[2].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 300,
+                duration_ms: 300,
+                mode: ParsedKaraokeMode::OutlineToggle,
+            })
+        );
     }
 
     #[test]
@@ -1713,10 +1925,21 @@ mod tests {
 
         assert_eq!(parsed.lines.len(), 1);
         assert_eq!(parsed.lines[0].spans.len(), 1);
-        let drawing = parsed.lines[0].spans[0].drawing.as_ref().expect("drawing span");
+        let drawing = parsed.lines[0].spans[0]
+            .drawing
+            .as_ref()
+            .expect("drawing span");
         assert_eq!(drawing.scale, 1);
         assert_eq!(drawing.polygons.len(), 1);
-        assert_eq!(drawing.bounds(), Some(Rect { x_min: 0, y_min: 0, x_max: 11, y_max: 11 }));
+        assert_eq!(
+            drawing.bounds(),
+            Some(Rect {
+                x_min: 0,
+                y_min: 0,
+                x_max: 11,
+                y_max: 11
+            })
+        );
     }
 
     #[test]
@@ -1724,19 +1947,32 @@ mod tests {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\p1}m 0 0 b 10 0 10 10 0 10", &base_style, &[]);
 
-        let drawing = parsed.lines[0].spans[0].drawing.as_ref().expect("drawing span");
+        let drawing = parsed.lines[0].spans[0]
+            .drawing
+            .as_ref()
+            .expect("drawing span");
         assert_eq!(drawing.polygons.len(), 1);
         assert!(drawing.polygons[0].len() > 4);
-        assert_eq!(drawing.polygons[0].first().copied(), Some(Point { x: 0, y: 0 }));
-        assert_eq!(drawing.polygons[0].last().copied(), Some(Point { x: 0, y: 10 }));
+        assert_eq!(
+            drawing.polygons[0].first().copied(),
+            Some(Point { x: 0, y: 0 })
+        );
+        assert_eq!(
+            drawing.polygons[0].last().copied(),
+            Some(Point { x: 0, y: 10 })
+        );
     }
 
     #[test]
     fn parses_spline_drawing_spans_in_p_mode() {
         let base_style = ParsedStyle::default();
-        let parsed = parse_dialogue_text("{\\p1}m 0 0 s 10 0 10 10 0 10 p -5 5 c", &base_style, &[]);
+        let parsed =
+            parse_dialogue_text("{\\p1}m 0 0 s 10 0 10 10 0 10 p -5 5 c", &base_style, &[]);
 
-        let drawing = parsed.lines[0].spans[0].drawing.as_ref().expect("drawing span");
+        let drawing = parsed.lines[0].spans[0]
+            .drawing
+            .as_ref()
+            .expect("drawing span");
         assert_eq!(drawing.polygons.len(), 1);
         assert!(drawing.polygons[0].len() > 8);
     }
@@ -1744,18 +1980,35 @@ mod tests {
     #[test]
     fn parses_non_closing_move_drawing_spans_in_p_mode() {
         let base_style = ParsedStyle::default();
-        let parsed = parse_dialogue_text("{\\p1}m 0 0 l 10 0 10 10 0 10 n 20 20 l 30 20 30 30 20 30", &base_style, &[]);
+        let parsed = parse_dialogue_text(
+            "{\\p1}m 0 0 l 10 0 10 10 0 10 n 20 20 l 30 20 30 30 20 30",
+            &base_style,
+            &[],
+        );
 
-        let drawing = parsed.lines[0].spans[0].drawing.as_ref().expect("drawing span");
+        let drawing = parsed.lines[0].spans[0]
+            .drawing
+            .as_ref()
+            .expect("drawing span");
         assert_eq!(drawing.polygons.len(), 2);
-        assert_eq!(drawing.polygons[0].first().copied(), Some(Point { x: 0, y: 0 }));
-        assert_eq!(drawing.polygons[1].first().copied(), Some(Point { x: 20, y: 20 }));
+        assert_eq!(
+            drawing.polygons[0].first().copied(),
+            Some(Point { x: 0, y: 0 })
+        );
+        assert_eq!(
+            drawing.polygons[1].first().copied(),
+            Some(Point { x: 20, y: 20 })
+        );
     }
 
     #[test]
     fn parses_timed_transform_overrides() {
         let base_style = ParsedStyle::default();
-        let parsed = parse_dialogue_text("{\\t(100,300,2,\\1c&H112233&\\fs48\\fscx150\\fscy50\\fsp4\\bord6\\blur2)}Text", &base_style, &[]);
+        let parsed = parse_dialogue_text(
+            "{\\t(100,300,2,\\1c&H112233&\\fs48\\fscx150\\fscy50\\fsp4\\bord6\\blur2)}Text",
+            &base_style,
+            &[],
+        );
 
         let transforms = &parsed.lines[0].spans[0].transforms;
         assert_eq!(transforms.len(), 1);
@@ -1772,9 +2025,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_z_rotation_overrides_and_transforms() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\frz15\\t(0,1000,\\frz45)}Text", &base_style, &[]);
+
+        let span = &parsed.lines[0].spans[0];
+        assert_eq!(span.style.rotation_z, 15.0);
+        assert_eq!(span.transforms.len(), 1);
+        assert_eq!(span.transforms[0].style.rotation_z, Some(45.0));
+    }
+
+    #[test]
     fn parses_color_and_shadow_overrides() {
         let base_style = ParsedStyle::default();
-        let parsed = parse_dialogue_text("{\\1c&H112233&\\4c&H445566&\\1a&H80&\\shad3.5\\blur1.5}Color", &base_style, &[]);
+        let parsed = parse_dialogue_text(
+            "{\\1c&H112233&\\4c&H445566&\\1a&H80&\\shad3.5\\blur1.5}Color",
+            &base_style,
+            &[],
+        );
 
         assert_eq!(parsed.lines.len(), 1);
         assert_eq!(parsed.lines[0].spans.len(), 1);
@@ -1787,7 +2055,9 @@ mod tests {
     #[test]
     fn parses_font_attachments_from_fonts_section() {
         let encoded = encode_font_bytes(b"ABC");
-        let input = format!("[Fonts]\nfontname: DemoFont.ttf\n{encoded}\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1");
+        let input = format!(
+            "[Fonts]\nfontname: DemoFont.ttf\n{encoded}\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1"
+        );
         let track = parse_script_text(&input).expect("script should parse");
 
         assert_eq!(track.attachments.len(), 1);

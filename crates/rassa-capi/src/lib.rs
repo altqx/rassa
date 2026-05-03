@@ -1,20 +1,22 @@
-#![allow(dead_code, non_camel_case_types, non_snake_case, unsafe_op_in_unsafe_fn)]
+#![allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    unsafe_op_in_unsafe_fn
+)]
 
 use std::{
-    ffi::{c_char, c_double, c_int, c_void, CStr, CString},
-    fs,
-    mem,
-    ptr,
-    slice,
+    ffi::{CStr, CString, c_char, c_double, c_int, c_void},
+    fs, mem, ptr, slice,
 };
 
 use libc::{free, malloc};
-use rassa_core::{ass, Margins, RendererConfig, Size};
+use rassa_core::{Margins, RendererConfig, Size, ass};
 use rassa_fonts::{
-    AttachedFontProvider, DefaultFontFileProvider, FontAttachment as ProviderFontAttachment, FontProvider,
-    FontconfigProvider, MergedFontProvider, NullFontProvider,
+    AttachedFontProvider, DefaultFontFileProvider, FontAttachment as ProviderFontAttachment,
+    FontProvider, FontconfigProvider, MergedFontProvider, NullFontProvider,
 };
-use rassa_parse::{parse_script_bytes, ParsedAttachment, ParsedEvent, ParsedStyle, ParsedTrack};
+use rassa_parse::{ParsedAttachment, ParsedEvent, ParsedStyle, ParsedTrack, parse_script_bytes};
 use rassa_render::RenderEngine;
 
 pub struct ASS_Library {
@@ -237,7 +239,11 @@ impl OwnedImageList {
                 w: plane.size.width,
                 h: plane.size.height,
                 stride: plane.stride,
-                bitmap: if bitmap.is_empty() { ptr::null_mut() } else { bitmap.as_mut_ptr() },
+                bitmap: if bitmap.is_empty() {
+                    ptr::null_mut()
+                } else {
+                    bitmap.as_mut_ptr()
+                },
                 color: plane.color.0,
                 dst_x: plane.destination.x,
                 dst_y: plane.destination.y,
@@ -422,7 +428,9 @@ pub unsafe extern "C" fn ass_process_force_style(track: *mut ASS_Track) {
         }
 
         let (style_name, field_name) = match key.rsplit_once('.') {
-            Some((style_name, field_name)) if !style_name.trim().is_empty() => (Some(style_name.trim()), field_name.trim()),
+            Some((style_name, field_name)) if !style_name.trim().is_empty() => {
+                (Some(style_name.trim()), field_name.trim())
+            }
             _ => (None, key),
         };
 
@@ -431,7 +439,10 @@ pub unsafe extern "C" fn ass_process_force_style(track: *mut ASS_Track) {
         }
 
         for style in slice::from_raw_parts_mut(track_ref.styles, track_ref.n_styles as usize) {
-            let matches_style = style_name.is_none_or(|target| string_option_from_ptr(style.Name).is_some_and(|name| name.eq_ignore_ascii_case(target)));
+            let matches_style = style_name.is_none_or(|target| {
+                string_option_from_ptr(style.Name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(target))
+            });
             if matches_style {
                 apply_style_override(style, field_name, value);
             }
@@ -484,7 +495,9 @@ pub unsafe extern "C" fn ass_set_storage_size(priv_: *mut ASS_Renderer, w: c_int
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_set_shaper(priv_: *mut ASS_Renderer, level: c_int) {
     if let Some(renderer) = priv_.as_mut() {
-        renderer.shaping = if level == ass::ShapingLevel::Simple as c_int || level == ass::ShapingLevel::Complex as c_int {
+        renderer.shaping = if level == ass::ShapingLevel::Simple as c_int
+            || level == ass::ShapingLevel::Complex as c_int
+        {
             level
         } else {
             ass::ShapingLevel::Complex as c_int
@@ -520,7 +533,11 @@ pub unsafe extern "C" fn ass_set_pixel_aspect(priv_: *mut ASS_Renderer, par: c_d
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ass_set_aspect_ratio(priv_: *mut ASS_Renderer, dar: c_double, sar: c_double) {
+pub unsafe extern "C" fn ass_set_aspect_ratio(
+    priv_: *mut ASS_Renderer,
+    dar: c_double,
+    sar: c_double,
+) {
     if sar == 0.0 {
         ass_set_pixel_aspect(priv_, 0.0);
     } else {
@@ -603,14 +620,20 @@ pub unsafe extern "C" fn ass_set_fonts(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ass_set_selective_style_override_enabled(priv_: *mut ASS_Renderer, bits: c_int) {
+pub unsafe extern "C" fn ass_set_selective_style_override_enabled(
+    priv_: *mut ASS_Renderer,
+    bits: c_int,
+) {
     if let Some(renderer) = priv_.as_mut() {
         renderer.selective_override_bits = bits;
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ass_set_selective_style_override(priv_: *mut ASS_Renderer, style: *mut ASS_Style) {
+pub unsafe extern "C" fn ass_set_selective_style_override(
+    priv_: *mut ASS_Renderer,
+    style: *mut ASS_Style,
+) {
     if let Some(renderer) = priv_.as_mut() {
         renderer.selective_override_style = OwnedStyleOverride::from_ffi(style);
     }
@@ -622,7 +645,11 @@ pub unsafe extern "C" fn ass_fonts_update(_priv_: *mut ASS_Renderer) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ass_set_cache_limits(priv_: *mut ASS_Renderer, glyph_max: c_int, bitmap_max_size: c_int) {
+pub unsafe extern "C" fn ass_set_cache_limits(
+    priv_: *mut ASS_Renderer,
+    glyph_max: c_int,
+    bitmap_max_size: c_int,
+) {
     if let Some(renderer) = priv_.as_mut() {
         renderer.cache_limits = (glyph_max, bitmap_max_size);
     }
@@ -649,13 +676,14 @@ pub unsafe extern "C" fn ass_render_frame(
 
     let active_count = active_event_count(track, now);
     if let Some(detect_change) = detect_change.as_mut() {
-        *detect_change = if renderer.last_timestamp == Some(now) && renderer.last_active_count == active_count {
-            0
-        } else if renderer.last_active_count == active_count {
-            1
-        } else {
-            2
-        };
+        *detect_change =
+            if renderer.last_timestamp == Some(now) && renderer.last_active_count == active_count {
+                0
+            } else if renderer.last_active_count == active_count {
+                1
+            } else {
+                2
+            };
     }
 
     renderer.last_timestamp = Some(now);
@@ -669,7 +697,12 @@ pub unsafe extern "C" fn ass_render_frame(
     let mut parsed = parsed_track_from_ffi(track_ref);
     apply_selective_style_overrides(&mut parsed, renderer);
     let provider = build_font_provider(renderer, track_ref.library);
-    let planes = RenderEngine::new().render_frame_with_provider_and_config(&parsed, &provider, now, &renderer_config(renderer, &parsed));
+    let planes = RenderEngine::new().render_frame_with_provider_and_config(
+        &parsed,
+        &provider,
+        now,
+        &renderer_config(renderer, &parsed),
+    );
     renderer.rendered_images = Some(OwnedImageList::from_planes(planes));
     renderer
         .rendered_images
@@ -715,7 +748,11 @@ pub unsafe extern "C" fn ass_new_track(library: *mut ASS_Library) -> *mut ASS_Tr
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ass_track_set_feature(track: *mut ASS_Track, feature: c_int, enable: c_int) -> c_int {
+pub unsafe extern "C" fn ass_track_set_feature(
+    track: *mut ASS_Track,
+    feature: c_int,
+    enable: c_int,
+) -> c_int {
     let Some(state) = track_state_mut(track) else {
         return -1;
     };
@@ -812,7 +849,11 @@ pub unsafe extern "C" fn ass_process_data(track: *mut ASS_Track, data: *const c_
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ass_process_codec_private(track: *mut ASS_Track, data: *const c_char, size: c_int) {
+pub unsafe extern "C" fn ass_process_codec_private(
+    track: *mut ASS_Track,
+    data: *const c_char,
+    size: c_int,
+) {
     ass_process_data(track, data, size);
 }
 
@@ -837,7 +878,10 @@ pub unsafe extern "C" fn ass_process_chunk(
     events.push(make_event(&ParsedEvent {
         start: timecode,
         duration,
-        read_order: if track_state_mut(track).map(|state| state.check_readorder).unwrap_or(true) {
+        read_order: if track_state_mut(track)
+            .map(|state| state.check_readorder)
+            .unwrap_or(true)
+        {
             events.len() as c_int
         } else {
             0
@@ -888,6 +932,7 @@ pub unsafe extern "C" fn ass_configure_prune(track: *mut ASS_Track, delay: i64) 
     }
 }
 
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_flush_events(track: *mut ASS_Track) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -999,7 +1044,10 @@ pub unsafe extern "C" fn ass_clear_fonts(library: *mut ASS_Library) {
     }
 }
 
-fn build_font_provider(renderer: &ASS_Renderer, library: *mut ASS_Library) -> Box<dyn FontProvider> {
+fn build_font_provider(
+    renderer: &ASS_Renderer,
+    library: *mut ASS_Library,
+) -> Box<dyn FontProvider> {
     let has_system_provider = matches!(
         renderer.default_provider,
         value if value == ass::DefaultFontProvider::Autodetect as c_int
@@ -1045,7 +1093,10 @@ fn build_font_provider(renderer: &ASS_Renderer, library: *mut ASS_Library) -> Bo
     wrap_default_font_path(provider, renderer)
 }
 
-fn wrap_default_font_path(provider: Box<dyn FontProvider>, renderer: &ASS_Renderer) -> Box<dyn FontProvider> {
+fn wrap_default_font_path(
+    provider: Box<dyn FontProvider>,
+    renderer: &ASS_Renderer,
+) -> Box<dyn FontProvider> {
     let Some(default_font) = renderer.default_font.as_deref() else {
         return provider;
     };
@@ -1061,8 +1112,16 @@ fn wrap_default_font_path(provider: Box<dyn FontProvider>, renderer: &ASS_Render
 fn renderer_config(renderer: &ASS_Renderer, track: &ParsedTrack) -> RendererConfig {
     RendererConfig {
         frame: Size {
-            width: if renderer.frame_width > 0 { renderer.frame_width } else { track.play_res_x },
-            height: if renderer.frame_height > 0 { renderer.frame_height } else { track.play_res_y },
+            width: if renderer.frame_width > 0 {
+                renderer.frame_width
+            } else {
+                track.play_res_x
+            },
+            height: if renderer.frame_height > 0 {
+                renderer.frame_height
+            } else {
+                track.play_res_y
+            },
         },
         storage: Size {
             width: renderer.storage_width,
@@ -1130,7 +1189,8 @@ fn apply_track_override(track: &mut ASS_Track, key: &str, value: &str) -> bool {
     } else if key.eq_ignore_ascii_case("WrapStyle") {
         track.WrapStyle = parse_override_i32(value, track.WrapStyle);
     } else if key.eq_ignore_ascii_case("ScaledBorderAndShadow") {
-        track.ScaledBorderAndShadow = parse_override_bool(value, track.ScaledBorderAndShadow != 0) as c_int;
+        track.ScaledBorderAndShadow =
+            parse_override_bool(value, track.ScaledBorderAndShadow != 0) as c_int;
     } else if key.eq_ignore_ascii_case("Kerning") {
         track.Kerning = parse_override_bool(value, track.Kerning != 0) as c_int;
     } else {
@@ -1214,7 +1274,11 @@ fn parse_override_bool(value: &str, default: bool) -> bool {
     } else if value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("false") {
         false
     } else {
-        value.trim().parse::<i32>().map(|parsed| parsed != 0).unwrap_or(default)
+        value
+            .trim()
+            .parse::<i32>()
+            .map(|parsed| parsed != 0)
+            .unwrap_or(default)
     }
 }
 
@@ -1314,7 +1378,11 @@ unsafe fn replace_track_from_parsed(track: *mut ASS_Track, parsed: ParsedTrack) 
     *track_ref = build_track(parsed, library, parser_priv);
 }
 
-unsafe fn build_track(parsed: ParsedTrack, library: *mut ASS_Library, parser_priv: *mut ASS_ParserPriv) -> ASS_Track {
+unsafe fn build_track(
+    parsed: ParsedTrack,
+    library: *mut ASS_Library,
+    parser_priv: *mut ASS_ParserPriv,
+) -> ASS_Track {
     let mut styles = parsed.styles.iter().map(make_style).collect::<Vec<_>>();
     let mut events = parsed.events.iter().map(make_event).collect::<Vec<_>>();
 
@@ -1380,7 +1448,11 @@ unsafe fn take_styles(track: &mut ASS_Track) -> Vec<ASS_Style> {
         track.max_styles = 0;
         Vec::new()
     } else {
-        let vec = Vec::from_raw_parts(track.styles, track.n_styles as usize, track.max_styles as usize);
+        let vec = Vec::from_raw_parts(
+            track.styles,
+            track.n_styles as usize,
+            track.max_styles as usize,
+        );
         track.styles = ptr::null_mut();
         track.n_styles = 0;
         track.max_styles = 0;
@@ -1391,7 +1463,11 @@ unsafe fn take_styles(track: &mut ASS_Track) -> Vec<ASS_Style> {
 unsafe fn store_styles(track: &mut ASS_Track, mut styles: Vec<ASS_Style>) {
     track.n_styles = styles.len() as c_int;
     track.max_styles = styles.capacity() as c_int;
-    track.styles = if styles.capacity() == 0 { ptr::null_mut() } else { styles.as_mut_ptr() };
+    track.styles = if styles.capacity() == 0 {
+        ptr::null_mut()
+    } else {
+        styles.as_mut_ptr()
+    };
     mem::forget(styles);
 }
 
@@ -1402,7 +1478,11 @@ unsafe fn take_events(track: &mut ASS_Track) -> Vec<ASS_Event> {
         track.max_events = 0;
         Vec::new()
     } else {
-        let vec = Vec::from_raw_parts(track.events, track.n_events as usize, track.max_events as usize);
+        let vec = Vec::from_raw_parts(
+            track.events,
+            track.n_events as usize,
+            track.max_events as usize,
+        );
         track.events = ptr::null_mut();
         track.n_events = 0;
         track.max_events = 0;
@@ -1413,7 +1493,11 @@ unsafe fn take_events(track: &mut ASS_Track) -> Vec<ASS_Event> {
 unsafe fn store_events(track: &mut ASS_Track, mut events: Vec<ASS_Event>) {
     track.n_events = events.len() as c_int;
     track.max_events = events.capacity() as c_int;
-    track.events = if events.capacity() == 0 { ptr::null_mut() } else { events.as_mut_ptr() };
+    track.events = if events.capacity() == 0 {
+        ptr::null_mut()
+    } else {
+        events.as_mut_ptr()
+    };
     mem::forget(events);
 }
 
@@ -1490,7 +1574,9 @@ fn make_event(event: &ParsedEvent) -> ASS_Event {
 
 fn string_to_c_ptr(value: &str) -> *mut c_char {
     let sanitized = value.replace('\0', " ");
-    CString::new(sanitized).map(CString::into_raw).unwrap_or(ptr::null_mut())
+    CString::new(sanitized)
+        .map(CString::into_raw)
+        .unwrap_or(ptr::null_mut())
 }
 
 unsafe fn string_option_from_ptr(value: *const c_char) -> Option<String> {
@@ -1567,8 +1653,12 @@ unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
             value if value == ass::YCbCrMatrix::Bt601Pc as c_int => ass::YCbCrMatrix::Bt601Pc,
             value if value == ass::YCbCrMatrix::Bt709Tv as c_int => ass::YCbCrMatrix::Bt709Tv,
             value if value == ass::YCbCrMatrix::Bt709Pc as c_int => ass::YCbCrMatrix::Bt709Pc,
-            value if value == ass::YCbCrMatrix::Smpte240mTv as c_int => ass::YCbCrMatrix::Smpte240mTv,
-            value if value == ass::YCbCrMatrix::Smpte240mPc as c_int => ass::YCbCrMatrix::Smpte240mPc,
+            value if value == ass::YCbCrMatrix::Smpte240mTv as c_int => {
+                ass::YCbCrMatrix::Smpte240mTv
+            }
+            value if value == ass::YCbCrMatrix::Smpte240mPc as c_int => {
+                ass::YCbCrMatrix::Smpte240mPc
+            }
             value if value == ass::YCbCrMatrix::FccTv as c_int => ass::YCbCrMatrix::FccTv,
             value if value == ass::YCbCrMatrix::FccPc as c_int => ass::YCbCrMatrix::FccPc,
             value if value == ass::YCbCrMatrix::Unknown as c_int => ass::YCbCrMatrix::Unknown,
@@ -1612,7 +1702,11 @@ unsafe fn parsed_style_from_ffi(style: &ASS_Style) -> ParsedStyle {
 }
 
 fn apply_selective_style_overrides(track: &mut ParsedTrack, renderer: &ASS_Renderer) {
-    let Some(user_style) = renderer.selective_override_style.as_ref().map(|style| &style.style) else {
+    let Some(user_style) = renderer
+        .selective_override_style
+        .as_ref()
+        .map(|style| &style.style)
+    else {
         return;
     };
 

@@ -12,13 +12,14 @@ pub enum ShapingMode {
     Complex,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShapeRequest {
     pub text: String,
     pub family: String,
     pub style: Option<String>,
     pub language: Option<String>,
     pub mode: ShapingMode,
+    pub font_size: Option<f32>,
 }
 
 impl ShapeRequest {
@@ -29,6 +30,7 @@ impl ShapeRequest {
             style: None,
             language: None,
             mode: ShapingMode::Simple,
+            font_size: None,
         }
     }
 
@@ -44,6 +46,11 @@ impl ShapeRequest {
 
     pub fn with_mode(mut self, mode: ShapingMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_font_size(mut self, font_size: f32) -> Self {
+        self.font_size = font_size.is_finite().then_some(font_size.max(0.0));
         self
     }
 }
@@ -77,17 +84,29 @@ pub struct ShapedText {
 }
 
 pub trait Shaper {
-    fn shape_segment(&self, segment: &TextSegment, font: &FontMatch, direction: BidiDirection) -> Vec<GlyphInfo>;
+    fn shape_segment(
+        &self,
+        segment: &TextSegment,
+        font: &FontMatch,
+        direction: BidiDirection,
+    ) -> Vec<GlyphInfo>;
 }
 
 #[derive(Default)]
 pub struct SimpleShaper;
 
 impl Shaper for SimpleShaper {
-    fn shape_segment(&self, segment: &TextSegment, _font: &FontMatch, direction: BidiDirection) -> Vec<GlyphInfo> {
+    fn shape_segment(
+        &self,
+        segment: &TextSegment,
+        _font: &FontMatch,
+        direction: BidiDirection,
+    ) -> Vec<GlyphInfo> {
         let characters = segment.text.chars().collect::<Vec<_>>();
         let indices: Vec<usize> = match direction {
-            BidiDirection::RightToLeft | BidiDirection::WeakRightToLeft => (0..characters.len()).rev().collect(),
+            BidiDirection::RightToLeft | BidiDirection::WeakRightToLeft => {
+                (0..characters.len()).rev().collect()
+            }
             _ => (0..characters.len()).collect(),
         };
 
@@ -116,8 +135,14 @@ impl ShapeEngine {
         Self::default()
     }
 
-    pub fn shape_text<P: FontProvider>(&self, provider: &P, request: &ShapeRequest) -> RassaResult<ShapedText> {
-        let analysis = self.unicode.analyze_text(&request.text, request.language.as_deref())?;
+    pub fn shape_text<P: FontProvider>(
+        &self,
+        provider: &P,
+        request: &ShapeRequest,
+    ) -> RassaResult<ShapedText> {
+        let analysis = self
+            .unicode
+            .analyze_text(&request.text, request.language.as_deref())?;
         let font = provider.resolve(&FontQuery {
             family: request.family.clone(),
             style: request.style.clone(),
@@ -136,7 +161,13 @@ impl ShapeEngine {
                 glyphs: match request.mode {
                     ShapingMode::Simple => self.simple.shape_segment(segment, &font, direction),
                     ShapingMode::Complex => self
-                        .shape_segment_complex(segment, &font, direction, request.language.as_deref())
+                        .shape_segment_complex(
+                            segment,
+                            &font,
+                            direction,
+                            request.language.as_deref(),
+                            request.font_size,
+                        )
                         .unwrap_or_else(|| self.simple.shape_segment(segment, &font, direction)),
                 },
             })
@@ -156,6 +187,7 @@ impl ShapeEngine {
         font: &FontMatch,
         direction: BidiDirection,
         language: Option<&str>,
+        font_size: Option<f32>,
     ) -> Option<Vec<GlyphInfo>> {
         let font_path = font.path.as_ref()?;
         let bytes = fs::read(font_path).ok()?;
@@ -172,6 +204,11 @@ impl ShapeEngine {
         }
 
         let glyph_buffer = shaper.shape(buffer, &[]);
+        let units_per_em = shaper.units_per_em().max(1) as f32;
+        let scale = font_size
+            .filter(|size| size.is_finite() && *size > 0.0)
+            .unwrap_or(1.0)
+            / units_per_em;
         let glyph_infos = glyph_buffer.glyph_infos();
         let glyph_positions = glyph_buffer.glyph_positions();
         if glyph_infos.len() != glyph_positions.len() {
@@ -185,10 +222,10 @@ impl ShapeEngine {
                 .map(|(info, position)| GlyphInfo {
                     glyph_id: info.glyph_id,
                     cluster: info.cluster as usize,
-                    x_advance: position.x_advance as f32 / 64.0,
-                    y_advance: position.y_advance as f32 / 64.0,
-                    x_offset: position.x_offset as f32 / 64.0,
-                    y_offset: position.y_offset as f32 / 64.0,
+                    x_advance: position.x_advance as f32 * scale,
+                    y_advance: position.y_advance as f32 * scale,
+                    x_offset: position.x_offset as f32 * scale,
+                    y_offset: position.y_offset as f32 * scale,
                 })
                 .collect(),
         )

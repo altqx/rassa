@@ -1,6 +1,6 @@
-use rassa_core::ass;
+use rassa_core::{RendererConfig, Size, ass};
 use rassa_fonts::FontconfigProvider;
-use rassa_parse::{parse_script_text, ParsedTrack};
+use rassa_parse::{ParsedTrack, parse_script_text};
 use rassa_render::RenderEngine;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +29,25 @@ pub fn render_track(track: &ParsedTrack, now_ms: i64) -> Vec<PlaneSummary> {
     summarize_planes(&engine.render_frame_with_provider(track, &provider, now_ms))
 }
 
+pub fn render_track_planes<P: rassa_fonts::FontProvider>(
+    track: &ParsedTrack,
+    provider: &P,
+    now_ms: i64,
+) -> Vec<rassa_core::ImagePlane> {
+    let engine = RenderEngine::new();
+    engine.render_frame_with_provider(track, provider, now_ms)
+}
+
+pub fn render_track_planes_with_config<P: rassa_fonts::FontProvider>(
+    track: &ParsedTrack,
+    provider: &P,
+    now_ms: i64,
+    config: &RendererConfig,
+) -> Vec<rassa_core::ImagePlane> {
+    let engine = RenderEngine::new();
+    engine.render_frame_with_provider_and_config(track, provider, now_ms, config)
+}
+
 fn summarize_planes(planes: &[rassa_core::ImagePlane]) -> Vec<PlaneSummary> {
     planes
         .iter()
@@ -47,8 +66,16 @@ fn summarize_planes(planes: &[rassa_core::ImagePlane]) -> Vec<PlaneSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rassa_fonts::FontProvider;
-    use std::{env, ffi::{c_char, CString}, fs, path::PathBuf, ptr, time::{SystemTime, UNIX_EPOCH}};
+    use rassa_fonts::{AttachedFontProvider, FontAttachment, FontProvider};
+    use std::{
+        env,
+        ffi::{CString, c_char},
+        fs,
+        path::PathBuf,
+        process::Command,
+        ptr,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     const INLINE_OVERRIDE_FIXTURE: &str = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,36,&H00112233,&H00445566,&H000A0B0C,&H00101010,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)\\t(0,1000,\\1c&H00223344&)}{\\K100}Test";
     const STYLE_ONLY_FIXTURE: &str = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Alt,sans,18,&H00ABCDEF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,11,12,13,1";
@@ -152,8 +179,10 @@ mod tests {
         }
         (min_y != i32::MAX).then_some(min_y)
     }
-    
-    fn image_signatures(mut image: *mut rassa_capi::ASS_Image) -> Vec<(u32, i32, i32, i32, i32, Vec<u8>)> {
+
+    fn image_signatures(
+        mut image: *mut rassa_capi::ASS_Image,
+    ) -> Vec<(u32, i32, i32, i32, i32, Vec<u8>)> {
         let mut signatures = Vec::new();
         unsafe {
             while !image.is_null() {
@@ -168,11 +197,386 @@ mod tests {
                         bitmap.extend_from_slice(row_slice);
                     }
                 }
-                signatures.push(((*image).color, (*image).dst_x, (*image).dst_y, (*image).w, (*image).h, bitmap));
+                signatures.push((
+                    (*image).color,
+                    (*image).dst_x,
+                    (*image).dst_y,
+                    (*image).w,
+                    (*image).h,
+                    bitmap,
+                ));
                 image = (*image).next;
             }
         }
         signatures
+    }
+
+    fn png_dimensions(bytes: &[u8]) -> Option<(i32, i32)> {
+        let header = bytes.get(0..24)?;
+        (header.get(0..8)? == b"\x89PNG\r\n\x1a\n" && header.get(12..16)? == b"IHDR")
+            .then_some(())?;
+        let width = u32::from_be_bytes(header.get(16..20)?.try_into().ok()?) as i32;
+        let height = u32::from_be_bytes(header.get(20..24)?.try_into().ok()?) as i32;
+        Some((width, height))
+    }
+
+    fn render_compare_reference(
+        script: &str,
+        now_ms: i64,
+        reference_png: &[u8],
+    ) -> Vec<PlaneSummary> {
+        let (width, height) =
+            png_dimensions(reference_png).expect("reference PNG should have dimensions");
+        let track = parse_fixture(script);
+        assert_eq!(
+            track.play_res_x, width,
+            "compare fixture PlayResX should match reference PNG width"
+        );
+        assert_eq!(
+            track.play_res_y, height,
+            "compare fixture PlayResY should match reference PNG height"
+        );
+
+        let summary = render_track(&track, now_ms);
+        assert!(
+            !summary.is_empty(),
+            "compare fixture should render images at {now_ms} ms"
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|plane| plane.kind == ass::ImageType::Character)
+        );
+        assert!(summary.iter().all(|plane| plane.lit_pixels > 0));
+        assert!(
+            summary
+                .iter()
+                .all(|plane| plane.width > 0 && plane.height > 0)
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|plane| plane.x + plane.width > 0 && plane.x < width)
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|plane| plane.y + plane.height > 0 && plane.y < height)
+        );
+        summary
+    }
+
+    fn compare_fixture_font_provider() -> AttachedFontProvider {
+        AttachedFontProvider::from_attachments_in_dir(
+            &[
+                FontAttachment {
+                    name: "font1.ttf".to_string(),
+                    data: include_bytes!("../../../libass/compare/test/font1.ttf").to_vec(),
+                },
+                FontAttachment {
+                    name: "font2.otf".to_string(),
+                    data: include_bytes!("../../../libass/compare/test/font2.otf").to_vec(),
+                },
+            ],
+            Some(env::temp_dir().join("rassa-compare-fonts")),
+        )
+    }
+
+    fn upstream_compare_raw_url(name: &str) -> String {
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+            "compare fixture names must be plain file names"
+        );
+        format!("https://raw.githubusercontent.com/libass/libass/master/compare/test/{name}")
+    }
+
+    fn fetch_upstream_compare_file(name: &str) -> Vec<u8> {
+        let url = upstream_compare_raw_url(name);
+        let output = Command::new("curl")
+            .args(["-fsSL", "--max-time", "20", "--retry", "2", &url])
+            .output()
+            .expect("curl should be available for live upstream fixture fetches");
+        assert!(
+            output.status.success(),
+            "failed to fetch {url}: status={:?}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "server file {url} should not be empty"
+        );
+        output.stdout
+    }
+
+    fn upstream_compare_font_provider_from_server() -> AttachedFontProvider {
+        AttachedFontProvider::from_attachments_in_dir(
+            &[
+                FontAttachment {
+                    name: "font1.ttf".to_string(),
+                    data: fetch_upstream_compare_file("font1.ttf"),
+                },
+                FontAttachment {
+                    name: "font2.otf".to_string(),
+                    data: fetch_upstream_compare_file("font2.otf"),
+                },
+            ],
+            Some(env::temp_dir().join("rassa-compare-fonts-server")),
+        )
+    }
+
+    #[test]
+    #[ignore = "live network check for pulling encoded upstream files directly from the server"]
+    fn upstream_compare_reference_can_be_loaded_directly_from_server() {
+        let script = String::from_utf8(fetch_upstream_compare_file("sub2.ass"))
+            .expect("upstream ASS fixture should be utf-8 text");
+        let reference_png = fetch_upstream_compare_file("sub2-153000.png");
+        let font_provider = upstream_compare_font_provider_from_server();
+
+        let (width, height) = png_dimensions(&reference_png)
+            .expect("server PNG bytes should still be encoded PNG data");
+        assert_eq!((width, height), (320, 180));
+
+        let track = parse_fixture(&script);
+        let planes = render_track_planes_with_config(
+            &track,
+            &font_provider,
+            153000,
+            &RendererConfig {
+                frame: Size { width, height },
+                storage: Size { width, height },
+                ..RendererConfig::default()
+            },
+        );
+
+        assert!(
+            !planes.is_empty(),
+            "server-loaded compare fixture should render with server-loaded raw font bytes"
+        );
+    }
+
+    fn decode_png_compare_target(bytes: &[u8]) -> (usize, usize, Vec<u16>) {
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().expect("reference PNG should decode");
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buffer).expect("reference PNG frame");
+        let data = &buffer[..info.buffer_size()];
+        let target = match (info.color_type, info.bit_depth) {
+            (png::ColorType::Rgba, png::BitDepth::Eight) => data
+                .chunks_exact(4)
+                .flat_map(|px| {
+                    let a = px[3];
+                    let premul = |c: u8| {
+                        let ca = u16::from(c) * u16::from(a);
+                        let value = (ca + (ca >> 8) + 128) >> 8;
+                        257_u16 * value
+                    };
+                    [
+                        premul(px[0]),
+                        premul(px[1]),
+                        premul(px[2]),
+                        257_u16 * u16::from(!a),
+                    ]
+                })
+                .collect(),
+            (png::ColorType::Rgba, png::BitDepth::Sixteen) => data
+                .chunks_exact(8)
+                .flat_map(|px| {
+                    let r = u16::from_be_bytes([px[0], px[1]]);
+                    let g = u16::from_be_bytes([px[2], px[3]]);
+                    let b = u16::from_be_bytes([px[4], px[5]]);
+                    let a = u16::from_be_bytes([px[6], px[7]]);
+                    let premul = |c: u16| {
+                        let ca = u32::from(c) * u32::from(a);
+                        ((ca + (ca >> 16) + (1 << 15)) >> 16) as u16
+                    };
+                    [premul(r), premul(g), premul(b), !a]
+                })
+                .collect(),
+            other => panic!("unsupported reference PNG format: {other:?}"),
+        };
+        (info.width as usize, info.height as usize, target)
+    }
+
+    fn blend_planes_to_compare_frame(
+        width: usize,
+        height: usize,
+        planes: &[rassa_core::ImagePlane],
+    ) -> Vec<u8> {
+        let mut frame = vec![0_u8; width * height * 4];
+        for px in frame.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+
+        for plane in planes {
+            let r = (plane.color.0 >> 24) as u8;
+            let g = (plane.color.0 >> 16) as u8;
+            let b = (plane.color.0 >> 8) as u8;
+            let a = plane.color.0 as u8;
+            let mul = 129_i32 * i32::from(255_u8.saturating_sub(a));
+            let offs = 1_i32 << 22;
+            let x_min = plane.destination.x.max(0) as usize;
+            let y_min = plane.destination.y.max(0) as usize;
+            let x_max = (plane.destination.x + plane.size.width)
+                .min(width as i32)
+                .max(0) as usize;
+            let y_max = (plane.destination.y + plane.size.height)
+                .min(height as i32)
+                .max(0) as usize;
+            if x_min >= x_max || y_min >= y_max || plane.stride <= 0 {
+                continue;
+            }
+            let stride = plane.stride as usize;
+            for y in y_min..y_max {
+                for x in x_min..x_max {
+                    let src_x = (x as i32 - plane.destination.x) as usize;
+                    let src_y = (y as i32 - plane.destination.y) as usize;
+                    let src = i32::from(plane.bitmap[src_y * stride + src_x]);
+                    let k = src * mul;
+                    let dst = &mut frame[(y * width + x) * 4..][..4];
+                    for (channel, target) in [r, g, b, 0].into_iter().enumerate() {
+                        let current = i32::from(dst[channel]);
+                        dst[channel] =
+                            (current - (((current - i32::from(target)) * k + offs) >> 23)) as u8;
+                    }
+                }
+            }
+        }
+        frame
+    }
+
+    fn compare_bbox(buffer: &[u16], width: usize) -> Option<(usize, usize, usize, usize)> {
+        let mut min_x = usize::MAX;
+        let mut min_y = usize::MAX;
+        let mut max_x = 0_usize;
+        let mut max_y = 0_usize;
+        for (idx, px) in buffer.chunks_exact(4).enumerate() {
+            if px[3] == 65535 {
+                continue;
+            }
+            let x = idx % width;
+            let y = idx / width;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + 1);
+            max_y = max_y.max(y + 1);
+        }
+        (min_x != usize::MAX).then_some((min_x, min_y, max_x, max_y))
+    }
+
+    fn downsample_compare_frame(
+        temp: &[u8],
+        width: usize,
+        height: usize,
+        scale_x: usize,
+        scale_y: usize,
+    ) -> Vec<u16> {
+        let scale_area = scale_x * scale_y;
+        let mul = ((257_u64 << 20) / scale_area as u64) as u64;
+        let offs = (1_u64 << 19) - 1;
+        let temp_width = width * scale_x;
+        let mut frame = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let mut sums = [0_u16; 4];
+                for sy in 0..scale_y {
+                    let row_start = ((y * scale_y + sy) * temp_width + x * scale_x) * 4;
+                    for sx in 0..scale_x {
+                        let offset = row_start + sx * 4;
+                        for channel in 0..4 {
+                            sums[channel] += u16::from(temp[offset + channel]);
+                        }
+                    }
+                }
+                for sum in sums {
+                    frame.push(((u64::from(sum) * mul + offs) >> 20) as u16);
+                }
+            }
+        }
+        frame
+    }
+
+    fn assert_pixel_perfect_compare_fixture(script: &str, now_ms: i64, reference_png: &[u8]) {
+        const COMPARE_SCALE: usize = 8;
+        let (width, height, target) = decode_png_compare_target(reference_png);
+        let track = parse_fixture(script);
+        let provider = compare_fixture_font_provider();
+        let config = RendererConfig {
+            frame: Size {
+                width: (width * COMPARE_SCALE) as i32,
+                height: (height * COMPARE_SCALE) as i32,
+            },
+            storage: Size {
+                width: width as i32,
+                height: height as i32,
+            },
+            ..RendererConfig::default()
+        };
+        let planes = render_track_planes_with_config(&track, &provider, now_ms, &config);
+        let actual = downsample_compare_frame(
+            &blend_planes_to_compare_frame(width * COMPARE_SCALE, height * COMPARE_SCALE, &planes),
+            width,
+            height,
+            COMPARE_SCALE,
+            COMPARE_SCALE,
+        );
+        assert_eq!(actual.len(), target.len());
+        let mut different_pixels = 0_usize;
+        let mut first_diff = None;
+        let mut actual_non_transparent = 0_usize;
+        let mut target_non_transparent = 0_usize;
+        let mut actual_alpha_sum = 0_u64;
+        let mut target_alpha_sum = 0_u64;
+        for (idx, (a, t)) in actual
+            .chunks_exact(4)
+            .zip(target.chunks_exact(4))
+            .enumerate()
+        {
+            if a != t {
+                different_pixels += 1;
+                first_diff.get_or_insert((idx, [a[0], a[1], a[2], a[3]], [t[0], t[1], t[2], t[3]]));
+            }
+            if a[3] != 65535 {
+                actual_non_transparent += 1;
+                actual_alpha_sum += u64::from(65535 - a[3]);
+            }
+            if t[3] != 65535 {
+                target_non_transparent += 1;
+                target_alpha_sum += u64::from(65535 - t[3]);
+            }
+        }
+        let actual_bbox = compare_bbox(&actual, width);
+        let target_bbox = compare_bbox(&target, width);
+        let row_summary = |buffer: &[u16]| -> Vec<(usize, usize, u64)> {
+            buffer
+                .chunks_exact(width * 4)
+                .enumerate()
+                .filter_map(|(row, pixels)| {
+                    let mut count = 0_usize;
+                    let mut alpha_sum = 0_u64;
+                    for px in pixels.chunks_exact(4) {
+                        if px[3] != 65535 {
+                            count += 1;
+                            alpha_sum += u64::from(65535 - px[3]);
+                        }
+                    }
+                    (count > 0).then_some((row, count, alpha_sum))
+                })
+                .collect()
+        };
+        assert_eq!(
+            different_pixels,
+            0,
+            "rassa rendered frame differs from upstream libass compare reference at {now_ms} ms; planes={:?}, actual_nontransparent={}, target_nontransparent={}, actual_alpha_sum={}, target_alpha_sum={}, actual_bbox={actual_bbox:?}, target_bbox={target_bbox:?}, actual_rows={:?}, target_rows={:?}, first_diff={first_diff:?}",
+            summarize_planes(&planes),
+            actual_non_transparent,
+            target_non_transparent,
+            actual_alpha_sum,
+            target_alpha_sum,
+            row_summary(&actual),
+            row_summary(&target),
+        );
     }
 
     #[test]
@@ -191,7 +595,11 @@ mod tests {
         let second = render_fixture(INLINE_OVERRIDE_FIXTURE, 500);
 
         assert_eq!(first, second);
-        assert!(first.iter().any(|plane| plane.kind == ass::ImageType::Character));
+        assert!(
+            first
+                .iter()
+                .any(|plane| plane.kind == ass::ImageType::Character)
+        );
     }
 
     #[test]
@@ -200,7 +608,11 @@ mod tests {
         let summary = render_fixture(script, 2000);
 
         assert!(!summary.is_empty());
-        assert!(summary.iter().any(|plane| plane.kind == ass::ImageType::Character));
+        assert!(
+            summary
+                .iter()
+                .any(|plane| plane.kind == ass::ImageType::Character)
+        );
         assert!(summary.iter().all(|plane| plane.lit_pixels > 0));
     }
 
@@ -210,8 +622,60 @@ mod tests {
         let summary = render_fixture(script, 152000);
 
         assert!(!summary.is_empty());
-        assert!(summary.iter().any(|plane| plane.kind == ass::ImageType::Character));
-        assert!(summary.iter().all(|plane| plane.width >= 0 && plane.height >= 0));
+        assert!(
+            summary
+                .iter()
+                .any(|plane| plane.kind == ass::ImageType::Character)
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|plane| plane.width >= 0 && plane.height >= 0)
+        );
+    }
+
+    #[test]
+    fn upstream_compare_reference_png_matrix_renders_within_frame() {
+        let sub1 = include_str!("../../../libass/compare/test/sub1.ass");
+        let sub1_0500 = render_compare_reference(
+            sub1,
+            500,
+            include_bytes!("../../../libass/compare/test/sub1-0500.png"),
+        );
+        let sub1_1500 = render_compare_reference(
+            sub1,
+            1500,
+            include_bytes!("../../../libass/compare/test/sub1-1500.png"),
+        );
+        let sub1_2500 = render_compare_reference(
+            sub1,
+            2500,
+            include_bytes!("../../../libass/compare/test/sub1-2500.png"),
+        );
+        assert_ne!(
+            sub1_0500, sub1_1500,
+            "sub1 compare frames should exercise time-varying rendering"
+        );
+        assert_ne!(
+            sub1_1500, sub1_2500,
+            "sub1 compare frames should exercise time-varying rendering"
+        );
+
+        let sub2 = include_str!("../../../libass/compare/test/sub2.ass");
+        render_compare_reference(
+            sub2,
+            153000,
+            include_bytes!("../../../libass/compare/test/sub2-153000.png"),
+        );
+    }
+
+    #[test]
+    fn upstream_compare_reference_sub2_is_pixel_perfect() {
+        assert_pixel_perfect_compare_fixture(
+            include_str!("../../../libass/compare/test/sub2.ass"),
+            153000,
+            include_bytes!("../../../libass/compare/test/sub2-153000.png"),
+        );
     }
 
     #[test]
@@ -275,8 +739,20 @@ mod tests {
 
             let first = b"first";
             let second = b"second";
-            rassa_capi::ass_process_chunk(track, first.as_ptr() as *const c_char, first.len() as i32, 1000, 500);
-            rassa_capi::ass_process_chunk(track, second.as_ptr() as *const c_char, second.len() as i32, 3000, 500);
+            rassa_capi::ass_process_chunk(
+                track,
+                first.as_ptr() as *const c_char,
+                first.len() as i32,
+                1000,
+                500,
+            );
+            rassa_capi::ass_process_chunk(
+                track,
+                second.as_ptr() as *const c_char,
+                second.len() as i32,
+                3000,
+                500,
+            );
 
             assert_eq!((*track).n_events, 2);
             assert_eq!(rassa_capi::ass_step_sub(track, 1200, 1), 1800);
@@ -436,7 +912,10 @@ mod tests {
             let mut detect_change = 0;
             let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
 
-            assert_eq!(image_min_y_for_color(images, 0x0000_00FF), image_min_y_for_color(images, 0x0000_FF00));
+            assert_eq!(
+                image_min_y_for_color(images, 0x0000_00FF),
+                image_min_y_for_color(images, 0x0000_FF00)
+            );
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -494,9 +973,11 @@ mod tests {
             );
 
             let mut detect_change = 0;
-            let baseline = rassa_capi::ass_render_frame(renderer, baseline_track, 500, &mut detect_change);
+            let baseline =
+                rassa_capi::ass_render_frame(renderer, baseline_track, 500, &mut detect_change);
             let baseline_bounds = image_bounds(baseline).expect("baseline bounds");
-            let scaled = rassa_capi::ass_render_frame(renderer, scaled_track, 500, &mut detect_change);
+            let scaled =
+                rassa_capi::ass_render_frame(renderer, scaled_track, 500, &mut detect_change);
             let scaled_bounds = image_bounds(scaled).expect("scaled bounds");
 
             assert!(scaled_bounds.2 - scaled_bounds.0 > baseline_bounds.2 - baseline_bounds.0);
@@ -530,9 +1011,11 @@ mod tests {
             );
 
             let mut detect_change = 0;
-            let baseline = rassa_capi::ass_render_frame(renderer, baseline_track, 500, &mut detect_change);
+            let baseline =
+                rassa_capi::ass_render_frame(renderer, baseline_track, 500, &mut detect_change);
             let baseline_bounds = image_bounds(baseline).expect("baseline bounds");
-            let scaled = rassa_capi::ass_render_frame(renderer, scaled_track, 500, &mut detect_change);
+            let scaled =
+                rassa_capi::ass_render_frame(renderer, scaled_track, 500, &mut detect_change);
             let scaled_bounds = image_bounds(scaled).expect("scaled bounds");
 
             assert!(scaled_bounds.2 - scaled_bounds.0 > baseline_bounds.2 - baseline_bounds.0);
@@ -566,9 +1049,11 @@ mod tests {
             );
 
             let mut detect_change = 0;
-            let baseline = rassa_capi::ass_render_frame(renderer, baseline_track, 500, &mut detect_change);
+            let baseline =
+                rassa_capi::ass_render_frame(renderer, baseline_track, 500, &mut detect_change);
             let baseline_bounds = image_bounds(baseline).expect("baseline bounds");
-            let spaced = rassa_capi::ass_render_frame(renderer, spaced_track, 500, &mut detect_change);
+            let spaced =
+                rassa_capi::ass_render_frame(renderer, spaced_track, 500, &mut detect_change);
             let spaced_bounds = image_bounds(spaced).expect("spaced bounds");
 
             assert!(spaced_bounds.2 - spaced_bounds.0 > baseline_bounds.2 - baseline_bounds.0);
@@ -720,7 +1205,8 @@ mod tests {
             let baseline_signature = image_signatures(baseline);
 
             rassa_capi::ass_set_storage_size(renderer, 400, 120);
-            let storage_adjusted = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let storage_adjusted =
+                rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
             let storage_adjusted_area = total_image_area(storage_adjusted);
 
             assert!(baseline_area > 0);
@@ -847,7 +1333,10 @@ mod tests {
             override_style.PrimaryColour = 0x000A0B0C;
             override_style.SecondaryColour = 0x000A0B0C;
             override_style.FontSize = 48.0;
-            rassa_capi::ass_set_selective_style_override_enabled(renderer, ass::override_bits::STYLE);
+            rassa_capi::ass_set_selective_style_override_enabled(
+                renderer,
+                ass::override_bits::STYLE,
+            );
             rassa_capi::ass_set_selective_style_override(renderer, &mut override_style);
 
             let overridden = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
@@ -983,10 +1472,12 @@ mod tests {
             );
 
             let mut none_change = 0;
-            let none_images = rassa_capi::ass_render_frame(none_renderer, track, 500, &mut none_change);
+            let none_images =
+                rassa_capi::ass_render_frame(none_renderer, track, 500, &mut none_change);
             let none_signature = image_signatures(none_images);
             let mut invalid_change = 0;
-            let invalid_images = rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
+            let invalid_images =
+                rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
 
             assert!(none_change > 0);
             assert!(invalid_change > 0);
@@ -1005,7 +1496,8 @@ mod tests {
             .resolve_family("sans")
             .path
             .expect("system font path should exist");
-        let default_font = CString::new(system_font.to_string_lossy().as_bytes()).expect("font path cstring");
+        let default_font =
+            CString::new(system_font.to_string_lossy().as_bytes()).expect("font path cstring");
 
         unsafe {
             let library = rassa_capi::ass_library_init();
@@ -1036,9 +1528,15 @@ mod tests {
             );
 
             let mut no_default_change = 0;
-            let no_default_images = rassa_capi::ass_render_frame(no_default_renderer, track, 500, &mut no_default_change);
+            let no_default_images = rassa_capi::ass_render_frame(
+                no_default_renderer,
+                track,
+                500,
+                &mut no_default_change,
+            );
             let mut default_change = 0;
-            let default_images = rassa_capi::ass_render_frame(default_renderer, track, 500, &mut default_change);
+            let default_images =
+                rassa_capi::ass_render_frame(default_renderer, track, 500, &mut default_change);
 
             assert!(no_default_change > 0);
             assert!(default_change > 0);
@@ -1190,11 +1688,8 @@ mod tests {
     fn capi_style_overrides_apply_on_load() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let (_storage, mut overrides) = style_override_list(&[
-                "PlayResX=640",
-                "Default.FontSize=48",
-                "Default.MarginL=33",
-            ]);
+            let (_storage, mut overrides) =
+                style_override_list(&["PlayResX=640", "Default.FontSize=48", "Default.MarginL=33"]);
             rassa_capi::ass_set_style_overrides(library, overrides.as_mut_ptr());
 
             let track = rassa_capi::ass_read_memory(
@@ -1243,7 +1738,7 @@ mod tests {
             rassa_capi::ass_library_done(library);
         }
     }
-    
+
     #[test]
     fn capi_set_shaper_allows_rendering() {
         const SHAPING_FIXTURE: &str = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,20,20,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,office";
@@ -1265,12 +1760,15 @@ mod tests {
             rassa_capi::ass_set_shaper(invalid_renderer, 99);
 
             let mut simple_change = 0;
-            let simple = rassa_capi::ass_render_frame(simple_renderer, track, 500, &mut simple_change);
+            let simple =
+                rassa_capi::ass_render_frame(simple_renderer, track, 500, &mut simple_change);
             let mut complex_change = 0;
-            let complex = rassa_capi::ass_render_frame(complex_renderer, track, 500, &mut complex_change);
+            let complex =
+                rassa_capi::ass_render_frame(complex_renderer, track, 500, &mut complex_change);
             let complex_signature = image_signatures(complex);
             let mut invalid_change = 0;
-            let invalid = rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
+            let invalid =
+                rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
             let invalid_signature = image_signatures(invalid);
 
             assert!(!simple.is_null());

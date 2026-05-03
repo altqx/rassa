@@ -4,8 +4,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use freetype::{face::LoadFlag, Bitmap, Library};
-use rassa_core::{ass, RassaError, RassaResult};
+use freetype::{Bitmap, Library, face::LoadFlag, ffi};
+use rassa_core::{RassaError, RassaResult, ass};
 use rassa_fonts::FontMatch;
 use rassa_shape::{GlyphInfo, ShapedRun};
 
@@ -31,6 +31,8 @@ pub struct RasterGlyph {
     pub stride: i32,
     pub left: i32,
     pub top: i32,
+    pub offset_x: i32,
+    pub offset_y: i32,
     pub advance_x: i32,
     pub advance_y: i32,
     pub pixel_mode: RasterPixelMode,
@@ -39,14 +41,14 @@ pub struct RasterGlyph {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RasterOptions {
-    pub pixel_height: u32,
+    pub size_26_6: i32,
     pub hinting: ass::Hinting,
 }
 
 impl Default for RasterOptions {
     fn default() -> Self {
         Self {
-            pixel_height: 32,
+            size_26_6: 32 * 64,
             hinting: ass::Hinting::None,
         }
     }
@@ -66,7 +68,7 @@ pub struct RasterCacheStats {
 struct GlyphCacheKey {
     path: PathBuf,
     glyph_id: u32,
-    pixel_height: u32,
+    size_26_6: i32,
     hinting: ass::Hinting,
 }
 
@@ -87,6 +89,8 @@ impl Rasterizer {
             .map(|glyph| RasterGlyph {
                 glyph_id: glyph.glyph_id,
                 cluster: glyph.cluster,
+                offset_x: glyph.x_offset.round() as i32,
+                offset_y: (-glyph.y_offset).round() as i32,
                 advance_x: glyph.x_advance.round() as i32,
                 advance_y: glyph.y_advance.round() as i32,
                 ..RasterGlyph::default()
@@ -94,17 +98,24 @@ impl Rasterizer {
             .collect()
     }
 
-    pub fn rasterize_glyphs(&self, font: &FontMatch, glyphs: &[GlyphInfo]) -> RassaResult<Vec<RasterGlyph>> {
+    pub fn rasterize_glyphs(
+        &self,
+        font: &FontMatch,
+        glyphs: &[GlyphInfo],
+    ) -> RassaResult<Vec<RasterGlyph>> {
         let font_path = font
             .path
             .as_ref()
             .ok_or_else(|| RassaError::new(format!("font '{}' is unresolved", font.family)))?;
-        let library = Library::init().map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
-        let face = library
-            .new_face(font_path, 0)
-            .map_err(|error| RassaError::new(format!("failed to load font '{}': {error:?}", font_path.display())))?;
-        face.set_pixel_sizes(0, self.options.pixel_height)
-            .map_err(|error| RassaError::new(format!("failed to set font pixel size: {error:?}")))?;
+        let library = Library::init()
+            .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
+        let mut face = library.new_face(font_path, 0).map_err(|error| {
+            RassaError::new(format!(
+                "failed to load font '{}': {error:?}",
+                font_path.display()
+            ))
+        })?;
+        request_real_dim_size(&mut face, self.options.size_26_6.max(64))?;
 
         let mut rasterized = Vec::with_capacity(glyphs.len());
         let load_flags = load_flags_for_hinting(self.options.hinting);
@@ -112,12 +123,19 @@ impl Rasterizer {
             let cache_key = GlyphCacheKey {
                 path: font_path.clone(),
                 glyph_id: glyph.glyph_id,
-                pixel_height: self.options.pixel_height,
+                size_26_6: self.options.size_26_6,
                 hinting: self.options.hinting,
             };
-            if let Some(cached) = glyph_cache().lock().expect("glyph cache mutex poisoned").get(&cache_key).cloned() {
+            if let Some(cached) = glyph_cache()
+                .lock()
+                .expect("glyph cache mutex poisoned")
+                .get(&cache_key)
+                .cloned()
+            {
                 rasterized.push(RasterGlyph {
                     cluster: glyph.cluster,
+                    offset_x: glyph.x_offset.round() as i32,
+                    offset_y: (-glyph.y_offset).round() as i32,
                     advance_x: cached.advance_x,
                     advance_y: cached.advance_y,
                     ..cached
@@ -125,8 +143,13 @@ impl Rasterizer {
                 continue;
             }
 
-            face.load_char(glyph.glyph_id as usize, load_flags)
-                .map_err(|error| RassaError::new(format!("failed to load glyph {}: {error:?}", glyph.glyph_id)))?;
+            face.load_glyph(glyph.glyph_id, load_flags)
+                .map_err(|error| {
+                    RassaError::new(format!(
+                        "failed to load glyph {}: {error:?}",
+                        glyph.glyph_id
+                    ))
+                })?;
             let slot = face.glyph();
             let bitmap = slot.bitmap();
             let stride = bitmap.pitch().abs();
@@ -138,6 +161,8 @@ impl Rasterizer {
                 stride,
                 left: slot.bitmap_left(),
                 top: slot.bitmap_top(),
+                offset_x: glyph.x_offset.round() as i32,
+                offset_y: (-glyph.y_offset).round() as i32,
                 advance_x: (slot.advance().x >> 6) as i32,
                 advance_y: (slot.advance().y >> 6) as i32,
                 pixel_mode: classify_pixel_mode(&bitmap),
@@ -158,20 +183,32 @@ impl Rasterizer {
     }
 
     pub fn outline_glyphs(&self, glyphs: &[RasterGlyph], radius: i32) -> Vec<RasterGlyph> {
-        glyphs.iter().map(|glyph| expand_outline(glyph, radius)).collect()
+        glyphs
+            .iter()
+            .map(|glyph| expand_outline(glyph, radius))
+            .collect()
     }
 
     pub fn blur_glyphs(&self, glyphs: &[RasterGlyph], radius: u32) -> Vec<RasterGlyph> {
-        glyphs.iter().map(|glyph| blur_glyph(glyph, radius)).collect()
+        glyphs
+            .iter()
+            .map(|glyph| blur_glyph(glyph, radius))
+            .collect()
     }
 
     pub fn clear_cache() {
-        glyph_cache().lock().expect("glyph cache mutex poisoned").clear();
+        glyph_cache()
+            .lock()
+            .expect("glyph cache mutex poisoned")
+            .clear();
     }
 
     pub fn cache_stats() -> RasterCacheStats {
         RasterCacheStats {
-            glyph_entries: glyph_cache().lock().expect("glyph cache mutex poisoned").len(),
+            glyph_entries: glyph_cache()
+                .lock()
+                .expect("glyph cache mutex poisoned")
+                .len(),
         }
     }
 }
@@ -180,12 +217,39 @@ fn glyph_cache() -> &'static Mutex<HashMap<GlyphCacheKey, RasterGlyph>> {
     GLYPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResult<()> {
+    let mut request = ffi::FT_Size_RequestRec {
+        size_request_type: ffi::FT_SIZE_REQUEST_TYPE_REAL_DIM,
+        width: 0,
+        height: size_26_6.into(),
+        horiResolution: 0,
+        vertResolution: 0,
+    };
+    let err = unsafe {
+        ffi::FT_Request_Size(
+            face.raw_mut() as *mut ffi::FT_FaceRec,
+            &mut request as ffi::FT_Size_Request,
+        )
+    };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(RassaError::new(format!(
+            "failed to request freetype real-dim size {size_26_6}: {err}"
+        )))
+    }
+}
+
 fn load_flags_for_hinting(hinting: ass::Hinting) -> LoadFlag {
+    let base = LoadFlag::RENDER
+        | LoadFlag::NO_BITMAP
+        | LoadFlag::IGNORE_GLOBAL_ADVANCE_WITH
+        | LoadFlag::IGNORE_TRANSFORM;
     match hinting {
-        ass::Hinting::None => LoadFlag::RENDER | LoadFlag::NO_HINTING,
-        ass::Hinting::Light => LoadFlag::RENDER | LoadFlag::FORCE_AUTOHINT | LoadFlag::TARGET_LIGHT,
-        ass::Hinting::Normal => LoadFlag::RENDER | LoadFlag::FORCE_AUTOHINT | LoadFlag::TARGET_NORMAL,
-        ass::Hinting::Native => LoadFlag::RENDER | LoadFlag::TARGET_NORMAL,
+        ass::Hinting::None => base | LoadFlag::NO_HINTING,
+        ass::Hinting::Light => base | LoadFlag::FORCE_AUTOHINT | LoadFlag::TARGET_LIGHT,
+        ass::Hinting::Normal => base | LoadFlag::FORCE_AUTOHINT,
+        ass::Hinting::Native => base,
     }
 }
 
@@ -213,7 +277,8 @@ fn copy_bitmap_rows(bitmap: &Bitmap) -> Vec<u8> {
         for row in 0..rows {
             let src_start = row * stride;
             let dst_start = (rows - 1 - row) * stride;
-            buffer[dst_start..dst_start + stride].copy_from_slice(&source[src_start..src_start + stride]);
+            buffer[dst_start..dst_start + stride]
+                .copy_from_slice(&source[src_start..src_start + stride]);
         }
     }
 
@@ -242,8 +307,12 @@ fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {
             }
             let center_x = x + radius;
             let center_y = y + radius;
-            for outline_y in center_y.saturating_sub(radius)..=(center_y + radius).min(new_height - 1) {
-                for outline_x in center_x.saturating_sub(radius)..=(center_x + radius).min(new_width - 1) {
+            for outline_y in
+                center_y.saturating_sub(radius)..=(center_y + radius).min(new_height - 1)
+            {
+                for outline_x in
+                    center_x.saturating_sub(radius)..=(center_x + radius).min(new_width - 1)
+                {
                     let dx = outline_x as i32 - center_x as i32;
                     let dy = outline_y as i32 - center_y as i32;
                     if dx * dx + dy * dy > radius_squared {
@@ -331,7 +400,7 @@ mod tests {
             .shape_text(&provider, &ShapeRequest::new("Ab", "sans"))
             .expect("shaping should succeed");
         let rasterizer = Rasterizer::with_options(RasterOptions {
-            pixel_height: 24,
+            size_26_6: 24 * 64,
             hinting: ass::Hinting::Normal,
         });
         let glyphs = rasterizer
@@ -341,7 +410,11 @@ mod tests {
         assert_eq!(glyphs.len(), 2);
         assert!(glyphs.iter().all(|glyph| glyph.width >= 0));
         assert!(glyphs.iter().all(|glyph| glyph.height >= 0));
-        assert!(glyphs.iter().all(|glyph| glyph.bitmap.len() == (glyph.stride * glyph.height) as usize));
+        assert!(
+            glyphs
+                .iter()
+                .all(|glyph| glyph.bitmap.len() == (glyph.stride * glyph.height) as usize)
+        );
         assert!(glyphs.iter().any(|glyph| !glyph.bitmap.is_empty()));
     }
 
@@ -354,17 +427,24 @@ mod tests {
             .shape_text(&provider, &ShapeRequest::new("A", "sans"))
             .expect("shaping should succeed");
         let rasterizer = Rasterizer::with_options(RasterOptions {
-            pixel_height: 47,
+            size_26_6: 47 * 64,
             hinting: ass::Hinting::Normal,
         });
 
-        let first = rasterizer.rasterize_run(&shaped.runs[0]).expect("rasterization should succeed");
+        let first = rasterizer
+            .rasterize_run(&shaped.runs[0])
+            .expect("rasterization should succeed");
         let entries_after_first = glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options);
-        let second = rasterizer.rasterize_run(&shaped.runs[0]).expect("rasterization should succeed");
+        let second = rasterizer
+            .rasterize_run(&shaped.runs[0])
+            .expect("rasterization should succeed");
 
         assert_eq!(first, second);
         assert!(entries_after_first > 0);
-        assert_eq!(glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options), entries_after_first);
+        assert_eq!(
+            glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options),
+            entries_after_first
+        );
     }
 
     fn glyph_cache_entries_for_run(run: &ShapedRun, options: RasterOptions) -> usize {
@@ -375,7 +455,11 @@ mod tests {
             .lock()
             .expect("glyph cache mutex poisoned")
             .keys()
-            .filter(|key| key.path == *path && key.pixel_height == options.pixel_height && key.hinting == options.hinting)
+            .filter(|key| {
+                key.path == *path
+                    && key.size_26_6 == options.size_26_6
+                    && key.hinting == options.hinting
+            })
             .count()
     }
 
@@ -435,7 +519,12 @@ mod tests {
         assert_eq!(blurred[0].stride, 5);
         assert_eq!(blurred[0].left, -1);
         assert_eq!(blurred[0].top, 1);
-        assert!(blurred[0].bitmap.iter().any(|value| *value > 0 && *value < 255));
+        assert!(
+            blurred[0]
+                .bitmap
+                .iter()
+                .any(|value| *value > 0 && *value < 255)
+        );
     }
 
     #[test]
