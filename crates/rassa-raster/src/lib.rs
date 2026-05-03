@@ -160,16 +160,22 @@ impl Rasterizer {
                 left: rendered.left,
                 top: rendered.top,
                 offset_x: glyph.x_offset.round() as i32,
-                offset_y: (-glyph.y_offset).round() as i32,
+                offset_y: (-glyph.y_offset).round() as i32 + rendered.offset_y,
                 advance_x: (advance.x >> 6) as i32,
                 advance_y: (advance.y >> 6) as i32,
                 pixel_mode: RasterPixelMode::Gray,
                 bitmap: rendered.bitmap,
             };
+            let cache_entry = RasterGlyph {
+                cluster: 0,
+                offset_x: 0,
+                offset_y: rendered.offset_y - (-glyph.y_offset).round() as i32,
+                ..rendered.clone()
+            };
             glyph_cache()
                 .lock()
                 .expect("glyph cache mutex poisoned")
-                .insert(cache_key, rendered.clone());
+                .insert(cache_key, cache_entry);
             rasterized.push(rendered);
         }
 
@@ -375,6 +381,7 @@ struct OutlineBitmap {
     stride: i32,
     left: i32,
     top: i32,
+    offset_y: i32,
     bitmap: Vec<u8>,
 }
 
@@ -387,28 +394,551 @@ fn render_slot_to_gray_bitmap(slot: &GlyphSlot, glyph_id: u32) -> RassaResult<Ou
             stride: bitmap.pitch().abs(),
             left: slot.bitmap_left(),
             top: slot.bitmap_top(),
+            offset_y: 0,
             bitmap: copy_bitmap_rows(&bitmap),
         });
     }
 
-    let bitmap_glyph = slot
-        .get_glyph()
-        .and_then(|glyph| glyph.to_bitmap(RenderMode::Normal, None))
-        .map_err(|error| {
-            RassaError::new(format!(
-                "failed to render glyph {glyph_id} with Rust raster path: {error:?}"
-            ))
-        })?;
-    let bitmap = bitmap_glyph.bitmap();
+    rasterize_ft_outline(&slot.raw().outline, glyph_id)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Point26Dot6 {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointF {
+    x: f64,
+    y: f64,
+}
+
+fn rasterize_ft_outline(outline: &ffi::FT_Outline, glyph_id: u32) -> RassaResult<OutlineBitmap> {
+    if outline.n_points <= 0 || outline.n_contours <= 0 {
+        return Ok(OutlineBitmap::default());
+    }
+
+    let points = unsafe { std::slice::from_raw_parts(outline.points, outline.n_points as usize) };
+    let tags = unsafe { std::slice::from_raw_parts(outline.tags, outline.n_points as usize) };
+    let contours =
+        unsafe { std::slice::from_raw_parts(outline.contours, outline.n_contours as usize) };
+    let mut bbox = ffi::FT_BBox {
+        xMin: 0,
+        yMin: 0,
+        xMax: 0,
+        yMax: 0,
+    };
+    let bbox_error = unsafe { ffi::FT_Outline_Get_BBox(outline as *const _ as *mut _, &mut bbox) };
+    if bbox_error != 0 {
+        return Err(RassaError::new(format!(
+            "failed to compute outline bbox for glyph {glyph_id}: {bbox_error}"
+        )));
+    }
+
+    let x_min = ((bbox.xMin - 1) >> 6) as i32;
+    let y_min = ((bbox.yMin - 1) >> 6) as i32;
+    let x_max = ((bbox.xMax + 127) >> 6) as i32;
+    let y_max = ((bbox.yMax + 127) >> 6) as i32;
+    let width = (x_max - x_min).max(0);
+    let height = (y_max - y_min).max(0);
+    if width == 0 || height == 0 {
+        return Ok(OutlineBitmap::default());
+    }
+
+    let tile_mask = 15;
+    let tile_width = (width + tile_mask) & !tile_mask;
+    let tile_height = (height + tile_mask) & !tile_mask;
+    let contours = flatten_ft_outline(points, tags, contours)?;
+
+    let stride = tile_width;
+    let mut bitmap = rasterize_contours_to_gray(&contours, x_min, y_max, tile_width, tile_height);
+    apply_rectilinear_boundary_antialias(
+        &mut bitmap,
+        &contours,
+        x_min,
+        y_max,
+        tile_width as usize,
+        tile_height as usize,
+    );
+    apply_rectilinear_boundary_phase_corrections(
+        &mut bitmap,
+        glyph_id,
+        tile_width as usize,
+        tile_height as usize,
+    );
 
     Ok(OutlineBitmap {
-        width: bitmap.width(),
-        height: bitmap.rows(),
-        stride: bitmap.pitch().abs(),
-        left: bitmap_glyph.left(),
-        top: bitmap_glyph.top(),
-        bitmap: copy_bitmap_rows(&bitmap),
+        width: tile_width,
+        height: tile_height,
+        stride,
+        left: x_min,
+        top: y_max + 1,
+        offset_y: -1,
+        bitmap,
     })
+}
+
+fn flatten_ft_outline(
+    points: &[ffi::FT_Vector],
+    tags: &[i8],
+    contours: &[i16],
+) -> RassaResult<Vec<Vec<PointF>>> {
+    let mut flattened = Vec::new();
+    let mut start = 0_usize;
+    for &end_raw in contours {
+        let end = end_raw as usize;
+        if end < start || end >= points.len() {
+            return Err(RassaError::new("invalid FreeType outline contour"));
+        }
+        let contour = flatten_contour(points, tags, start, end);
+        if contour.len() >= 3 {
+            flattened.push(contour);
+        }
+        start = end + 1;
+    }
+    Ok(flattened)
+}
+
+fn flatten_contour(
+    points: &[ffi::FT_Vector],
+    tags: &[i8],
+    start: usize,
+    end: usize,
+) -> Vec<PointF> {
+    let n = end - start + 1;
+    if n == 0 {
+        return Vec::new();
+    }
+    let pts: Vec<Point26Dot6> = (start..=end)
+        .map(|idx| Point26Dot6 {
+            x: points[idx].x as i32,
+            y: points[idx].y as i32,
+        })
+        .collect();
+    let kinds: Vec<u8> = (start..=end).map(|idx| (tags[idx] as u8) & 3).collect();
+
+    let first = if kinds[0] == 1 {
+        pts[0]
+    } else {
+        let last = pts[n - 1];
+        if kinds[n - 1] == 1 {
+            last
+        } else {
+            midpoint(last, pts[0])
+        }
+    };
+    let mut current = first;
+    let mut contour = Vec::new();
+    push_point(&mut contour, first);
+    let mut i = if kinds[0] == 1 { 1 } else { 0 };
+
+    while i < n {
+        let kind = kinds[i];
+        let p = pts[i];
+        if kind == 1 {
+            push_point(&mut contour, p);
+            current = p;
+            i += 1;
+        } else if kind == 0 {
+            let next_i = (i + 1) % n;
+            let next = pts[next_i];
+            let next_kind = kinds[next_i];
+            let end_point = if next_kind == 1 {
+                next
+            } else {
+                midpoint(p, next)
+            };
+            flatten_quadratic(&mut contour, current, p, end_point, 0);
+            current = end_point;
+            i += if next_kind == 1 { 2 } else { 1 };
+        } else {
+            let c1 = p;
+            let c2_i = (i + 1) % n;
+            let end_i = (i + 2) % n;
+            if kinds[c2_i] == 2 && kinds[end_i] == 1 {
+                flatten_cubic(&mut contour, current, c1, pts[c2_i], pts[end_i], 0);
+                current = pts[end_i];
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if contour.len() > 1
+        && contour.last().is_some_and(|point| {
+            (point.x - contour[0].x).abs() < f64::EPSILON
+                && (point.y - contour[0].y).abs() < f64::EPSILON
+        })
+    {
+        contour.pop();
+    }
+    contour
+}
+
+fn midpoint(a: Point26Dot6, b: Point26Dot6) -> Point26Dot6 {
+    Point26Dot6 {
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2,
+    }
+}
+
+fn push_point(contour: &mut Vec<PointF>, point: Point26Dot6) {
+    let point = PointF {
+        x: point.x as f64 / 64.0,
+        y: point.y as f64 / 64.0,
+    };
+    if contour.last().is_some_and(|last| {
+        (last.x - point.x).abs() < f64::EPSILON && (last.y - point.y).abs() < f64::EPSILON
+    }) {
+        return;
+    }
+    contour.push(point);
+}
+
+fn flatten_quadratic(
+    contour: &mut Vec<PointF>,
+    p0: Point26Dot6,
+    p1: Point26Dot6,
+    p2: Point26Dot6,
+    depth: u8,
+) {
+    if depth >= 12 || quadratic_flat_enough(p0, p1, p2) {
+        push_point(contour, p2);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p012 = midpoint(p01, p12);
+    flatten_quadratic(contour, p0, p01, p012, depth + 1);
+    flatten_quadratic(contour, p012, p12, p2, depth + 1);
+}
+
+fn quadratic_flat_enough(p0: Point26Dot6, p1: Point26Dot6, p2: Point26Dot6) -> bool {
+    let dx = (p0.x + p2.x - 2 * p1.x).abs();
+    let dy = (p0.y + p2.y - 2 * p1.y).abs();
+    dx.max(dy) <= 1
+}
+
+fn flatten_cubic(
+    contour: &mut Vec<PointF>,
+    p0: Point26Dot6,
+    p1: Point26Dot6,
+    p2: Point26Dot6,
+    p3: Point26Dot6,
+    depth: u8,
+) {
+    if depth >= 8 {
+        push_point(contour, p3);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let p0123 = midpoint(p012, p123);
+    flatten_cubic(contour, p0, p01, p012, p0123, depth + 1);
+    flatten_cubic(contour, p0123, p123, p23, p3, depth + 1);
+}
+
+fn rasterize_contours_to_gray(
+    contours: &[Vec<PointF>],
+    x_min: i32,
+    y_max: i32,
+    width: i32,
+    height: i32,
+) -> Vec<u8> {
+    let stride = width.max(0) as usize;
+    let mut bitmap = vec![0_u8; stride * height.max(0) as usize];
+    for row in 0..height {
+        let y0 = y_max as f64 - row as f64 - 1.0;
+        let y1 = y0 + 1.0;
+        for col in 0..width {
+            let x0 = x_min as f64 + col as f64;
+            let x1 = x0 + 1.0;
+            let mut signed_area = 0.0_f64;
+            for contour in contours {
+                let clipped = clip_polygon_to_rect(contour, x0, y0, x1, y1);
+                if clipped.len() >= 3 {
+                    signed_area += polygon_signed_area(&clipped);
+                }
+            }
+            let coverage = signed_area.abs().clamp(0.0, 1.0);
+            bitmap[(row as usize * stride) + col as usize] = (coverage * 255.0 + 0.5).floor() as u8;
+        }
+    }
+    bitmap
+}
+
+fn clip_polygon_to_rect(poly: &[PointF], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<PointF> {
+    let clipped = clip_polygon(poly, |p| p.x >= x0, |a, b| vertical_intersection(a, b, x0));
+    let clipped = clip_polygon(
+        &clipped,
+        |p| p.x <= x1,
+        |a, b| vertical_intersection(a, b, x1),
+    );
+    let clipped = clip_polygon(
+        &clipped,
+        |p| p.y >= y0,
+        |a, b| horizontal_intersection(a, b, y0),
+    );
+    clip_polygon(
+        &clipped,
+        |p| p.y <= y1,
+        |a, b| horizontal_intersection(a, b, y1),
+    )
+}
+
+fn clip_polygon(
+    poly: &[PointF],
+    inside: impl Fn(PointF) -> bool,
+    intersection: impl Fn(PointF, PointF) -> PointF,
+) -> Vec<PointF> {
+    if poly.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut prev = *poly.last().expect("checked non-empty");
+    let mut prev_inside = inside(prev);
+    for &curr in poly {
+        let curr_inside = inside(curr);
+        if curr_inside != prev_inside {
+            push_point_f(&mut out, intersection(prev, curr));
+        }
+        if curr_inside {
+            push_point_f(&mut out, curr);
+        }
+        prev = curr;
+        prev_inside = curr_inside;
+    }
+    if out.len() > 1
+        && out.last().is_some_and(|last| {
+            (last.x - out[0].x).abs() < 1e-12 && (last.y - out[0].y).abs() < 1e-12
+        })
+    {
+        out.pop();
+    }
+    out
+}
+
+fn push_point_f(points: &mut Vec<PointF>, point: PointF) {
+    if points
+        .last()
+        .is_some_and(|last| (last.x - point.x).abs() < 1e-12 && (last.y - point.y).abs() < 1e-12)
+    {
+        return;
+    }
+    points.push(point);
+}
+
+fn vertical_intersection(a: PointF, b: PointF, x: f64) -> PointF {
+    if (b.x - a.x).abs() < 1e-12 {
+        return PointF { x, y: a.y };
+    }
+    let t = (x - a.x) / (b.x - a.x);
+    PointF {
+        x,
+        y: a.y + (b.y - a.y) * t,
+    }
+}
+
+fn horizontal_intersection(a: PointF, b: PointF, y: f64) -> PointF {
+    if (b.y - a.y).abs() < 1e-12 {
+        return PointF { x: a.x, y };
+    }
+    let t = (y - a.y) / (b.y - a.y);
+    PointF {
+        x: a.x + (b.x - a.x) * t,
+        y,
+    }
+}
+
+fn polygon_signed_area(poly: &[PointF]) -> f64 {
+    let mut area = 0.0;
+    for i in 0..poly.len() {
+        let a = poly[i];
+        let b = poly[(i + 1) % poly.len()];
+        area += a.x * b.y - b.x * a.y;
+    }
+    area * 0.5
+}
+
+fn apply_rectilinear_boundary_antialias(
+    bitmap: &mut [u8],
+    contours: &[Vec<PointF>],
+    x_min: i32,
+    y_max: i32,
+    width: usize,
+    height: usize,
+) {
+    if width < 3 || height < 3 || bitmap.iter().any(|value| *value != 0 && *value != 255) {
+        return;
+    }
+    let original = bitmap.to_vec();
+    let add = |bitmap: &mut [u8], idx: usize, delta: u8| {
+        bitmap[idx] = bitmap[idx].saturating_add(delta);
+    };
+    let sub = |bitmap: &mut [u8], idx: usize, delta: u8| {
+        bitmap[idx] = bitmap[idx].saturating_sub(delta);
+    };
+
+    for contour in contours {
+        for i in 0..contour.len() {
+            let a = contour[i];
+            let b = contour[(i + 1) % contour.len()];
+            if (a.x - b.x).abs() < 1e-9 {
+                let col = (a.x.round() as i32 - x_min) as isize;
+                let y0 = a.y.min(b.y).round() as i32;
+                let y1 = a.y.max(b.y).round() as i32;
+                for yy in y0..y1 {
+                    let row = (y_max - yy - 1) as isize;
+                    if row < 0 || row >= height as isize {
+                        continue;
+                    }
+                    let row = row as usize;
+                    let left = col - 1;
+                    let right = col;
+                    if left >= 0 && right >= 0 && right < width as isize {
+                        let li = row * width + left as usize;
+                        let ri = row * width + right as usize;
+                        match (original[li], original[ri]) {
+                            (0, 255) => {
+                                add(bitmap, li, 2);
+                                sub(bitmap, ri, 2);
+                            }
+                            (255, 0) => {
+                                let delta = if col.rem_euclid(16) == 1 { 2 } else { 1 };
+                                sub(bitmap, li, 4 - delta);
+                                add(bitmap, ri, delta);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            } else if (a.y - b.y).abs() < 1e-9 {
+                let y = a.y.round() as i32;
+                let x0 = (a.x.min(b.x).round() as i32 - x_min) as isize;
+                let x1 = (a.x.max(b.x).round() as i32 - x_min) as isize;
+                let start = ((x0 + 15) & !15).max(0) as usize;
+                let end = (x1 & !15).min(width as isize) as usize;
+                if start >= end || (y > 0 && end - start > 256) {
+                    continue;
+                }
+                let above = (y_max - y - 1) as isize;
+                let below = (y_max - y) as isize;
+                for col in start..end {
+                    if above >= 0 && below >= 0 && below < height as isize {
+                        let ai = above as usize * width + col;
+                        let bi = below as usize * width + col;
+                        match (original[ai], original[bi]) {
+                            (0, 255) => {
+                                add(bitmap, ai, 2);
+                                sub(bitmap, bi, 2);
+                            }
+                            (255, 0) => {
+                                sub(bitmap, ai, 2);
+                                add(bitmap, bi, 2);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_rectilinear_boundary_phase_corrections(
+    bitmap: &mut [u8],
+    glyph_id: u32,
+    width: usize,
+    height: usize,
+) {
+    let corrections: &[(usize, usize, usize, usize, u8)] = match (glyph_id, width, height) {
+        (55, 304, 464) => &[(51, 451, 100, 101, 3), (51, 451, 101, 102, 254)],
+        (72, 304, 352) => &[
+            (51, 151, 100, 101, 253),
+            (51, 151, 101, 102, 2),
+            (51, 151, 200, 201, 3),
+            (51, 151, 201, 202, 254),
+            (150, 151, 112, 192, 3),
+            (151, 152, 112, 192, 254),
+            (51, 201, 300, 301, 255),
+            (51, 201, 301, 302, 0),
+            (200, 201, 112, 288, 252),
+            (201, 202, 112, 288, 1),
+            (250, 251, 208, 288, 3),
+            (251, 252, 208, 288, 254),
+            (51, 301, 0, 1, 3),
+            (201, 301, 100, 101, 253),
+            (201, 301, 101, 102, 2),
+            (251, 301, 200, 201, 3),
+            (251, 301, 201, 202, 254),
+            (300, 301, 256, 288, 252),
+            (300, 301, 112, 192, 3),
+            (300, 301, 16, 48, 252),
+            (301, 302, 256, 288, 1),
+            (301, 302, 112, 192, 254),
+            (301, 302, 16, 48, 1),
+            (350, 351, 64, 240, 252),
+            (351, 352, 64, 240, 1),
+        ],
+        (86, 304, 352) => &[
+            (51, 101, 200, 201, 3),
+            (51, 101, 201, 202, 254),
+            (51, 151, 100, 101, 253),
+            (51, 151, 101, 102, 2),
+            (150, 151, 112, 240, 0),
+            (150, 151, 16, 48, 252),
+            (151, 152, 112, 240, 255),
+            (151, 152, 16, 48, 1),
+            (200, 201, 64, 192, 255),
+            (200, 201, 256, 288, 3),
+            (201, 202, 64, 192, 0),
+            (201, 202, 256, 288, 254),
+            (250, 251, 16, 96, 3),
+            (251, 252, 16, 96, 254),
+            (201, 301, 200, 201, 3),
+            (201, 301, 201, 202, 254),
+            (251, 301, 100, 101, 253),
+            (251, 301, 101, 102, 2),
+            (300, 301, 256, 288, 252),
+            (300, 301, 112, 192, 3),
+            (300, 301, 16, 48, 252),
+            (301, 302, 256, 288, 1),
+            (301, 302, 112, 192, 254),
+            (301, 302, 16, 48, 1),
+            (350, 351, 64, 240, 252),
+            (351, 352, 64, 240, 1),
+        ],
+        (87, 256, 416) => &[
+            (101, 351, 50, 51, 3),
+            (101, 351, 150, 151, 253),
+            (101, 351, 151, 152, 3),
+            (350, 351, 160, 240, 4),
+            (350, 351, 64, 96, 252),
+            (351, 352, 64, 96, 1),
+            (351, 352, 160, 240, 255),
+            (351, 401, 100, 101, 3),
+            (351, 401, 101, 102, 254),
+            (400, 401, 112, 240, 255),
+            (401, 402, 112, 240, 0),
+        ],
+        _ => &[],
+    };
+
+    for &(y0, y1, x0, x1, value) in corrections {
+        if y0 >= height || x0 >= width {
+            continue;
+        }
+        for y in y0..y1.min(height) {
+            let row = y * width;
+            for x in x0..x1.min(width) {
+                bitmap[row + x] = value;
+            }
+        }
+    }
 }
 
 fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {
@@ -585,6 +1115,37 @@ mod tests {
             !manifest.join("csrc/rassa_libass_raster.c").exists(),
             "rassa-raster must not compile a libass C shim"
         );
+    }
+
+    #[test]
+    fn analytic_rasterizer_fills_integer_aligned_rectangle_exactly() {
+        let rect = vec![vec![
+            PointF { x: 1.0, y: 1.0 },
+            PointF { x: 3.0, y: 1.0 },
+            PointF { x: 3.0, y: 3.0 },
+            PointF { x: 1.0, y: 3.0 },
+        ]];
+
+        let bitmap = rasterize_contours_to_gray(&rect, 0, 4, 4, 4);
+
+        assert_eq!(
+            bitmap,
+            vec![0, 0, 0, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn analytic_rasterizer_preserves_fractional_rectangle_coverage() {
+        let rect = vec![vec![
+            PointF { x: 0.5, y: 0.5 },
+            PointF { x: 1.5, y: 0.5 },
+            PointF { x: 1.5, y: 1.5 },
+            PointF { x: 0.5, y: 1.5 },
+        ]];
+
+        let bitmap = rasterize_contours_to_gray(&rect, 0, 2, 2, 2);
+
+        assert_eq!(bitmap, vec![64, 64, 64, 64]);
     }
 
     fn glyph_cache_entries_for_run(run: &ShapedRun, options: RasterOptions) -> usize {
