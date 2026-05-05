@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "rassa"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rassa-capi",
  "rassa-core",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-capi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "rassa-core",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-check"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "rassa-core",
@@ -684,11 +684,11 @@ dependencies = [
 
 [[package]]
 name = "rassa-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "rassa-fonts"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fontdb",
  "ttf-parser 0.25.1",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-layout"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rassa-core",
  "rassa-fonts",
@@ -709,14 +709,14 @@ dependencies = [
 
 [[package]]
 name = "rassa-libass-capi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rassa-capi",
 ]
 
 [[package]]
 name = "rassa-parse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "iconv-native",
  "rassa-core",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-raster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-render"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rassa-core",
  "rassa-fonts",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-shape"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "harfrust",
  "rassa-core",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-test"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "png 0.17.16",
  "rassa",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-unibreak"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rassa-core",
  "unicode-linebreak",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "rassa-unicode"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rassa-core",
  "rassa-unibreak",

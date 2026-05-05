@@ -11,9 +11,9 @@ keywords.workspace = true
 
 [dependencies]
 harfrust = "0.6.0"
-rassa-core = { path = "../rassa-core", version = "0.2.0" }
-rassa-fonts = { path = "../rassa-fonts", version = "0.2.0" }
-rassa-unicode = { path = "../rassa-unicode", version = "0.2.0" }
+rassa-core = { path = "../rassa-core", version = "0.3.0" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.3.0" }
+rassa-unicode = { path = "../rassa-unicode", version = "0.3.0" }
 
 [lib]
 path = "src/lib.rs"
