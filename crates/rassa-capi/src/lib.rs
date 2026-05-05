@@ -12,6 +12,7 @@ use std::{
     fs, mem, ptr, slice,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use libc::{free, malloc};
 use rassa_core::{Margins, RendererConfig, Size, ass};
 use rassa_fonts::{
@@ -594,7 +595,7 @@ pub unsafe extern "C" fn ass_get_available_font_providers(
         ass::DefaultFontProvider::Fontconfig as c_int,
     ];
     let allocation_size = mem::size_of_val(&values);
-    let allocation = malloc(allocation_size) as *mut c_int;
+    let allocation = ass_malloc(allocation_size) as *mut c_int;
     if allocation.is_null() {
         *providers = ptr::null_mut();
         *size = usize::MAX;
@@ -1358,13 +1359,34 @@ pub unsafe extern "C" fn ass_step_sub(track: *mut ASS_Track, now: i64, movement:
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_malloc(size: usize) -> *mut c_void {
-    malloc(size)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        malloc(size)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut bytes = Vec::<u8>::with_capacity(size);
+        let ptr = bytes.as_mut_ptr();
+        std::mem::forget(bytes);
+        ptr.cast()
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_free(ptr: *mut c_void) {
-    if !ptr.is_null() {
+    if ptr.is_null() {
+        return;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         free(ptr);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ptr;
     }
 }
 

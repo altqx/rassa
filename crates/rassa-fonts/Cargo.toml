@@ -10,8 +10,8 @@ readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
-fontconfig = { package = "fontconfig-rs", version = "0.1.1" }
-freetype-rs = "0.38.0"
+ttf-parser = "0.25.1"
+fontdb = "0.23.0"
 
 [lib]
 path = "src/lib.rs"

@@ -3,10 +3,10 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::Mutex,
 };
 
-use freetype::Library;
+#[cfg(not(target_arch = "wasm32"))]
+use fontdb::{Database, Family, Query, Source, Stretch, Style as FontdbStyle, Weight};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FontAttachment {
@@ -99,70 +99,58 @@ impl FontProvider for NullFontProvider {
     }
 }
 
-pub struct FontconfigProvider {
-    config: Mutex<fontconfig::FontConfig>,
+pub struct CrossfontProvider {
     fallback_family: Option<String>,
 }
 
-impl Default for FontconfigProvider {
+pub type FontconfigProvider = CrossfontProvider;
+
+impl Default for CrossfontProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FontconfigProvider {
+impl CrossfontProvider {
     pub fn new() -> Self {
         Self {
-            config: Mutex::new(fontconfig::FontConfig::default()),
             fallback_family: None,
         }
     }
 
     pub fn with_fallback_family(fallback_family: impl Into<String>) -> Self {
         Self {
-            config: Mutex::new(fontconfig::FontConfig::default()),
             fallback_family: Some(fallback_family.into()),
         }
     }
 
-    fn find_font(&self, family: String, style: Option<String>) -> Option<fontconfig::Font> {
-        let mut config = self.config.lock().expect("fontconfig mutex poisoned");
-        let mut pattern = fontconfig::OwnedPattern::new();
-        pattern.add(&fontconfig::properties::FC_FAMILY, family.clone());
-        if let Some(style) = style.clone() {
-            pattern.add(&fontconfig::properties::FC_STYLE, style);
-        }
-        pattern.default_substitute();
-        config.substitute(&mut pattern, fontconfig::MatchKind::Pattern);
-        let font_match = pattern.font_match(&mut config);
-        font_match.name().and_then(|name| {
-            font_match.filename().map(|filename| fontconfig::Font {
-                name: name.to_owned(),
-                path: PathBuf::from(filename),
-            })
+    #[cfg(not(target_arch = "wasm32"))]
+    fn find_font(&self, family: String, style: Option<String>) -> Option<FontMatch> {
+        resolve_system_font(&family, style.as_deref()).map(|(resolved_family, resolved_path)| {
+            FontMatch {
+                family: resolved_family,
+                path: resolved_path,
+                style,
+                provider: FontProviderKind::Fontconfig,
+            }
         })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn find_font(&self, _family: String, _style: Option<String>) -> Option<FontMatch> {
+        None
     }
 }
 
-impl FontProvider for FontconfigProvider {
+impl FontProvider for CrossfontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
         if let Some(font) = self.find_font(query.family.clone(), query.style.clone()) {
-            return FontMatch {
-                family: font.name,
-                path: Some(font.path),
-                style: query.style.clone(),
-                provider: FontProviderKind::Fontconfig,
-            };
+            return font;
         }
 
         if let Some(fallback_family) = &self.fallback_family {
             if let Some(font) = self.find_font(fallback_family.clone(), query.style.clone()) {
-                return FontMatch {
-                    family: font.name,
-                    path: Some(font.path),
-                    style: query.style.clone(),
-                    provider: FontProviderKind::Fontconfig,
-                };
+                return font;
             }
         }
 
@@ -172,6 +160,83 @@ impl FontProvider for FontconfigProvider {
             FontProviderKind::Fontconfig,
         )
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Option<PathBuf>)> {
+    let mut database = Database::new();
+    database.load_system_fonts();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(path) = fontconfig_match_path(family) {
+        let resolved_family = load_face_metadata(&path)
+            .map(|(family, _)| family)
+            .unwrap_or_else(|| family.to_owned());
+        return Some((resolved_family, Some(path)));
+    }
+
+    let requested_style = style.map(normalize_font_key);
+    let fontdb_style = requested_style
+        .as_deref()
+        .map(|style| {
+            if style.contains("italic") || style.contains("oblique") {
+                FontdbStyle::Italic
+            } else {
+                FontdbStyle::Normal
+            }
+        })
+        .unwrap_or(FontdbStyle::Normal);
+
+    let normalized_family = normalize_font_key(family);
+    let family_query = match normalized_family.as_str() {
+        "sans" | "sansserif" => Family::SansSerif,
+        "serif" => Family::Serif,
+        "mono" | "monospace" => Family::Monospace,
+        "cursive" => Family::Cursive,
+        "fantasy" => Family::Fantasy,
+        _ => Family::Name(family),
+    };
+
+    let query = Query {
+        families: &[family_query],
+        weight: Weight::NORMAL,
+        stretch: Stretch::Normal,
+        style: fontdb_style,
+    };
+    let id = database.query(&query).or_else(|| {
+        let fallback = Query {
+            families: &[family_query],
+            weight: Weight::NORMAL,
+            stretch: Stretch::Normal,
+            style: FontdbStyle::Normal,
+        };
+        database.query(&fallback)
+    })?;
+    let face = database.face(id)?;
+    let resolved_family = face
+        .families
+        .first()
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| family.to_owned());
+    let path = match &face.source {
+        Source::File(path) => Some(path.clone()),
+        Source::SharedFile(path, _) => Some(path.clone()),
+        _ => None,
+    };
+    Some((resolved_family, path))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fontconfig_match_path(family: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", family])
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?);
+    path.exists().then_some(path)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -201,12 +266,9 @@ impl AttachedFontProvider {
             .map(|path| path.as_ref().to_path_buf())
             .unwrap_or_else(|| std::env::temp_dir().join("rassa-attached-fonts"));
         let _ = fs::create_dir_all(&root);
-        let library = Library::init().ok();
         let fonts = attachments
             .iter()
-            .filter_map(|attachment| {
-                AttachedFontRecord::from_attachment(attachment, &root, library.as_ref())
-            })
+            .filter_map(|attachment| AttachedFontRecord::from_attachment(attachment, &root))
             .collect();
 
         Self { fonts }
@@ -306,11 +368,7 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
 }
 
 impl AttachedFontRecord {
-    fn from_attachment(
-        attachment: &FontAttachment,
-        root: &Path,
-        library: Option<&Library>,
-    ) -> Option<Self> {
+    fn from_attachment(attachment: &FontAttachment, root: &Path) -> Option<Self> {
         if attachment.data.is_empty() {
             return None;
         }
@@ -320,7 +378,7 @@ impl AttachedFontRecord {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| attachment.name.clone());
         let (family, style) =
-            load_face_metadata(library, &path).unwrap_or_else(|| (fallback_name.clone(), None));
+            load_face_metadata(&path).unwrap_or_else(|| (fallback_name.clone(), None));
         let mut aliases = vec![normalize_font_key(&family)];
         if let Some(stem) = attachment_file_stem(attachment) {
             aliases.push(normalize_font_key(&stem));
@@ -353,12 +411,22 @@ fn materialize_attachment(root: &Path, attachment: &FontAttachment) -> Option<Pa
     Some(path)
 }
 
-fn load_face_metadata(library: Option<&Library>, path: &Path) -> Option<(String, Option<String>)> {
-    let library = library?;
-    let face = library.new_face(path, 0).ok()?;
-    let family = face.family_name()?;
-    let style = face.style_name();
+fn load_face_metadata(path: &Path) -> Option<(String, Option<String>)> {
+    let data = fs::read(path).ok()?;
+    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+    let family = font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+        .or_else(|| font_name(&face, ttf_parser::name_id::FAMILY))?;
+    let style = font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
+        .or_else(|| font_name(&face, ttf_parser::name_id::SUBFAMILY));
     Some((family, style))
+}
+
+fn font_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
+    face.names()
+        .into_iter()
+        .find(|name| name.name_id == name_id && name.is_unicode())
+        .and_then(|name| name.to_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn attachment_file_stem(attachment: &FontAttachment) -> Option<String> {
