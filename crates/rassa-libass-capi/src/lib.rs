@@ -1,4 +1,1 @@
-#[path = "../../rassa-capi/src/lib.rs"]
-mod capi;
-
-pub use capi::*;
+pub use rassa_capi::*;

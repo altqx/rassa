@@ -11,11 +11,7 @@ keywords.workspace = true
 build = "build.rs"
 
 [dependencies]
-libc.workspace = true
-rassa-core = { path = "../rassa-core", version = "0.1.0" }
-rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
-rassa-parse = { path = "../rassa-parse", version = "0.1.0" }
-rassa-render = { path = "../rassa-render", version = "0.1.0" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.0" }
 
 [lib]
 name = "ass"

@@ -383,11 +383,7 @@ dependencies = [
 name = "rassa-libass-capi"
 version = "0.1.0"
 dependencies = [
- "libc",
- "rassa-core",
- "rassa-fonts",
- "rassa-parse",
- "rassa-render",
+ "rassa-capi",
 ]
 
 [[package]]
