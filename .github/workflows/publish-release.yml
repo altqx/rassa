@@ -1,0 +1,200 @@
+name: Publish and Release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - Cargo.toml
+      - crates/**/Cargo.toml
+      - .github/workflows/publish-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  detect-version:
+    name: detect version change
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Detect workspace version
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=$(awk '
+            $0 == "[workspace.package]" { in_pkg = 1; next }
+            /^\[/ { in_pkg = 0 }
+            in_pkg && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+
+          if [ -z "$version" ]; then
+            echo "Could not determine workspace.package.version" >&2
+            exit 1
+          fi
+
+          changed=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            changed=true
+          elif git rev-parse "${{ github.event.before }}" >/dev/null 2>&1; then
+            old_version=$(git show "${{ github.event.before }}:Cargo.toml" | awk '
+              $0 == "[workspace.package]" { in_pkg = 1; next }
+              /^\[/ { in_pkg = 0 }
+              in_pkg && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ' || true)
+            if [ "$old_version" != "$version" ]; then
+              changed=true
+            fi
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists; skipping publish."
+            changed=false
+          fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version changed=$changed"
+
+  publish:
+    name: publish crates.io packages
+    needs: detect-version
+    if: needs.detect-version.outputs.changed == 'true' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libfribidi-dev \
+            libunibreak-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy rustfmt
+          rustup default stable
+
+      - name: Verify before publish
+        run: |
+          cargo fmt --all -- --check
+          cargo test -q
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release -p rassa -p rassa-libass-capi -p rassa-check
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "Missing CRATES_IO_TOKEN secret" >&2
+            exit 1
+          fi
+
+          crates=(
+            rassa-core
+            rassa-unibreak-sys
+            rassa-fonts
+            rassa-parse
+            rassa-unibreak
+            rassa-unicode
+            rassa-shape
+            rassa-raster
+            rassa-layout
+            rassa-render
+            rassa-capi
+            rassa
+            rassa-libass-capi
+            rassa-check
+          )
+
+          for crate in "${crates[@]}"; do
+            if curl -fsS "https://crates.io/api/v1/crates/$crate/${{ needs.detect-version.outputs.version }}" >/dev/null 2>&1; then
+              echo "$crate ${{ needs.detect-version.outputs.version }} is already on crates.io; skipping."
+              continue
+            fi
+
+            for attempt in 1 2 3 4 5; do
+              if cargo publish -p "$crate"; then
+                break
+              fi
+              if [ "$attempt" = 5 ]; then
+                exit 1
+              fi
+              echo "Publish failed for $crate; waiting for crates.io index before retry $((attempt + 1))/5."
+              sleep 60
+            done
+
+            sleep 60
+          done
+
+  github-release:
+    name: create GitHub release
+    needs: [detect-version, publish]
+    if: needs.detect-version.outputs.changed == 'true' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect-version.outputs.tag }}
+          VERSION: ${{ needs.detect-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "rassa $VERSION" \
+              --notes "Published rassa workspace crates version $VERSION to crates.io."
+          fi

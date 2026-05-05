@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test, lint, and package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libfribidi-dev \
+            libunibreak-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy rustfmt
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test -q
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build shared libraries
+        run: cargo build --release -p rassa -p rassa-libass-capi -p rassa-check
+
+      - name: Verify shared-library outputs
+        run: |
+          test -f target/release/librassa.so
+          test -f target/release/libass.so
+          file target/release/librassa.so target/release/libass.so
+          nm -D --defined-only target/release/librassa.so \
+            | grep -E ' ass_library_init$| ass_library_version$| ass_render_frame$'
+
+      - name: Check package file lists
+        run: |
+          set -euo pipefail
+          crates=(
+            rassa-core
+            rassa-unibreak-sys
+            rassa-fonts
+            rassa-parse
+            rassa-unibreak
+            rassa-unicode
+            rassa-shape
+            rassa-raster
+            rassa-layout
+            rassa-render
+            rassa-capi
+            rassa
+            rassa-libass-capi
+            rassa-check
+          )
+          for crate in "${crates[@]}"; do
+            cargo package -p "$crate" --list >/dev/null
+          done
+
+  broad-corpus:
+    name: strict broad corpus
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libfribidi-dev \
+            libunibreak-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run strict broad corpus pixel diff
+        run: |
+          RASSA_STRICT_BROAD_PIXEL_DIFF=1 \
+            cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report \
+            -- --ignored --nocapture
