@@ -943,6 +943,17 @@ fn apply_override_block(
             if !family.is_empty() {
                 current_style.font_name = family.to_string();
             }
+        } else if let Some(rest) = tag.strip_prefix("kt") {
+            flush_span(
+                buffer,
+                &previous,
+                *pending_karaoke,
+                *drawing_scale,
+                &previous_transforms,
+                active_line,
+            );
+            *karaoke_cursor_ms = parse_karaoke_duration(rest).unwrap_or(0);
+            *pending_karaoke = None;
         } else if let Some((rest, mode)) = tag
             .strip_prefix("kf")
             .map(|rest| (rest, ParsedKaraokeMode::Sweep))
@@ -976,9 +987,12 @@ fn apply_override_block(
                 *karaoke_cursor_ms += duration_ms;
             }
         } else if let Some(rest) = tag.strip_prefix("fscx") {
-            current_style.scale_x = parse_scale(rest, current_style.scale_x);
+            current_style.scale_x = parse_scale(rest, base_style.scale_x);
         } else if let Some(rest) = tag.strip_prefix("fscy") {
-            current_style.scale_y = parse_scale(rest, current_style.scale_y);
+            current_style.scale_y = parse_scale(rest, base_style.scale_y);
+        } else if tag == "fsc" {
+            current_style.scale_x = base_style.scale_x;
+            current_style.scale_y = base_style.scale_y;
         } else if let Some(rest) = tag.strip_prefix("fsp") {
             current_style.spacing = parse_f64(rest, current_style.spacing);
         } else if let Some(rest) = tag.strip_prefix("frx") {
@@ -992,7 +1006,8 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix("fay") {
             current_style.shear_y = parse_f64(rest, current_style.shear_y);
         } else if let Some(rest) = tag.strip_prefix("fs") {
-            current_style.font_size = parse_f64(rest, current_style.font_size);
+            current_style.font_size =
+                parse_font_size_override(rest, current_style.font_size, base_style.font_size);
         } else if let Some(rest) = tag.strip_prefix("iclip") {
             if let Some(rect) = parse_rect_clip(rest) {
                 parsed.clip_rect = Some(rect);
@@ -1312,6 +1327,22 @@ fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> Pars
         blur: ((target.blur - base.blur).abs() > f64::EPSILON).then_some(target.blur),
         be: ((target.be - base.be).abs() > f64::EPSILON).then_some(target.be),
     }
+}
+
+fn parse_font_size_override(value: &str, current: f64, base: f64) -> f64 {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return base;
+    }
+
+    let parsed = trimmed.parse::<f64>().unwrap_or(0.0);
+    let resolved = if trimmed.starts_with(['+', '-']) {
+        current * (1.0 + parsed / 10.0)
+    } else {
+        parsed
+    };
+
+    if resolved > 0.0 { resolved } else { base }
 }
 
 fn parse_karaoke_duration(value: &str) -> Option<i32> {
@@ -2056,6 +2087,54 @@ mod tests {
                 mode: ParsedKaraokeMode::OutlineToggle,
             })
         );
+    }
+
+    #[test]
+    fn parses_kt_karaoke_timing_reset() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\k10}A{\\kt50\\k10}B", &base_style, &[]);
+
+        assert_eq!(parsed.lines.len(), 1);
+        assert_eq!(parsed.lines[0].spans.len(), 2);
+        assert_eq!(
+            parsed.lines[0].spans[0].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 0,
+                duration_ms: 100,
+                mode: ParsedKaraokeMode::FillSwap,
+            })
+        );
+        assert_eq!(
+            parsed.lines[0].spans[1].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 500,
+                duration_ms: 100,
+                mode: ParsedKaraokeMode::FillSwap,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_font_size_relative_and_scale_reset_overrides() {
+        let base_style = ParsedStyle {
+            font_size: 20.0,
+            scale_x: 1.2,
+            scale_y: 0.8,
+            ..ParsedStyle::default()
+        };
+        let parsed = parse_dialogue_text(
+            "{\\fs+5}Bigger{\\fs-2}Smaller{\\fs0}Reset{\\fscx150\\fscy50}Scaled{\\fsc}Base",
+            &base_style,
+            &[],
+        );
+
+        assert_eq!(parsed.lines[0].spans[0].style.font_size, 30.0);
+        assert_eq!(parsed.lines[0].spans[1].style.font_size, 24.0);
+        assert_eq!(parsed.lines[0].spans[2].style.font_size, 20.0);
+        assert_eq!(parsed.lines[0].spans[3].style.scale_x, 1.5);
+        assert_eq!(parsed.lines[0].spans[3].style.scale_y, 0.5);
+        assert_eq!(parsed.lines[0].spans[4].style.scale_x, 1.2);
+        assert_eq!(parsed.lines[0].spans[4].style.scale_y, 0.8);
     }
 
     #[test]

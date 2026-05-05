@@ -499,12 +499,124 @@ mod tests {
                         }
                     }
                 }
-                for sum in sums {
-                    frame.push(((u64::from(sum) * mul + offs) >> 20) as u16);
+                let mut values = [0_u16; 4];
+                for (channel, sum) in sums.into_iter().enumerate() {
+                    values[channel] = ((u64::from(sum) * mul + offs) >> 20) as u16;
                 }
+                if values[3] == u16::MAX {
+                    values[0] = 0;
+                    values[1] = 0;
+                    values[2] = 0;
+                }
+                frame.extend_from_slice(&values);
             }
         }
         frame
+    }
+
+    fn write_compare_debug_png(
+        path: &std::path::Path,
+        buffer: &[u16],
+        width: usize,
+        height: usize,
+    ) {
+        let file = fs::File::create(path).expect("debug PNG should be creatable");
+        let mut encoder = png::Encoder::new(file, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        let mut writer = encoder.write_header().expect("debug PNG header");
+        let mut rgba = Vec::with_capacity(width * height * 8);
+        for px in buffer.chunks_exact(4) {
+            let inv_alpha = px[3];
+            let alpha = 65535_u16.saturating_sub(inv_alpha);
+            let unpremul = |channel: u16| -> u16 {
+                if alpha == 0 {
+                    0
+                } else {
+                    ((u32::from(channel) * 65535 + u32::from(alpha) / 2) / u32::from(alpha))
+                        .min(65535) as u16
+                }
+            };
+            for value in [unpremul(px[0]), unpremul(px[1]), unpremul(px[2]), alpha] {
+                rgba.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        writer.write_image_data(&rgba).expect("debug PNG data");
+    }
+
+    fn compare_dump_name(script: &str) -> String {
+        script
+            .lines()
+            .find_map(|line| line.strip_prefix("Dialogue:"))
+            .and_then(|line| line.rsplit_once(',').map(|(_, text)| text))
+            .or_else(|| {
+                script
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Title:"))
+                    .map(str::trim)
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or("compare")
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>()
+    }
+
+    fn maybe_dump_compare_debug(
+        script: &str,
+        now_ms: i64,
+        width: usize,
+        height: usize,
+        actual: &[u16],
+        target: &[u16],
+    ) {
+        let Ok(dir) = env::var("RASSA_DUMP_COMPARE") else {
+            return;
+        };
+        let name = compare_dump_name(script);
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).expect("debug dump directory should be creatable");
+        write_compare_debug_png(
+            &dir.join(format!("{name}-{now_ms:04}-actual.png")),
+            actual,
+            width,
+            height,
+        );
+        write_compare_debug_png(
+            &dir.join(format!("{name}-{now_ms:04}-target.png")),
+            target,
+            width,
+            height,
+        );
+    }
+
+    fn maybe_dump_compare_planes(script: &str, now_ms: i64, planes: &[rassa_core::ImagePlane]) {
+        let Ok(dir) = env::var("RASSA_DUMP_COMPARE_PLANES") else {
+            return;
+        };
+        let name = compare_dump_name(script);
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).expect("plane dump directory should be creatable");
+        for (idx, plane) in planes.iter().enumerate() {
+            let path = dir.join(format!(
+                "{name}-{now_ms:04}-{idx:02}-{:?}-x{}-y{}-w{}-h{}-s{}.pgm",
+                plane.kind,
+                plane.destination.x,
+                plane.destination.y,
+                plane.size.width,
+                plane.size.height,
+                plane.stride,
+            ));
+            let mut data =
+                format!("P5\n{} {}\n255\n", plane.size.width, plane.size.height).into_bytes();
+            let stride = plane.stride as usize;
+            let width = plane.size.width as usize;
+            let height = plane.size.height as usize;
+            for y in 0..height {
+                data.extend_from_slice(&plane.bitmap[y * stride..y * stride + width]);
+            }
+            fs::write(path, data).expect("plane dump should be written");
+        }
     }
 
     fn assert_pixel_perfect_compare_fixture(script: &str, now_ms: i64, reference_png: &[u8]) {
@@ -524,6 +636,7 @@ mod tests {
             ..RendererConfig::default()
         };
         let planes = render_track_planes_with_config(&track, &provider, now_ms, &config);
+        maybe_dump_compare_planes(script, now_ms, &planes);
         let actual = downsample_compare_frame(
             &blend_planes_to_compare_frame(width * COMPARE_SCALE, height * COMPARE_SCALE, &planes),
             width,
@@ -554,6 +667,25 @@ mod tests {
             if t[3] != 65535 {
                 target_non_transparent += 1;
                 target_alpha_sum += u64::from(65535 - t[3]);
+            }
+        }
+        if different_pixels > 0 {
+            maybe_dump_compare_debug(script, now_ms, width, height, &actual, &target);
+            if env::var_os("RASSA_DEBUG_COMPARE_PIXELS").is_some() {
+                for y in 60..height.min(125) {
+                    let mut row = Vec::new();
+                    for x in 115..width.min(205) {
+                        let idx = (y * width + x) * 4;
+                        let a = &actual[idx..idx + 4];
+                        let t = &target[idx..idx + 4];
+                        if a != t {
+                            row.push((x, [a[0], a[1], a[2], a[3]], [t[0], t[1], t[2], t[3]]));
+                        }
+                    }
+                    if !row.is_empty() {
+                        eprintln!("u16diff row {y}: {row:?}");
+                    }
+                }
             }
         }
         let actual_bbox = compare_bbox(&actual, width);
@@ -687,6 +819,86 @@ mod tests {
             153000,
             include_bytes!("../fixtures/libass/compare/test/sub2-153000.png"),
         );
+    }
+
+    #[test]
+    #[ignore = "broad upstream-generated pixel corpus; run explicitly for renderer parity work"]
+    fn upstream_generated_broad_corpus_pixel_diff_report() {
+        let corpus_dir = workspace_root().join("crates/rassa-test/fixtures/libass/compare/broad");
+        let mut cases = Vec::new();
+        for entry in fs::read_dir(&corpus_dir).expect("broad compare corpus directory should exist")
+        {
+            let path = entry.expect("corpus entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ass") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let script = fs::read_to_string(&path).expect("corpus ASS should be readable");
+            for png_entry in fs::read_dir(&corpus_dir).expect("broad compare corpus directory") {
+                let png_path = png_entry.expect("png corpus entry").path();
+                if png_path.extension().and_then(|ext| ext.to_str()) != Some("png") {
+                    continue;
+                }
+                let Some(file_stem) = png_path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let Some(time_part) = file_stem.strip_prefix(&format!("{stem}-")) else {
+                    continue;
+                };
+                let Ok(now_ms) = time_part.parse::<i64>() else {
+                    continue;
+                };
+                let reference_png = fs::read(&png_path).expect("reference PNG should be readable");
+                cases.push((stem.clone(), now_ms, script.clone(), reference_png));
+            }
+        }
+        cases.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert!(
+            cases.len() >= 12,
+            "broad corpus should contain at least 12 generated upstream frames; found {}",
+            cases.len()
+        );
+        if let Ok(filter) = env::var("RASSA_BROAD_FILTER") {
+            cases.retain(|(name, _, _, _)| name.contains(&filter));
+            assert!(
+                !cases.is_empty(),
+                "broad corpus filter {filter:?} should match at least one case"
+            );
+        }
+        let strict = env::var_os("RASSA_STRICT_BROAD_PIXEL_DIFF").is_some();
+        let mut failures = Vec::new();
+        for (name, now_ms, script, reference_png) in cases {
+            let result = std::panic::catch_unwind(|| {
+                assert_pixel_perfect_compare_fixture(&script, now_ms, &reference_png);
+            });
+            match result {
+                Ok(()) => eprintln!("broad corpus pixel-perfect: {name} @ {now_ms} ms"),
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic");
+                    eprintln!("broad corpus mismatch: {name} @ {now_ms} ms: {message}");
+                    failures.push((name, now_ms));
+                }
+            }
+        }
+        if strict {
+            assert!(
+                failures.is_empty(),
+                "strict broad corpus pixel diff failed for {failures:?}"
+            );
+        } else {
+            eprintln!(
+                "broad corpus report completed: {} mismatching frame(s); set RASSA_STRICT_BROAD_PIXEL_DIFF=1 to make mismatches fail the test",
+                failures.len()
+            );
+        }
     }
 
     #[test]

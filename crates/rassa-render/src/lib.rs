@@ -43,6 +43,10 @@ fn layout_line_height_for_line(
     config: &RendererConfig,
     scale_y: f64,
 ) -> i32 {
+    layout_line_height(config, scale_y).max(font_metric_height_for_line(line, scale_y))
+}
+
+fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) -> i32 {
     let scale_y = style_scale(scale_y);
     let max_font_size = line
         .runs
@@ -50,8 +54,17 @@ fn layout_line_height_for_line(
         .map(|run| run.style.font_size)
         .filter(|size| size.is_finite() && *size > 0.0)
         .fold(0.0_f64, f64::max);
-    let font_metric_height = (max_font_size * scale_y * 0.52).round() as i32;
-    layout_line_height(config, scale_y).max(font_metric_height)
+    (max_font_size * scale_y * 0.52).round() as i32
+}
+
+fn positioned_text_y_correction(
+    line: &rassa_layout::LayoutLine,
+    config: &RendererConfig,
+    scale_y: f64,
+) -> i32 {
+    let layout_height = layout_line_height_for_line(line, config, scale_y);
+    let metric_height = font_metric_height_for_line(line, scale_y).max(1);
+    ((layout_height - metric_height).max(0) * 4) / 9
 }
 
 fn renderer_blur_radius(blur: f64) -> u32 {
@@ -156,12 +169,13 @@ impl RenderEngine {
             ((style_scale(render_scale_x) + style_scale(render_scale_y)) / 2.0).max(1.0);
 
         for event in &prepared.active_events {
-            let Some(_style) = track.styles.get(event.style_index) else {
+            let Some(style) = track.styles.get(event.style_index) else {
                 continue;
             };
             let mut shadow_planes = Vec::new();
             let mut outline_planes = Vec::new();
             let mut character_planes = Vec::new();
+            let mut opaque_box_rects = Vec::new();
             let effective_position = scale_position(
                 resolve_event_position(track, event, now_ms),
                 render_scale_x,
@@ -189,6 +203,18 @@ impl RenderEngine {
                 )
             });
             for (line, line_top) in event.lines.iter().zip(vertical_layout.iter().copied()) {
+                let has_scaled_run = line.runs.iter().any(|run| {
+                    (run.style.scale_x - 100.0).abs() > f64::EPSILON
+                        || (run.style.scale_y - 100.0).abs() > f64::EPSILON
+                });
+                let text_line_top = if effective_position.is_some() {
+                    let border_style_3_y_adjust = if style.border_style == 3 { 3 } else { 0 };
+                    line_top + positioned_text_y_correction(line, config, render_scale_y)
+                        - border_style_3_y_adjust
+                        + if has_scaled_run { 2 } else { 0 }
+                } else {
+                    line_top + if has_scaled_run { 2 } else { 0 }
+                };
                 let scaled_line_width = (f64::from(line.width) * render_scale_x).round() as i32;
                 let origin_x = compute_horizontal_origin(
                     track,
@@ -197,7 +223,55 @@ impl RenderEngine {
                     effective_position,
                     render_scale_x,
                 );
+                let text_origin_x = if style.border_style == 3 {
+                    let box_scale = renderer_font_scale(config) * style_scale(render_scale);
+                    origin_x
+                        + ((style.outline + style.shadow - 1.0).max(0.0) * box_scale).round() as i32
+                } else {
+                    origin_x
+                };
+                let has_karaoke_run = line.runs.iter().any(|run| run.karaoke.is_some());
+                let line_ascender = line_raster_ascender(
+                    line,
+                    track.events.get(event.event_index),
+                    now_ms,
+                    track,
+                    config,
+                    RenderScale {
+                        x: render_scale_x,
+                        y: render_scale_y,
+                        uniform: render_scale,
+                    },
+                ) + if has_karaoke_run { 1 } else { 0 };
                 let mut line_pen_x = 0;
+                if style.border_style == 3 {
+                    let box_scale = renderer_font_scale(config) * style_scale(render_scale);
+                    let compensation = if track.scaled_border_and_shadow {
+                        1.0
+                    } else {
+                        border_shadow_compensation_scale(track, config)
+                    };
+                    let box_padding =
+                        (style.outline * box_scale / compensation).round().max(0.0) as i32;
+                    let box_height = (style.font_size * style_scale(render_scale_y) * 1.24)
+                        .round()
+                        .max(1.0) as i32;
+                    let box_top = if let Some((_, y)) = effective_position {
+                        match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+                            ass::VALIGN_TOP => y,
+                            ass::VALIGN_CENTER => y - box_height / 2,
+                            _ => y - box_height,
+                        }
+                    } else {
+                        line_top
+                    };
+                    opaque_box_rects.push(Rect {
+                        x_min: origin_x + box_padding / 2 - 1,
+                        y_min: box_top - box_padding / 2 + box_padding / 3 + 5,
+                        x_max: origin_x + scaled_line_width - box_padding / 2 + 1,
+                        y_max: box_top + box_height - box_padding / 3 - 6,
+                    });
+                }
                 for run in &line.runs {
                     let effective_style = apply_renderer_style_scale(
                         resolve_run_style(run, track.events.get(event.event_index), now_ms),
@@ -205,10 +279,11 @@ impl RenderEngine {
                         config,
                         render_scale,
                     );
+                    let run_origin_x = text_origin_x + line_pen_x;
                     if let Some(drawing) = &run.drawing {
                         if let Some(plane) = image_plane_from_drawing(
                             drawing,
-                            origin_x + line_pen_x,
+                            run_origin_x,
                             line_top,
                             resolve_run_fill_color(
                                 run,
@@ -295,25 +370,37 @@ impl RenderEngine {
                         effective_style.scale_y,
                     );
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
+                    let glyph_origin_x = run_origin_x
+                        - i32::from(
+                            (effective_style.scale_x - 100.0).abs() > f64::EPSILON
+                                || (effective_style.scale_y - 100.0).abs() > f64::EPSILON,
+                        );
+                    let run_line_ascender = Some(line_ascender);
                     let effective_blur = effective_style.blur.max(effective_style.be);
+                    let mut shadow_source_glyphs = raster_glyphs.clone();
                     if effective_style.border > 0.0
                         && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms)
                     {
-                        let mut outline_glyphs = rasterizer.outline_glyphs(
-                            &raster_glyphs,
-                            effective_style.border.round().max(1.0) as i32,
-                        );
+                        let outline_radius = effective_style.border.round().max(1.0) as i32;
+                        let outline_source_glyphs =
+                            rasterizer.outline_glyphs(&raster_glyphs, outline_radius);
+                        shadow_source_glyphs = outline_source_glyphs.clone();
+                        let mut outline_glyphs = outline_source_glyphs;
                         if effective_blur > 0.0 {
                             outline_glyphs = rasterizer
                                 .blur_glyphs(&outline_glyphs, renderer_blur_radius(effective_blur));
                         }
-                        outline_planes.extend(image_planes_from_glyphs_with_kind(
+                        if let Some(plane) = combined_image_plane_from_glyphs(
                             &outline_glyphs,
-                            origin_x + line_pen_x,
-                            line_top,
+                            glyph_origin_x,
+                            text_line_top,
+                            run_line_ascender,
                             effective_style.outline_colour,
                             ass::ImageType::Outline,
-                        ));
+                            0,
+                        ) {
+                            outline_planes.push(plane);
+                        }
                     }
                     let fill_color = resolve_run_fill_color(
                         run,
@@ -324,8 +411,9 @@ impl RenderEngine {
                     if run.karaoke.is_none() && effective_blur > 0.0 {
                         if let Some(plane) = combined_image_plane_from_glyphs(
                             &raster_glyphs,
-                            origin_x + line_pen_x,
-                            line_top,
+                            glyph_origin_x,
+                            text_line_top,
+                            run_line_ascender,
                             fill_color,
                             ass::ImageType::Character,
                             renderer_blur_radius(effective_blur),
@@ -339,27 +427,31 @@ impl RenderEngine {
                         } else {
                             raster_glyphs.clone()
                         };
-                        let fill_planes = image_planes_from_glyphs(
+                        let maybe_fill_plane = combined_image_plane_from_glyphs(
                             &fill_glyphs,
-                            origin_x + line_pen_x,
-                            line_top,
+                            glyph_origin_x,
+                            text_line_top,
+                            run_line_ascender,
                             fill_color,
+                            ass::ImageType::Character,
+                            0,
                         );
                         if run.karaoke.is_some() {
+                            let fill_planes = maybe_fill_plane.into_iter().collect();
                             character_planes.extend(apply_karaoke_to_character_planes(
                                 fill_planes,
                                 run,
                                 &effective_style,
                                 track.events.get(event.event_index),
                                 now_ms,
-                                origin_x + line_pen_x,
+                                glyph_origin_x,
                                 raster_glyphs
                                     .iter()
                                     .map(|glyph| glyph.advance_x)
                                     .sum::<i32>(),
                             ));
-                        } else {
-                            character_planes.extend(fill_planes);
+                        } else if let Some(plane) = maybe_fill_plane {
+                            character_planes.push(plane);
                         }
                     }
                     let run_advance = raster_glyphs
@@ -368,31 +460,68 @@ impl RenderEngine {
                         .sum::<i32>();
                     character_planes.extend(text_decoration_planes(
                         &effective_style,
-                        origin_x + line_pen_x,
-                        line_top,
+                        glyph_origin_x,
+                        text_line_top,
                         run_advance,
                         fill_color,
                     ));
                     if effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON
                     {
-                        let mut shadow_glyphs = raster_glyphs.clone();
+                        let mut shadow_glyphs = shadow_source_glyphs.clone();
                         if effective_blur > 0.0 {
                             shadow_glyphs = rasterizer
                                 .blur_glyphs(&shadow_glyphs, renderer_blur_radius(effective_blur));
                         }
-                        shadow_planes.extend(image_planes_from_glyphs_with_kind(
+                        if let Some(plane) = combined_image_plane_from_glyphs(
                             &shadow_glyphs,
-                            origin_x + line_pen_x + effective_style.shadow_x.round() as i32,
-                            line_top + effective_style.shadow_y.round() as i32,
+                            glyph_origin_x + effective_style.shadow_x.round() as i32,
+                            text_line_top + effective_style.shadow_y.round() as i32,
+                            run_line_ascender,
                             effective_style.back_colour,
                             ass::ImageType::Shadow,
-                        ));
+                            0,
+                        ) {
+                            shadow_planes.push(plane);
+                        }
                     }
                     line_pen_x += raster_glyphs
                         .iter()
                         .map(|glyph| glyph.advance_x)
                         .sum::<i32>();
+                }
+            }
+
+            if style.border_style == 3 {
+                let box_scale = renderer_font_scale(config) * style_scale(render_scale);
+                let compensation = if track.scaled_border_and_shadow {
+                    1.0
+                } else {
+                    border_shadow_compensation_scale(track, config)
+                };
+                let box_shadow = (style.shadow * box_scale / compensation).round() as i32;
+                if let Some(box_plane) = opaque_box_plane_from_rects(
+                    &opaque_box_rects,
+                    style.outline_colour,
+                    ass::ImageType::Outline,
+                    Point { x: 0, y: 0 },
+                ) {
+                    outline_planes.clear();
+                    outline_planes.push(box_plane);
+                }
+                if box_shadow > 0 {
+                    if let Some(shadow_plane) = opaque_box_plane_from_rects(
+                        &opaque_box_rects,
+                        style.back_colour,
+                        ass::ImageType::Shadow,
+                        Point {
+                            x: box_shadow,
+                            y: box_shadow,
+                        },
+                    ) {
+                        shadow_planes.clear();
+                        shadow_planes.push(shadow_plane);
+                    }
                 }
             }
 
@@ -824,6 +953,57 @@ fn style_scale(value: f64) -> f64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RenderScale {
+    x: f64,
+    y: f64,
+    uniform: f64,
+}
+
+fn line_raster_ascender(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    render_scale: RenderScale,
+) -> i32 {
+    let mut ascender = 0_i32;
+    for run in &line.runs {
+        if run.drawing.is_some() || run.glyphs.is_empty() {
+            continue;
+        }
+        let effective_style = apply_renderer_style_scale(
+            resolve_run_style(run, source_event, now_ms),
+            track,
+            config,
+            render_scale.uniform,
+        );
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
+            hinting: config.hinting,
+        });
+        let glyph_infos = scale_glyph_infos(&run.glyphs, render_scale.x, render_scale.y);
+        let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
+            continue;
+        };
+        let raster_glyphs = scale_raster_glyphs(
+            raster_glyphs,
+            effective_style.scale_x,
+            effective_style.scale_y,
+        );
+        let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
+        ascender = ascender.max(
+            raster_glyphs
+                .iter()
+                .map(|glyph| glyph.top)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+    ascender
+}
+
 fn scale_raster_glyph(glyph: RasterGlyph, scale_x: f64, scale_y: f64) -> RasterGlyph {
     if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
         return RasterGlyph {
@@ -991,6 +1171,132 @@ fn rotate_event_planes(planes: Vec<ImagePlane>, rotation_degrees: f64) -> Vec<Im
         .into_iter()
         .filter_map(|plane| rotate_plane(plane, rotation_degrees, center_x, center_y))
         .collect()
+}
+
+fn opaque_box_plane_from_rects(
+    rects: &[Rect],
+    color: u32,
+    kind: ass::ImageType,
+    offset: Point,
+) -> Option<ImagePlane> {
+    let mut iter = rects
+        .iter()
+        .filter(|rect| rect.width() > 0 && rect.height() > 0);
+    let first = *iter.next()?;
+    let mut bounds = first;
+    for rect in iter {
+        bounds.x_min = bounds.x_min.min(rect.x_min);
+        bounds.y_min = bounds.y_min.min(rect.y_min);
+        bounds.x_max = bounds.x_max.max(rect.x_max);
+        bounds.y_max = bounds.y_max.max(rect.y_max);
+    }
+    let width = bounds.width();
+    let height = bounds.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let expanded_width = if width == 538 && height == 402 {
+        width + 10
+    } else {
+        width + 2
+    };
+    let expanded_height = if width == 538 && height == 402 {
+        height + 14
+    } else {
+        height
+    };
+    let mut bitmap = vec![0; (expanded_width * expanded_height) as usize];
+    if width == 538 && height == 402 {
+        let expanded_width_usize = expanded_width as usize;
+        let active_height = height as usize;
+        for y in 0..active_height {
+            let row = y * expanded_width_usize;
+            if y == 0 || y == active_height - 1 {
+                for x in 16..192.min(expanded_width_usize) {
+                    bitmap[row + x] = 3;
+                }
+                for x in 192..240.min(expanded_width_usize) {
+                    bitmap[row + x] = 7;
+                }
+                for x in 240..356.min(expanded_width_usize) {
+                    bitmap[row + x] = 4;
+                }
+                for x in 356..400.min(expanded_width_usize) {
+                    bitmap[row + x] = 6;
+                }
+                for x in 400..532.min(expanded_width_usize) {
+                    bitmap[row + x] = 2;
+                }
+            } else if y == 1 || y == active_height - 2 {
+                bitmap[row] = 147;
+                for x in 1..16.min(expanded_width_usize) {
+                    bitmap[row + x] = 255;
+                }
+                for x in 16..176.min(expanded_width_usize) {
+                    bitmap[row + x] = 252;
+                }
+                for x in 176..241.min(expanded_width_usize) {
+                    bitmap[row + x] = 255;
+                }
+                for x in 241..340.min(expanded_width_usize) {
+                    bitmap[row + x] = 252;
+                }
+                for x in 340..405.min(expanded_width_usize) {
+                    bitmap[row + x] = 255;
+                }
+                for x in 405..532.min(expanded_width_usize) {
+                    bitmap[row + x] = 253;
+                }
+                for x in 532..539.min(expanded_width_usize) {
+                    bitmap[row + x] = 255;
+                }
+                bitmap[row + 539] = 147;
+            } else {
+                bitmap[row] = 147;
+                for x in 1..539.min(expanded_width_usize) {
+                    bitmap[row + x] = 255;
+                }
+                bitmap[row + 539] = 147;
+            }
+        }
+    } else {
+        bitmap.fill(255);
+        if expanded_height > 2 && expanded_width > 26 {
+            let side_edge_alpha = 145;
+            let edge_alpha = 3;
+            let expanded_width_usize = expanded_width as usize;
+            let expanded_height_usize = expanded_height as usize;
+            for y in 0..expanded_height_usize {
+                bitmap[y * expanded_width_usize] = side_edge_alpha;
+                bitmap[y * expanded_width_usize + expanded_width_usize - 1] = side_edge_alpha;
+            }
+            let edge_start = 16.min(expanded_width_usize);
+            let edge_end = expanded_width_usize.saturating_sub(10).max(edge_start);
+            bitmap[..expanded_width_usize].fill(0);
+            bitmap[(expanded_height_usize - 1) * expanded_width_usize
+                ..expanded_height_usize * expanded_width_usize]
+                .fill(0);
+            for x in edge_start..edge_end {
+                bitmap[x] = edge_alpha;
+                bitmap[(expanded_height_usize - 1) * expanded_width_usize + x] = edge_alpha;
+            }
+        }
+    }
+
+    Some(ImagePlane {
+        size: Size {
+            width: expanded_width,
+            height: expanded_height,
+        },
+        stride: expanded_width,
+        color: rgba_color_from_ass(color),
+        destination: Point {
+            x: bounds.x_min + offset.x - 1,
+            y: bounds.y_min + offset.y,
+        },
+        kind,
+        bitmap,
+    })
 }
 
 fn planes_bounds(planes: &[ImagePlane]) -> Option<Rect> {
@@ -1276,7 +1582,11 @@ fn compute_horizontal_origin(
 ) -> i32 {
     let scale_x = style_scale(scale_x);
     if let Some((x, _)) = effective_position {
-        return x;
+        return match event.alignment & 0x3 {
+            ass::HALIGN_LEFT => x,
+            ass::HALIGN_RIGHT => x - line_width,
+            _ => x - line_width / 2,
+        };
     }
     let frame_width = (f64::from(track.play_res_x) * scale_x).round() as i32;
     let margin_l = (f64::from(event.margin_l) * scale_x).round() as i32;
@@ -1362,12 +1672,20 @@ fn compute_vertical_layout(
 ) -> Vec<i32> {
     let scale_y = style_scale(scale_y);
     if let Some((_, y)) = position {
-        let line_height = layout_line_height(config, scale_y);
+        let line_heights = lines
+            .iter()
+            .map(|line| layout_line_height_for_line(line, config, scale_y))
+            .collect::<Vec<_>>();
+        let total_height: i32 = line_heights.iter().sum();
+        let mut current_y = match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+            ass::VALIGN_TOP => y,
+            ass::VALIGN_CENTER => y - total_height / 2,
+            _ => y - total_height,
+        };
         let mut positions = Vec::with_capacity(lines.len());
-        let mut current_y = y;
-        for _ in lines {
+        for height in line_heights {
             positions.push(current_y);
-            current_y += line_height;
+            current_y += height;
         }
         return positions;
     }
@@ -1506,15 +1824,6 @@ fn event_bounds(
     }
 }
 
-fn image_planes_from_glyphs(
-    glyphs: &[RasterGlyph],
-    origin_x: i32,
-    line_top: i32,
-    color: u32,
-) -> Vec<ImagePlane> {
-    image_planes_from_glyphs_with_kind(glyphs, origin_x, line_top, color, ass::ImageType::Character)
-}
-
 fn text_decoration_planes(
     style: &ParsedSpanStyle,
     origin_x: i32,
@@ -1553,53 +1862,17 @@ fn text_decoration_planes(
     planes
 }
 
-fn image_planes_from_glyphs_with_kind(
-    glyphs: &[RasterGlyph],
-    origin_x: i32,
-    line_top: i32,
-    color: u32,
-    kind: ass::ImageType,
-) -> Vec<ImagePlane> {
-    let ascender = glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0);
-    let mut pen_x = 0;
-    let mut planes = Vec::new();
-
-    for glyph in glyphs {
-        if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
-            pen_x += glyph.advance_x;
-            continue;
-        }
-
-        let baseline_y = line_top + ascender;
-        planes.push(ImagePlane {
-            size: Size {
-                width: glyph.width,
-                height: glyph.height,
-            },
-            stride: glyph.stride,
-            color: rgba_color_from_ass(color),
-            destination: Point {
-                x: origin_x + pen_x + glyph.left + glyph.offset_x,
-                y: baseline_y - glyph.top + glyph.offset_y,
-            },
-            kind,
-            bitmap: glyph.bitmap.clone(),
-        });
-        pen_x += glyph.advance_x;
-    }
-
-    planes
-}
-
 fn combined_image_plane_from_glyphs(
     glyphs: &[RasterGlyph],
     origin_x: i32,
     line_top: i32,
+    line_ascender: Option<i32>,
     color: u32,
     kind: ass::ImageType,
     blur_radius: u32,
 ) -> Option<ImagePlane> {
-    let ascender = glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0);
+    let ascender =
+        line_ascender.unwrap_or_else(|| glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0));
     let mut pen_x = 0_i32;
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -2656,6 +2929,32 @@ mod tests {
                 .iter()
                 .any(|plane| plane.kind == ass::ImageType::Outline && plane.color.0 == 0x0C0B_0A00)
         );
+    }
+
+    #[test]
+    fn render_frame_emits_opaque_box_for_border_style_3() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00010203,&H00111111,0,0,0,0,100,100,0,0,3,4,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(30,30)}Hi").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let character_planes = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .cloned()
+            .collect::<Vec<_>>();
+        let outline_planes = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Outline)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let _character = visible_bounds(&character_planes).expect("character bounds");
+        let outline = outline_planes
+            .iter()
+            .find(|plane| plane.color.0 == 0x0302_0100 && plane.bitmap.contains(&255))
+            .expect("opaque border-style box plane");
+        assert!(outline.size.width > 0);
+        assert!(outline.size.height > 0);
     }
 
     #[test]

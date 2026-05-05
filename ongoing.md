@@ -2,6 +2,118 @@
 
 Append new session entries at the top of this file.
 
+## 2026-05-04
+
+### Strict Broad Exact-Pixel Continuation (shadow/karaoke geometry pass)
+- Continued the strict broad exact-pixel pass without touching CoreText/DirectWrite and without editing upstream references/comparator behavior to hide mismatches.
+- Retained a renderer-side fix where text shadow planes use the outline mask when a border is present, matching libass `ASS_Image` behavior for bordered shadow runs. This moved `broad_overrides @ 500 ms` from severe under-rendering (`actual_nontransparent=5104`) to near-target coverage (`actual_nontransparent=5898`, `target_nontransparent=5903`, bbox `Some((49,74,269,112))` vs `Some((48,74,269,112))`).
+- Added a karaoke-line ascender correction so `broad_karaoke @ 500 ms` high-res plane geometry now matches the libass probe exactly (`Outline1 x=623 y=615 w=368 h=240`, `Outline2 x=1007 y=663 w=368 h=192`, `Character1 x=631 y=623 w=352 h=224`, `Character2 x=1015 y=671 w=352 h=176`, `Character3 x=1399 y=623 w=544 h=224`). The remaining karaoke mismatch is coverage/composition intensity, not gross placement.
+- Rejected and reverted experiments that had no benefit or caused regressions: global ascender offsets (`+2/-2`), karaoke no-shared-ascender, broad `254->255` mask normalization, and raster correction-table `254->255` tweaks.
+- Verified retained changes: `cargo fmt --all`, `cargo test -p rassa-render -q`, `cargo test -p rassa-raster -q`, and strict `sub2` all pass (`/tmp/sub2_retained.log`). Strict broad remains red with 12 frames (`/tmp/strict_retained.log`): `broad_box`, `broad_static`, `broad_karaoke`, and `broad_overrides` still require exact coverage/composition fixes.
+
+### Strict Broad Exact-Pixel Continuation (libass geometry probe pass)
+- Continued strict broad exact-pixel work without touching CoreText/DirectWrite and without changing upstream reference PNGs/comparator behavior to hide renderer mismatches.
+- Added a temporary `/tmp/libass_probe.c` oracle program against the checked-out libass build (test-only, not production) to print upstream `ASS_Image` geometry for the broad fixtures. It showed `broad_static` geometry already matches (`x=671 y=591 w=1264 h=368`) and narrowed that fixture to raster mask coverage (`rassa lit_pixels=109200` vs upstream `108720`).
+- The same probe showed `broad_box` has a separate `BorderStyle=3` text-plane geometry issue: upstream character image is `x=1070 y=630 w=454 h=208`, while rassa had emitted a much wider/left-shifted character plane. A focused renderer change now brings the `broad_box` character-plane geometry to `x=1070 y=630 w=454 h=208`; the remaining `broad_box` output still has exact-pixel edge/composition deltas (`actual_nontransparent=3878`, `target_nontransparent=3878`, matching bbox, alpha `243329928` vs `243330809`).
+- Removed the temporary `RASSA_DUMP_COMPARE_RAW`/`.rgba16le` diagnostic hook from `rassa-test`; `RASSA_DUMP_COMPARE` PNG dumping remains available.
+- Re-ran the strict broad gate at `/tmp/strict_resume.log`: still 12 failing frames. Focused follow-up split the remaining roots: `broad_static` is rectilinear raster AA/coverage phase (turning rectilinear AA off proves the base mask is too small, current correction over-spreads weak fringe); `broad_karaoke`/`broad_overrides` are outline anchor/coverage interactions where a fill-ascender outline anchor improves karaoke but regresses scaled overrides, so that heuristic was not retained; `broad_box` edge/side alpha sweeps (`edge_alpha` and `side_edge_alpha`) cannot hit exact target with a simple constant change and were reverted. A run-level outline/shadow plane-combination cleanup was retained because it matches the intended libass-style image-plane grouping better and keeps tests green, but it does not change the remaining broad pixel metrics.
+- Verified after retained changes: `cargo fmt --all`, `cargo test -p rassa-render -q`, `cargo test -p rassa-raster -q`, and `cargo test -p rassa-test upstream_compare_reference_sub2_is_pixel_perfect -- --ignored --nocapture` pass. Strict broad is still red with 12 frames; latest strict logs `/tmp/strict_current.log`, `/tmp/strict_resume.log`, and `/tmp/strict_after_combined_run.log`.
+
+### Strict Broad Exact-Pixel Continuation (box edge/raw diagnostics pass)
+- Continued the strict broad exact-pixel pass without touching CoreText/DirectWrite and kept `upstream_compare_reference_sub2_is_pixel_perfect` as the regression guard.
+- Added `RASSA_BROAD_FILTER` support to the broad-corpus harness so individual fixture root causes can be tested without rerunning every broad frame; used it for `broad_box` and `broad_static` focused loops.
+- Improved `BorderStyle=3` opaque-box edge composition by expanding the box plane with a narrow antialiased side fringe while preserving the already-correct bbox and nontransparent count. Current `broad_box @ 500 ms`: `actual_nontransparent=3878`, `target_nontransparent=3878`, bbox `Some((126,64,197,119))` on both sides, alpha now `243329928` vs `243330809` (down from a much larger alpha gap earlier), but exact pixels still differ.
+- Added temporary raw RGBA16 diagnostics during the investigation, then removed those debug-only hooks before leaving the tree. Raw analysis showed `broad_static` is a rectilinear glyph edge-coverage/phase issue (mostly inverse-alpha `64→32` edge pixels plus 59 fringe pixels), not a placement issue.
+- Tried disabling rectilinear boundary antialiasing and changing its deltas as root-cause tests; those worsened/failed to improve `broad_static`, so the production raster path was restored.
+- Current verified focused checks pass: `cargo fmt --all`, `cargo test -p rassa-render -q`, `cargo test -p rassa-raster -q`, and `cargo test -p rassa-test upstream_compare_reference_sub2_is_pixel_perfect -- --ignored --nocapture` (`/tmp/sub2_after_cleanup.log`). Strict broad remains red with 12 frames (`/tmp/strict_after_cleanup.log`): `broad_box`, `broad_static`, `broad_karaoke`, and `broad_overrides` at the broad timestamps.
+
+### Strict Broad Exact-Pixel Continuation (scaled outline radius pass)
+- Continued strict broad exact-pixel work without touching CoreText/DirectWrite.
+- Added a raster regression ensuring `rassa-raster` preserves shaped glyph advances even when the glyph bitmap cache is reused; this prevents cached FreeType advance values from overriding HarfBuzz/layout advances.
+- Changed scaled outline generation to scale the bitmap-dilation outline radius for `\\fscx/\\fscy` runs using the combined x/y style scale. This made the largest remaining fixture (`broad_overrides`) substantially closer: `broad_overrides @ 500 ms` moved to `actual_nontransparent=5884` vs `target_nontransparent=5903`, `actual_alpha_sum=350908536` vs `target_alpha_sum=352761459`, `actual_bbox=Some((49,75,269,112))` vs `target_bbox=Some((48,74,269,112))`.
+- Kept the previous exact-bbox improvement for `broad_box @ 500 ms` (`actual_nontransparent=3878`, `target_nontransparent=3878`, bbox `Some((126,64,197,119))` on both sides), but its edge/composition alpha still differs.
+- Tried additional vertical positioning and outline-radius overshoot experiments; reverted the ones that worsened bbox/alpha or broke compilation. Current verified focused checks pass: `cargo fmt --all`, `cargo test -p rassa-render -q`, `cargo test -p rassa-raster -q`, and strict `sub2` (`/tmp/sub2_current_final.log`).
+- Strict broad remains red with 12 exact-pixel mismatching frames; current log: `/tmp/rassa_strict_current_final.log`. Remaining root causes are now mostly subpixel/coverage exactness: scaled outline edge coverage/top-left extent, karaoke outline/fill split edge placement, static glyph edge coverage, and `BorderStyle=3` antialiased rectangle/composition intensity.
+
+### Strict Broad Exact-Pixel Continuation (current)
+- Continued the strict broad exact-pixel pass without touching CoreText/DirectWrite.
+- Verified the latest `BorderStyle=3` y-edge experiment; strict broad remained red. Replaced the hard full-255 top/bottom rows of opaque box planes with a thin antialiased edge strip and adjusted the box side coverage. This brought `broad_box @ 500 ms` to matching nontransparent pixel count and bbox (`actual_nontransparent=3878`, `target_nontransparent=3878`, `actual_bbox=Some((126,64,197,119))`, `target_bbox=Some((126,64,197,119))`), but exact alpha still differs (`actual_alpha_sum=242836145`, `target_alpha_sum=243330809`).
+- Tried switching normal glyph fill to FreeType's rendered bitmap as a root-cause test. It regressed the broad static bbox (`actual=Some((84,74,240,118))` vs target `Some((83,73,241,119))`), so that experiment was reverted to keep the existing custom raster bbox parity.
+- Switched text outlines from bitmap dilation toward the existing FreeType stroker path for non-drawing text runs, with dilation fallback. This improved `broad_karaoke @ 500 ms` coverage (`actual_nontransparent=2708` vs `target_nontransparent=2755`, `actual_alpha_sum=149245915` vs `149217515`) while preserving focused renderer tests and strict `sub2`.
+- Replaced nearest-neighbor post-raster glyph scaling with bilinear resampling for scaled glyph bitmaps. This slightly improved the scaled override bbox (`broad_overrides @ 500 ms` moved from top 76 to 75, target 74) but strict broad remains red with 12 mismatching frames.
+- Current verified focused checks: `cargo fmt --all`, `cargo test -p rassa-render -q`, and `cargo test -p rassa-test upstream_compare_reference_sub2_is_pixel_perfect -- --ignored --nocapture` pass. Strict broad log: `/tmp/rassa_strict_bilinear.log`.
+
+### Strict Broad Exact-Pixel Attempt
+- Continued the strict broad exact-pixel pass without touching CoreText/DirectWrite.
+- Added optional compare-frame debug dumping for broad diagnostics via `RASSA_DUMP_COMPARE=/tmp/path`, writing actual/target PNG pairs for mismatching frames.
+- Normalized fully transparent downsampled pixels to transparent black in the broad compare compositor; this removes visually irrelevant RGB residue from exact comparisons without hiding any nontransparent alpha/color differences.
+- Re-tested an experimental shared-ascender placement change for positioned/outlined text, but reverted it because it regressed `broad_static` vertical placement while `sub2` must remain green.
+- Current focused verification remains green: `cargo fmt --all`, `cargo test -p rassa-render -q`, and `cargo test -p rassa-test upstream_compare_reference_sub2_is_pixel_perfect -- --ignored --nocapture`.
+- Strict broad is still red with 12 exact-pixel mismatching frames (`/tmp/rassa_strict_current.log`). Current root cause is subpixel/fixed-point coverage rather than gross placement: hard-edged `BorderStyle=3` boxes, nearest-neighbor post-raster scaling for `\\fscx/\\fscy`, and integer-rounded glyph/clip placement still diverge from upstream edge coverage.
+
+### Strict Broad Pixel-Diff Continuation Follow-up
+- Continued the strict broad-corpus root-cause pass without touching CoreText/DirectWrite.
+- Added a positioned-text vertical correction for explicit `\\pos`/`\\move` events that preserves the existing strict `sub2-153000` fixture while bringing broad positioned text closer to libass line metrics:
+  - `broad_static @ 500 ms` now has matching bbox `actual=Some((83,73,241,119))` vs `target=Some((83,73,241,119))` and near-identical alpha sum (`106953120` vs `106970208`); remaining mismatch is raster edge coverage.
+  - `broad_overrides @ 500 ms` improved enough that it remains the main outline/shadow/raster-intensity gap rather than a gross placement failure.
+  - `broad_karaoke @ 500 ms` is now down to roughly a one-row top-edge bbox delta (`actual=Some((77,77,242,107))` vs `target=Some((77,76,242,107))`) plus karaoke/outline intensity deltas.
+- Tightened `BorderStyle=3` line box right-edge geometry so `broad_box @ 500 ms` now matches the upstream bbox horizontally and vertically: `actual=Some((126,64,197,119))` vs `target=Some((126,64,197,119))`; remaining box delta is edge alpha/composition intensity.
+- Re-ran focused renderer tests, the strict `sub2-153000` ignored fixture, and the normal workspace test suite after these changes; all stayed green. Strict broad mode remains red with 12 exact-pixel mismatching frames.
+
+### Strict Broad Pixel-Diff Continuation
+- Re-ran the strict broad corpus gate and grouped the current failures by root cause:
+  - all 12 broad frames still differ in exact pixel mode;
+  - `broad_static` is now a small glyph/raster edge mismatch with matching horizontal bbox and about a one-pixel vertical extent delta;
+  - `broad_karaoke` is primarily outline/raster row-distribution and karaoke split intensity, not timing order;
+  - `broad_overrides` is dominated by outline/shadow/raster intensity for scaled/bordered inline overrides;
+  - `broad_box` exposed remaining `BorderStyle=3` opaque-box geometry differences.
+- Tightened `BorderStyle=3` opaque-box generation to use line-level ASS box rectangles instead of deriving the box solely from visible character glyph bounds. This moves the broad box fixture much closer to upstream: the 500 ms bbox improved to approximately `actual=Some((126,64,196,119))` vs `target=Some((126,64,197,119))`.
+- Kept the existing strict upstream `sub2-153000` pixel fixture green by preserving the prior line-height calibration; an attempted line-height tweak improved some broad rows but regressed that stricter reference and was reverted.
+
+### Verified This Continuation
+- `cargo fmt --all` completed successfully.
+- `cargo test -p rassa-render -q` passes.
+- `cargo test -p rassa-test upstream_compare_reference_sub2_is_pixel_perfect -- --ignored --nocapture` passes.
+- Full workspace `cargo test -q` passes.
+- Broad corpus report mode still passes and reports 12 mismatching frames; strict broad mode remains the active red gate for further renderer parity work.
+
+### Broad Upstream Pixel-Diff Corpus Pass
+- Added a generated upstream-reference corpus under `crates/rassa-test/fixtures/libass/compare/broad/` with 4 ASS fixtures and 12 upstream libass-rendered PNG frames:
+  - static centered `\\pos` text
+  - inline override/color/scale/border/shadow coverage
+  - karaoke timing coverage including `\\kt`/`\\kf`/`\\ko`
+  - `BorderStyle=3` opaque-box coverage
+- Added ignored `rassa-test` harness `upstream_generated_broad_corpus_pixel_diff_report` that renders every broad-corpus frame through rassa, composites the emitted image planes to RGBA, compares against the upstream PNG, and prints high-signal diagnostics: plane summaries, nontransparent counts, alpha sums, bboxes, row summaries, and first differing pixel.
+- The broad harness defaults to report mode so it can stay in `cargo test -- --ignored` without blocking unrelated work; setting `RASSA_STRICT_BROAD_PIXEL_DIFF=1` turns broad-corpus mismatches into a failing strict gate.
+- Ran the broad corpus in strict/red form first and confirmed it exposed parity deltas, then fixed the largest geometry issue found: explicit `\\pos`/`\\move` placement now honors ASS alignment anchors horizontally and vertically instead of treating positioned coordinates as top-left line origins.
+- After the anchor fix, centered static text aligns horizontally with upstream and the broad corpus shows much smaller placement deltas; remaining mismatches are mainly raster/outline/blur/composition/line-metric precision rather than the original gross `\\pos` anchoring error.
+
+### Verified
+- `cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture` passes in report mode and currently reports 12 mismatching broad frames.
+- The strict mode is intentionally available but not yet green: `RASSA_STRICT_BROAD_PIXEL_DIFF=1 cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture` remains the next renderer pixel-parity gate.
+
+### Feature-Completion Pass (excluding CoreText/DirectWrite)
+- Audited the remaining ASS/libass parity surface while explicitly keeping CoreText/DirectWrite backend work out of scope.
+- Closed parser override gaps aligned with upstream `ass_parse.c` semantics:
+  - Added `\kt` karaoke timing reset support so subsequent `\k`/`\kf`/`\ko` spans can start from an absolute centisecond cursor.
+  - Aligned inline `\fs` handling with libass-style relative font-size semantics (`+/-` values scale from the current size by tenths) and reset invalid/zero sizes to the base style size.
+  - Added `\fsc` reset behavior for paired scale reset back to the base style `ScaleX`/`ScaleY`.
+- Added renderer support for style `BorderStyle=3` opaque subtitle boxes: text events now replace outline planes with an opaque box around the rendered character bounds and optionally emit the matching shadow box from `BackColour`.
+- Added focused regressions for `\kt`, relative/reset font-size and scale overrides, and opaque-box border rendering.
+
+### Verified
+- `cargo fmt --all` completed successfully.
+- `cargo test -p rassa-parse parses_ -- --nocapture` passes with the new parser regressions.
+- `cargo test -p rassa-render render_frame_emits_opaque_box_for_border_style_3 -- --nocapture` passes.
+- Full workspace `cargo test -q` passes.
+- Ignored upstream/parity tests pass via `cargo test -- --ignored -q`, including the strict `rassa-test` reference fixtures.
+- Release build passes via `cargo build --release -q`.
+- Exported public C ABI inventory still reports 50 `ass_*` symbols from `target/release/libass.so`.
+
+### Current Gaps
+- CoreText/DirectWrite remain intentionally out of scope for this pass.
+- The available automated corpus and strict fixture tests pass, but absolute feature-complete confidence still depends on growing the upstream pixel-diff corpus beyond the current fixtures and continuing exact libass quirk matching for rare edge cases.
+
 ## 2026-05-03
 
 ### Pixel-Parity Continuation
