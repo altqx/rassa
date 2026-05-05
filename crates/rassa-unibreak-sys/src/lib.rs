@@ -1,6 +1,8 @@
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_int};
+use std::ffi::c_char;
+#[cfg(libunibreak_available)]
+use std::ffi::c_int;
 
 pub type utf8_t = u8;
 pub type utf16_t = u16;

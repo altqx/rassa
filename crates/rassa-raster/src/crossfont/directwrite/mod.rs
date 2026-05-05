@@ -1,4 +1,5 @@
 //! Rasterization powered by DirectWrite.
+#![allow(deprecated)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;

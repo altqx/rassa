@@ -1,12 +1,17 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::{ops::Range, os::raw::c_int};
+use std::ops::Range;
+#[cfg(fribidi_available)]
+use std::os::raw::c_int;
 
 use rassa_core::RassaResult;
 use rassa_unibreak::{BreakAnalysis, LineBreakOpportunity, WordBreakOpportunity, analyze_breaks};
 
+#[cfg(fribidi_available)]
 const FRIBIDI_MASK_RTL: u32 = 0x0000_0001;
+#[cfg(fribidi_available)]
 const FRIBIDI_MASK_WEAK: u32 = 0x0000_0020;
+#[cfg(fribidi_available)]
 const FRIBIDI_PAR_ON: u32 = 0x0000_0040;
 
 #[cfg(fribidi_available)]
@@ -143,11 +148,6 @@ fn analyze_bidi_with_fribidi(text: &str) -> RassaResult<BidiAnalysis> {
     })
 }
 
-#[cfg(not(fribidi_available))]
-fn analyze_bidi_with_fribidi(text: &str) -> RassaResult<BidiAnalysis> {
-    Ok(fallback_bidi_analysis(text))
-}
-
 fn fallback_bidi_analysis(text: &str) -> BidiAnalysis {
     let char_count = text.chars().count();
     BidiAnalysis {
@@ -159,6 +159,7 @@ fn fallback_bidi_analysis(text: &str) -> BidiAnalysis {
     }
 }
 
+#[cfg(fribidi_available)]
 fn map_bidi_direction(value: u32) -> BidiDirection {
     if value == FRIBIDI_PAR_ON {
         BidiDirection::Neutral
@@ -175,6 +176,7 @@ fn map_bidi_direction(value: u32) -> BidiDirection {
     }
 }
 
+#[cfg(fribidi_available)]
 fn normalize_indices(indices: &[i32]) -> Vec<usize> {
     indices
         .iter()
@@ -182,6 +184,7 @@ fn normalize_indices(indices: &[i32]) -> Vec<usize> {
         .collect()
 }
 
+#[cfg(fribidi_available)]
 fn utf32_to_string(codepoints: &[u32]) -> String {
     codepoints
         .iter()
