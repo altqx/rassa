@@ -12,7 +12,9 @@ use freetype::{
     Bitmap, GlyphSlot, Library, RenderMode, StrokerLineCap, StrokerLineJoin, face::LoadFlag, ffi,
 };
 
-use crate::crossfont::{BitmapBuffer, FontDesc, GlyphIdKey, Rasterize, Size, Style};
+use crate::crossfont::{
+    BitmapBuffer, FontDesc, GlyphIdKey, Rasterize, RasterizedGlyph, Size, Style,
+};
 use rassa_core::{RassaError, RassaResult, ass};
 use rassa_fonts::{FontMatch, FontProviderKind};
 use rassa_shape::{GlyphInfo, ShapedRun};
@@ -419,8 +421,8 @@ fn rasterize_system_glyphs(
             top: rendered.top,
             offset_x: glyph.x_offset.round() as i32,
             offset_y: (-glyph.y_offset).round() as i32,
-            advance_x: rendered.advance.0,
-            advance_y: rendered.advance.1,
+            advance_x: rendered_advance_x(&rendered, glyph),
+            advance_y: rendered_advance_y(&rendered, glyph),
             pixel_mode,
             bitmap,
         };
@@ -438,6 +440,22 @@ fn rasterize_system_glyphs(
     }
 
     Ok(rasterized)
+}
+
+fn rendered_advance_x(rendered: &RasterizedGlyph, shaped: &GlyphInfo) -> i32 {
+    if rendered.advance.0 != 0 {
+        rendered.advance.0
+    } else {
+        shaped.x_advance.round() as i32
+    }
+}
+
+fn rendered_advance_y(rendered: &RasterizedGlyph, shaped: &GlyphInfo) -> i32 {
+    if rendered.advance.1 != 0 {
+        rendered.advance.1
+    } else {
+        shaped.y_advance.round() as i32
+    }
 }
 
 fn crossfont_bitmap_to_gray(
@@ -1253,7 +1271,7 @@ fn blur_glyph(glyph: &RasterGlyph, radius: u32) -> RasterGlyph {
 mod tests {
     use super::*;
     use rassa_fonts::FontconfigProvider;
-    use rassa_shape::{ShapeEngine, ShapeRequest};
+    use rassa_shape::{ShapeEngine, ShapeRequest, ShapingMode};
 
     #[test]
     fn rasterize_run_renders_system_font_bitmaps() {
@@ -1261,7 +1279,10 @@ mod tests {
         let provider = FontconfigProvider::new();
         let shaper = ShapeEngine::new();
         let shaped = shaper
-            .shape_text(&provider, &ShapeRequest::new("Ab", "sans"))
+            .shape_text(
+                &provider,
+                &ShapeRequest::new("Ab", "sans").with_mode(ShapingMode::Complex),
+            )
             .expect("shaping should succeed");
         let rasterizer = Rasterizer::with_options(RasterOptions {
             size_26_6: 24 * 64,
@@ -1280,6 +1301,54 @@ mod tests {
                 .all(|glyph| glyph.bitmap.len() == (glyph.stride * glyph.height) as usize)
         );
         assert!(glyphs.iter().any(|glyph| !glyph.bitmap.is_empty()));
+        assert!(
+            glyphs
+                .iter()
+                .any(|glyph| glyph.bitmap.iter().any(|sample| *sample != 0)),
+            "system font rasterization should produce non-zero glyph coverage"
+        );
+        assert!(
+            glyphs.iter().any(|glyph| glyph.advance_x > 0),
+            "system font rasterization should preserve positive glyph advances"
+        );
+    }
+
+    #[test]
+    fn rendered_advance_falls_back_to_shaped_positions_when_backend_reports_zero() {
+        let rendered = RasterizedGlyph {
+            advance: (0, 0),
+            ..RasterizedGlyph::default()
+        };
+        let shaped = GlyphInfo {
+            glyph_id: 1,
+            cluster: 0,
+            x_advance: 17.4,
+            y_advance: -2.6,
+            x_offset: 0.0,
+            y_offset: 0.0,
+        };
+
+        assert_eq!(rendered_advance_x(&rendered, &shaped), 17);
+        assert_eq!(rendered_advance_y(&rendered, &shaped), -3);
+    }
+
+    #[test]
+    fn rendered_advance_keeps_backend_metrics_when_present() {
+        let rendered = RasterizedGlyph {
+            advance: (23, 5),
+            ..RasterizedGlyph::default()
+        };
+        let shaped = GlyphInfo {
+            glyph_id: 1,
+            cluster: 0,
+            x_advance: 17.4,
+            y_advance: -2.6,
+            x_offset: 0.0,
+            y_offset: 0.0,
+        };
+
+        assert_eq!(rendered_advance_x(&rendered, &shaped), 23);
+        assert_eq!(rendered_advance_y(&rendered, &shaped), 5);
     }
 
     #[test]

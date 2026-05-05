@@ -103,26 +103,52 @@ impl DirectWriteRasterizer {
         }
 
         // Headless Windows runners can report a ClearType rendering mode but return an
-        // empty ClearType alpha texture. Fall back to DirectWrite's aliased 1x1 mask
-        // so runtime visual smoke tests and headless embedders still exercise the
-        // native DirectWrite raster path instead of silently producing no glyphs.
+        // empty ClearType alpha texture. Build a fresh aliased analysis instead of
+        // reusing the ClearType analysis, then require real non-zero coverage before
+        // treating the glyph as rendered.
+        let aliased_analysis = GlyphRunAnalysis::create(
+            &glyph_run,
+            1.,
+            None,
+            dwrote::DWRITE_RENDERING_MODE_ALIASED,
+            dwrote::DWRITE_MEASURING_MODE_NATURAL,
+            0.0,
+            0.0,
+        )?;
         let aliased_bounds =
-            glyph_analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_ALIASED_1x1)?;
+            aliased_analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_ALIASED_1x1)?;
         let aliased_width = aliased_bounds.right - aliased_bounds.left;
         let aliased_height = aliased_bounds.bottom - aliased_bounds.top;
-        let aliased = glyph_analysis
-            .create_alpha_texture(dwrote::DWRITE_TEXTURE_ALIASED_1x1, aliased_bounds)?;
-        let buffer =
-            BitmapBuffer::Rgb(aliased.into_iter().flat_map(|sample| [sample; 3]).collect());
+        if aliased_width > 0 && aliased_height > 0 {
+            let aliased = aliased_analysis
+                .create_alpha_texture(dwrote::DWRITE_TEXTURE_ALIASED_1x1, aliased_bounds)?;
+            if aliased.iter().any(|sample| *sample != 0) {
+                return Ok(RasterizedGlyph {
+                    character,
+                    width: aliased_width,
+                    height: aliased_height,
+                    top: -aliased_bounds.top,
+                    left: aliased_bounds.left,
+                    advance: (0, 0),
+                    buffer: BitmapBuffer::Rgb(
+                        aliased.into_iter().flat_map(|sample| [sample; 3]).collect(),
+                    ),
+                });
+            }
+        }
 
+        // Some valid spacing glyphs (for example U+0020 shaped by glyph id) have no
+        // outline coverage. Return an empty glyph so one space does not make the
+        // whole run fail; higher-level smoke tests still catch runs where every
+        // printable glyph has zero coverage.
         Ok(RasterizedGlyph {
             character,
-            width: aliased_width,
-            height: aliased_height,
-            top: -aliased_bounds.top,
-            left: aliased_bounds.left,
+            width: 0,
+            height: 0,
+            top: 0,
+            left: 0,
             advance: (0, 0),
-            buffer,
+            buffer: BitmapBuffer::Rgb(Vec::new()),
         })
     }
 

@@ -207,13 +207,34 @@ jobs:
             --time-ms 500 \
             --width 320 \
             --height 180
+          cat > target/runtime-visual/text-smoke.ass <<'ASS'
+          [Script Info]
+          PlayResX: 320
+          PlayResY: 180
+
+          [V4+ Styles]
+          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+          Style: Default,Arial,32,&H0000FF00,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,5,10,10,10,1
+
+          [Events]
+          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+          Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0000,0000,0000,,Rassa native smoke
+          ASS
+          cargo run --release -p rassa-check -- \
+            --input target/runtime-visual/text-smoke.ass \
+            --output target/runtime-visual/text-frame.png \
+            --format png \
+            --time-ms 500 \
+            --width 320 \
+            --height 180
           cat > target/runtime-visual/validate_png.py <<'PY'
           from pathlib import Path
-          path = Path('target/runtime-visual/frame.png')
-          data = path.read_bytes()
-          assert data.startswith(b'\x89PNG\r\n\x1a\n'), 'rendered frame is not a PNG'
-          assert len(data) > 512, f'rendered PNG is unexpectedly small: {len(data)} bytes'
-          print(f'native visual PNG ok: {path} ({len(data)} bytes)')
+          for name in ('frame.png', 'text-frame.png'):
+              path = Path('target/runtime-visual') / name
+              data = path.read_bytes()
+              assert data.startswith(b'\x89PNG\r\n\x1a\n'), f'{name} is not a PNG'
+              assert len(data) > 512, f'{name} is unexpectedly small: {len(data)} bytes'
+              print(f'native visual PNG ok: {path} ({len(data)} bytes)')
           PY
           if command -v python3 >/dev/null 2>&1; then
             python3 target/runtime-visual/validate_png.py
