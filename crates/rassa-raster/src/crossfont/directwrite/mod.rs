@@ -82,19 +82,45 @@ impl DirectWriteRasterizer {
             0.0,
         )?;
 
-        let bounds =
+        let cleartype_bounds =
             glyph_analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1)?;
+        let cleartype_width = cleartype_bounds.right - cleartype_bounds.left;
+        let cleartype_height = cleartype_bounds.bottom - cleartype_bounds.top;
+        if cleartype_width > 0 && cleartype_height > 0 {
+            let cleartype = glyph_analysis
+                .create_alpha_texture(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1, cleartype_bounds)?;
+            if cleartype.iter().any(|sample| *sample != 0) {
+                return Ok(RasterizedGlyph {
+                    character,
+                    width: cleartype_width,
+                    height: cleartype_height,
+                    top: -cleartype_bounds.top,
+                    left: cleartype_bounds.left,
+                    advance: (0, 0),
+                    buffer: BitmapBuffer::Rgb(normalize_cleartype_layout(cleartype)),
+                });
+            }
+        }
 
-        let buffer = BitmapBuffer::Rgb(normalize_cleartype_layout(
-            glyph_analysis.create_alpha_texture(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1, bounds)?,
-        ));
+        // Headless Windows runners can report a ClearType rendering mode but return an
+        // empty ClearType alpha texture. Fall back to DirectWrite's aliased 1x1 mask
+        // so runtime visual smoke tests and headless embedders still exercise the
+        // native DirectWrite raster path instead of silently producing no glyphs.
+        let aliased_bounds =
+            glyph_analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_ALIASED_1x1)?;
+        let aliased_width = aliased_bounds.right - aliased_bounds.left;
+        let aliased_height = aliased_bounds.bottom - aliased_bounds.top;
+        let aliased = glyph_analysis
+            .create_alpha_texture(dwrote::DWRITE_TEXTURE_ALIASED_1x1, aliased_bounds)?;
+        let buffer =
+            BitmapBuffer::Rgb(aliased.into_iter().flat_map(|sample| [sample; 3]).collect());
 
         Ok(RasterizedGlyph {
             character,
-            width: bounds.right - bounds.left,
-            height: bounds.bottom - bounds.top,
-            top: -bounds.top,
-            left: bounds.left,
+            width: aliased_width,
+            height: aliased_height,
+            top: -aliased_bounds.top,
+            left: aliased_bounds.left,
             advance: (0, 0),
             buffer,
         })
