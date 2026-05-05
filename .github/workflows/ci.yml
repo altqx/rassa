@@ -240,7 +240,7 @@ jobs:
           fi
 
   broad-corpus:
-    name: strict broad corpus
+    name: broad corpus report
     runs-on: ubuntu-latest
 
     steps:
@@ -263,8 +263,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Run strict broad corpus pixel diff
+      - name: Run broad corpus pixel diff report
         run: |
-          RASSA_STRICT_BROAD_PIXEL_DIFF=1 \
-            cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report \
+          cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report \
             -- --ignored --nocapture

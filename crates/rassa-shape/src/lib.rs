@@ -191,7 +191,7 @@ impl ShapeEngine {
     ) -> Option<Vec<GlyphInfo>> {
         let font_path = font.path.as_ref()?;
         let bytes = fs::read(font_path).ok()?;
-        let font_ref = FontRef::new(bytes.as_slice()).ok()?;
+        let font_ref = FontRef::from_index(bytes.as_slice(), font.face_index.unwrap_or(0)).ok()?;
         let shaper_data = ShaperData::new(&font_ref);
         let shaper = shaper_data.shaper(&font_ref).build();
 

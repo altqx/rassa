@@ -73,6 +73,7 @@ pub struct RasterCacheStats {
 struct GlyphCacheKey {
     family: String,
     style: Option<String>,
+    face_index: Option<u32>,
     glyph_id: u32,
     size_26_6: i32,
     hinting: ass::Hinting,
@@ -137,12 +138,14 @@ impl Rasterizer {
         if let Some(font_path) = font.path.as_ref() {
             let library = Library::init()
                 .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
-            let mut face = library.new_face(font_path, 0).map_err(|error| {
-                RassaError::new(format!(
-                    "failed to load font '{}': {error:?}",
-                    font_path.display()
-                ))
-            })?;
+            let mut face = library
+                .new_face(font_path, font.face_index.unwrap_or(0) as isize)
+                .map_err(|error| {
+                    RassaError::new(format!(
+                        "failed to load font '{}': {error:?}",
+                        font_path.display()
+                    ))
+                })?;
             request_real_dim_size(&mut face, self.options.size_26_6.max(64))?;
             let stroker = library.new_stroker().map_err(|error| {
                 RassaError::new(format!("freetype stroker init failed: {error:?}"))
@@ -250,12 +253,14 @@ fn rasterize_freetype_glyphs(
         .ok_or_else(|| RassaError::new(format!("font '{}' is unresolved", font.family)))?;
     let library = Library::init()
         .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
-    let mut face = library.new_face(font_path, 0).map_err(|error| {
-        RassaError::new(format!(
-            "failed to load font '{}': {error:?}",
-            font_path.display()
-        ))
-    })?;
+    let mut face = library
+        .new_face(font_path, font.face_index.unwrap_or(0) as isize)
+        .map_err(|error| {
+            RassaError::new(format!(
+                "failed to load font '{}': {error:?}",
+                font_path.display()
+            ))
+        })?;
     request_real_dim_size(&mut face, options.size_26_6.max(64))?;
 
     let mut rasterized = Vec::with_capacity(glyphs.len());
@@ -265,6 +270,7 @@ fn rasterize_freetype_glyphs(
         let cache_key = GlyphCacheKey {
             family: font.family.clone(),
             style: font.style.clone(),
+            face_index: font.face_index,
             glyph_id: glyph.glyph_id,
             size_26_6: options.size_26_6,
             hinting: options.hinting,
@@ -377,6 +383,7 @@ fn rasterize_system_glyphs(
         let cache_key = GlyphCacheKey {
             family: font.family.clone(),
             style: font.style.clone(),
+            face_index: font.face_index,
             glyph_id: glyph.glyph_id,
             size_26_6: options.size_26_6,
             hinting: options.hinting,

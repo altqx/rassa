@@ -47,6 +47,7 @@ pub enum FontProviderKind {
 pub struct FontMatch {
     pub family: String,
     pub path: Option<PathBuf>,
+    pub face_index: Option<u32>,
     pub style: Option<String>,
     pub provider: FontProviderKind,
 }
@@ -60,6 +61,7 @@ impl FontMatch {
         Self {
             family: family.into(),
             path: None,
+            face_index: None,
             style,
             provider,
         }
@@ -126,14 +128,15 @@ impl CrossfontProvider {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn find_font(&self, family: String, style: Option<String>) -> Option<FontMatch> {
-        resolve_system_font(&family, style.as_deref()).map(|(resolved_family, resolved_path)| {
-            FontMatch {
+        resolve_system_font(&family, style.as_deref()).map(
+            |(resolved_family, resolved_path, face_index)| FontMatch {
                 family: resolved_family,
                 path: resolved_path,
+                face_index,
                 style,
                 provider: FontProviderKind::Fontconfig,
-            }
-        })
+            },
+        )
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -163,19 +166,25 @@ impl FontProvider for CrossfontProvider {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Option<PathBuf>)> {
+fn resolve_system_font(
+    family: &str,
+    style: Option<&str>,
+) -> Option<(String, Option<PathBuf>, Option<u32>)> {
     let mut database = Database::new();
     database.load_system_fonts();
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(path) = fontconfig_match_path(family, style, None) {
+    if let Some((path, face_index)) = fontconfig_match_path(family, style, None) {
         let resolved_family = load_face_metadata(&path)
             .map(|(family, _)| family)
             .unwrap_or_else(|| family.to_owned());
-        return Some((resolved_family, Some(path)));
+        return Some((resolved_family, Some(path), face_index));
     }
 
     let requested_style = style.map(normalize_font_key);
+    let wants_bold = requested_style
+        .as_deref()
+        .is_some_and(|style| style.contains("bold"));
     let fontdb_style = requested_style
         .as_deref()
         .map(|style| {
@@ -199,7 +208,11 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
 
     let query = Query {
         families: &[family_query],
-        weight: Weight::NORMAL,
+        weight: if wants_bold {
+            Weight::BOLD
+        } else {
+            Weight::NORMAL
+        },
         stretch: Stretch::Normal,
         style: fontdb_style,
     };
@@ -212,7 +225,7 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
         };
         database.query(&fallback)
     }) else {
-        return windows_known_font_path(family).map(|path| (family.to_owned(), Some(path)));
+        return windows_known_font_path(family).map(|path| (family.to_owned(), Some(path), None));
     };
     let face = database.face(id)?;
     let resolved_family = face
@@ -220,14 +233,21 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
         .first()
         .map(|(name, _)| name.clone())
         .unwrap_or_else(|| family.to_owned());
-    let path = match &face.source {
-        Source::File(path) => Some(path.clone()),
-        Source::SharedFile(path, _) => Some(path.clone()),
-        _ => None,
-    }
-    .or_else(|| windows_known_font_path(&resolved_family))
-    .or_else(|| windows_known_font_path(family));
-    Some((resolved_family, path))
+    let (path, face_index) = match &face.source {
+        Source::File(path) => (
+            Some(path.clone()),
+            Some(face.index).filter(|index| *index > 0),
+        ),
+        Source::SharedFile(path, _) => (
+            Some(path.clone()),
+            Some(face.index).filter(|index| *index > 0),
+        ),
+        _ => (None, Some(face.index).filter(|index| *index > 0)),
+    };
+    let path = path
+        .or_else(|| windows_known_font_path(&resolved_family))
+        .or_else(|| windows_known_font_path(family));
+    Some((resolved_family, path, face_index))
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
@@ -235,15 +255,15 @@ pub fn resolve_system_font_for_char(
     family: &str,
     style: Option<&str>,
     character: char,
-) -> Option<(String, Option<PathBuf>)> {
-    let path = fontconfig_match_path(family, style, Some(character))?;
+) -> Option<(String, Option<PathBuf>, Option<u32>)> {
+    let (path, face_index) = fontconfig_match_path(family, style, Some(character))?;
     if !font_file_supports_char(&path, character) {
         return None;
     }
     let resolved_family = load_face_metadata(&path)
         .map(|(family, _)| family)
         .unwrap_or_else(|| family.to_owned());
-    Some((resolved_family, Some(path)))
+    Some((resolved_family, Some(path), face_index))
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"), not(target_arch = "wasm32"))))]
@@ -251,7 +271,7 @@ pub fn resolve_system_font_for_char(
     _family: &str,
     _style: Option<&str>,
     _character: char,
-) -> Option<(String, Option<PathBuf>)> {
+) -> Option<(String, Option<PathBuf>, Option<u32>)> {
     None
 }
 
@@ -306,17 +326,23 @@ fn fontconfig_match_path(
     family: &str,
     style: Option<&str>,
     character: Option<char>,
-) -> Option<PathBuf> {
+) -> Option<(PathBuf, Option<u32>)> {
     let pattern = fontconfig_pattern(family, style, character);
     let output = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", &pattern])
+        .args(["-f", "%{file}\n%{index}", &pattern])
         .output()
         .ok()?;
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
-    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?);
-    path.exists().then_some(path)
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut lines = text.lines();
+    let path = PathBuf::from(lines.next()?.trim());
+    let face_index = lines
+        .next()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|index| *index > 0);
+    path.exists().then_some((path, face_index))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -389,6 +415,7 @@ impl FontProvider for AttachedFontProvider {
             return FontMatch {
                 family: font.family.clone(),
                 path: Some(font.path.clone()),
+                face_index: None,
                 style: font.style.clone(),
                 provider: FontProviderKind::Attached,
             };
@@ -455,6 +482,7 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
         FontMatch {
             family: self.family.clone().unwrap_or_else(|| query.family.clone()),
             path: Some(self.path.clone()),
+            face_index: None,
             style: query.style.clone(),
             provider: FontProviderKind::DefaultFile,
         }

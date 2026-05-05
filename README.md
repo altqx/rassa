@@ -374,7 +374,13 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release -p rassa-check -p rassa -p rassa-libass-capi
 ```
 
-Strict broad corpus pixel-diff gate:
+Broad corpus pixel-diff report (runs all generated upstream frames and logs mismatches without treating known parity gaps as a master-branch failure):
+
+```sh
+cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture
+```
+
+Opt-in strict broad corpus gate for renderer-parity work where the references are expected to be pixel-perfect:
 
 ```sh
 RASSA_STRICT_BROAD_PIXEL_DIFF=1 \

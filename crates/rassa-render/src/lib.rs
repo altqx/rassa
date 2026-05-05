@@ -204,8 +204,8 @@ impl RenderEngine {
             });
             for (line, line_top) in event.lines.iter().zip(vertical_layout.iter().copied()) {
                 let has_scaled_run = line.runs.iter().any(|run| {
-                    (run.style.scale_x - 100.0).abs() > f64::EPSILON
-                        || (run.style.scale_y - 100.0).abs() > f64::EPSILON
+                    (run.style.scale_x - 1.0).abs() > f64::EPSILON
+                        || (run.style.scale_y - 1.0).abs() > f64::EPSILON
                 });
                 let text_line_top = if effective_position.is_some() {
                     let border_style_3_y_adjust = if style.border_style == 3 { 3 } else { 0 };
@@ -372,15 +372,22 @@ impl RenderEngine {
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
                     let glyph_origin_x = run_origin_x
                         - i32::from(
-                            (effective_style.scale_x - 100.0).abs() > f64::EPSILON
-                                || (effective_style.scale_y - 100.0).abs() > f64::EPSILON,
+                            (effective_style.scale_x - 1.0).abs() > f64::EPSILON
+                                || (effective_style.scale_y - 1.0).abs() > f64::EPSILON,
                         );
                     let run_line_ascender = Some(line_ascender);
                     let effective_blur = effective_style.blur.max(effective_style.be);
+                    let has_outline = effective_style.border > 0.0
+                        && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms);
+                    let has_shadow = effective_style.shadow_x.abs() > f64::EPSILON
+                        || effective_style.shadow_y.abs() > f64::EPSILON;
+                    let fill_blur = if has_outline || has_shadow {
+                        0
+                    } else {
+                        renderer_blur_radius(effective_blur)
+                    };
                     let mut shadow_source_glyphs = raster_glyphs.clone();
-                    if effective_style.border > 0.0
-                        && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms)
-                    {
+                    if has_outline {
                         let outline_radius = effective_style.border.round().max(1.0) as i32;
                         let outline_source_glyphs =
                             rasterizer.outline_glyphs(&raster_glyphs, outline_radius);
@@ -413,7 +420,7 @@ impl RenderEngine {
                             run_line_ascender,
                             fill_color,
                             ass::ImageType::Character,
-                            renderer_blur_radius(effective_blur),
+                            fill_blur,
                         ) {
                             character_planes.push(plane);
                         }
@@ -425,7 +432,7 @@ impl RenderEngine {
                             run_line_ascender,
                             fill_color,
                             ass::ImageType::Character,
-                            renderer_blur_radius(effective_blur),
+                            fill_blur,
                         );
                         if run.karaoke.is_some() {
                             let fill_planes = maybe_fill_plane.into_iter().collect();
@@ -493,8 +500,7 @@ impl RenderEngine {
                     ass::ImageType::Outline,
                     Point { x: 0, y: 0 },
                 ) {
-                    outline_planes.clear();
-                    outline_planes.push(box_plane);
+                    outline_planes.insert(0, box_plane);
                 }
                 if box_shadow > 0 {
                     if let Some(shadow_plane) = opaque_box_plane_from_rects(
@@ -3085,7 +3091,7 @@ mod tests {
         let outline = outline_planes
             .iter()
             .find(|plane| plane.color.0 == 0x0302_0100 && plane.bitmap.contains(&255))
-            .expect("opaque border-style box plane");
+            .expect("opaque border-style box plane uses outline colour");
         assert!(outline.size.width > 0);
         assert!(outline.size.height > 0);
     }
@@ -3108,6 +3114,74 @@ mod tests {
                 .iter()
                 .any(|plane| plane.kind == ass::ImageType::Shadow
                     && plane.bitmap.iter().any(|value| *value > 0 && *value < 255))
+        );
+    }
+
+    #[test]
+    fn render_frame_blurs_fill_only_without_outline_or_shadow() {
+        let base = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(40,40)}Hi").expect("script should parse");
+        let blurred = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(40,40)\\blur3}Hi").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let base_planes = engine.render_frame_with_provider(&base, &provider, 500);
+        let blurred_planes = engine.render_frame_with_provider(&blurred, &provider, 500);
+        let base_character = visible_bounds(
+            &base_planes
+                .iter()
+                .filter(|plane| plane.kind == ass::ImageType::Character)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .expect("base character bounds");
+        let blurred_character = visible_bounds(
+            &blurred_planes
+                .iter()
+                .filter(|plane| plane.kind == ass::ImageType::Character)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .expect("blurred character bounds");
+
+        assert!(blurred_character.x_min < base_character.x_min);
+        assert!(blurred_character.x_max > base_character.x_max);
+        assert!(blurred_character.y_min < base_character.y_min);
+        assert!(blurred_character.y_max > base_character.y_max);
+    }
+
+    #[test]
+    fn render_frame_does_not_blur_fill_when_outline_or_shadow_exists() {
+        let base = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(40,40)}Hi").expect("script should parse");
+        let blurred = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(40,40)\\blur3}Hi").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let base_planes = engine.render_frame_with_provider(&base, &provider, 500);
+        let blurred_planes = engine.render_frame_with_provider(&blurred, &provider, 500);
+        let character_bounds = |planes: &[ImagePlane]| {
+            visible_bounds(
+                &planes
+                    .iter()
+                    .filter(|plane| plane.kind == ass::ImageType::Character)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .expect("character bounds")
+        };
+
+        assert_eq!(
+            character_bounds(&blurred_planes),
+            character_bounds(&base_planes)
+        );
+        assert!(
+            blurred_planes
+                .iter()
+                .filter(|plane| plane.kind == ass::ImageType::Outline)
+                .any(|plane| plane.bitmap.iter().any(|value| *value > 0 && *value < 255))
+        );
+        assert!(
+            blurred_planes
+                .iter()
+                .filter(|plane| plane.kind == ass::ImageType::Shadow)
+                .any(|plane| plane.bitmap.iter().any(|value| *value > 0 && *value < 255))
         );
     }
 

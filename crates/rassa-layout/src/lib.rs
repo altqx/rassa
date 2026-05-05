@@ -108,7 +108,8 @@ impl LayoutEngine {
             .wrap_style
             .unwrap_or(track.wrap_style)
             .clamp(0, 3);
-        let max_width = auto_wrap_width(track, event, style);
+        let alignment = parsed_text.alignment.unwrap_or(style.alignment);
+        let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment);
         let lines = wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?;
 
         Ok(LayoutEvent {
@@ -234,7 +235,13 @@ fn layout_line_from_text<P: FontProvider>(
     })
 }
 
-fn auto_wrap_width(track: &ParsedTrack, event: &ParsedEvent, style: &ParsedStyle) -> f32 {
+fn auto_wrap_width(
+    track: &ParsedTrack,
+    event: &ParsedEvent,
+    style: &ParsedStyle,
+    position: Option<(i32, i32)>,
+    alignment: i32,
+) -> f32 {
     if track.play_res_x == ParsedTrack::default().play_res_x
         && track.play_res_y == ParsedTrack::default().play_res_y
         && track.layout_res_x == 0
@@ -244,7 +251,18 @@ fn auto_wrap_width(track: &ParsedTrack, event: &ParsedEvent, style: &ParsedStyle
     }
     let margin_l = resolve_margin(event.margin_l, style.margin_l).max(0);
     let margin_r = resolve_margin(event.margin_r, style.margin_r).max(0);
-    (track.play_res_x - margin_l - margin_r).max(0) as f32
+    let full_width = (track.play_res_x - margin_l - margin_r).max(0);
+    let Some((x, _)) = position else {
+        return full_width as f32;
+    };
+
+    let left = (x - margin_l).max(0);
+    let right = (track.play_res_x - margin_r - x).max(0);
+    match alignment & 0x3 {
+        ass::HALIGN_LEFT => right as f32,
+        ass::HALIGN_RIGHT => left as f32,
+        _ => (left.min(right) * 2).min(full_width) as f32,
+    }
 }
 
 fn wrap_layout_lines(
@@ -464,9 +482,10 @@ fn split_text_by_font<P: FontProvider>(
             base_font.clone()
         } else {
             resolve_system_font_for_char(family, style.as_deref(), character)
-                .map(|(resolved_family, resolved_path)| FontMatch {
+                .map(|(resolved_family, resolved_path, face_index)| FontMatch {
                     family: resolved_family,
                     path: resolved_path,
+                    face_index,
                     style: style.clone(),
                     provider: base_font.provider,
                 })
@@ -486,7 +505,10 @@ fn split_text_by_font<P: FontProvider>(
 }
 
 fn same_font_match(left: &FontMatch, right: &FontMatch) -> bool {
-    left.family == right.family && left.path == right.path && left.style == right.style
+    left.family == right.family
+        && left.path == right.path
+        && left.face_index == right.face_index
+        && left.style == right.style
 }
 
 fn font_style_name(style: &ParsedSpanStyle) -> Option<String> {
@@ -586,12 +608,12 @@ mod tests {
     fn layout_wraps_long_text_at_unicode_line_breaks() {
         let track = parse_track(
             "[Script Info]
-PlayResX: 20
+PlayResX: 8
 WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,1,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -604,7 +626,7 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
             .expect("layout should succeed");
 
         assert!(layout.lines.len() > 1);
-        assert!(layout.lines.iter().all(|line| line.width <= 16.0));
+        assert!(layout.lines.iter().all(|line| line.width <= 4.0));
         assert!(layout.lines.iter().all(|line| !line.text.starts_with(' ')));
         assert!(layout.lines.iter().all(|line| !line.text.ends_with(' ')));
     }
@@ -613,12 +635,12 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
     fn layout_q2_disables_automatic_wrapping() {
         let track = parse_track(
             "[Script Info]
-PlayResX: 20
+PlayResX: 8
 WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,1,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -631,7 +653,32 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\q2}alpha beta gamm
             .expect("layout should succeed");
 
         assert_eq!(layout.lines.len(), 1);
-        assert!(layout.lines[0].width > 16.0);
+        assert!(layout.lines[0].width > 4.0);
+    }
+
+    #[test]
+    fn layout_wraps_positioned_center_text_within_anchor_space() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 40
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(10,20)\\an5\\q0}alpha beta gamma delta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert!(layout.lines.len() > 1);
+        assert!(layout.lines.iter().all(|line| line.width <= 16.0));
     }
 
     #[test]
@@ -639,12 +686,12 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\q2}alpha beta gamm
         let track = parse_track(
             "[Script Info]
 Language: ja
-PlayResX: 9
+PlayResX: 6
 WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,1,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -657,7 +704,7 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
             .expect("layout should succeed");
 
         assert!(layout.lines.len() > 1);
-        assert!(layout.lines.iter().all(|line| line.width <= 5.0));
+        assert!(layout.lines.iter().all(|line| line.width <= 2.0));
     }
 
     #[test]
