@@ -548,10 +548,7 @@ fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResu
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn load_flags_for_hinting(hinting: ass::Hinting) -> LoadFlag {
-    let base = LoadFlag::RENDER
-        | LoadFlag::NO_BITMAP
-        | LoadFlag::IGNORE_GLOBAL_ADVANCE_WITH
-        | LoadFlag::IGNORE_TRANSFORM;
+    let base = LoadFlag::RENDER | LoadFlag::NO_BITMAP | LoadFlag::IGNORE_GLOBAL_ADVANCE_WITH;
     match hinting {
         ass::Hinting::None => base | LoadFlag::NO_HINTING,
         ass::Hinting::Light => base | LoadFlag::FORCE_AUTOHINT | LoadFlag::TARGET_LIGHT,
@@ -1562,5 +1559,58 @@ mod tests {
         let native = load_flags_for_hinting(ass::Hinting::Native);
         assert!(!native.contains(LoadFlag::FORCE_AUTOHINT));
         assert!(native.contains(LoadFlag::TARGET_NORMAL));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn freetype_italic_rasterization_applies_synthetic_slant() {
+        Rasterizer::clear_cache();
+        let provider = FontconfigProvider::new();
+        let shaper = ShapeEngine::new();
+        let regular = shaper
+            .shape_text(
+                &provider,
+                &ShapeRequest::new("T", "DejaVu Sans").with_mode(ShapingMode::Complex),
+            )
+            .expect("regular shaping should succeed");
+        let italic = shaper
+            .shape_text(
+                &provider,
+                &ShapeRequest::new("T", "DejaVu Sans")
+                    .with_style("Italic")
+                    .with_mode(ShapingMode::Complex),
+            )
+            .expect("italic shaping should succeed");
+        if regular.runs.is_empty()
+            || italic.runs.is_empty()
+            || regular.runs[0].font.path.is_none()
+            || italic.runs[0].font.path.is_none()
+        {
+            eprintln!("skipping italic raster test: no local DejaVu Sans font path");
+            return;
+        }
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: 48 * 64,
+            hinting: ass::Hinting::Normal,
+        });
+
+        let regular_glyph = rasterizer
+            .rasterize_run(&regular.runs[0])
+            .expect("regular rasterization should succeed")
+            .remove(0);
+        let italic_glyph = rasterizer
+            .rasterize_run(&italic.runs[0])
+            .expect("italic rasterization should succeed")
+            .remove(0);
+
+        assert_ne!(
+            (italic_glyph.width, italic_glyph.left, italic_glyph.bitmap),
+            (
+                regular_glyph.width,
+                regular_glyph.left,
+                regular_glyph.bitmap
+            ),
+            "italic request must change the rendered outline, not reuse an upright glyph"
+        );
     }
 }

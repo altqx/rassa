@@ -629,6 +629,31 @@ mod tests {
     }
 
     #[test]
+    fn override_italic_resolves_italic_font_style() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,DejaVu Sans,40,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\i1}italic",
+        );
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+        let run = layout.lines[0].runs.first().expect("italic run");
+
+        assert!(run.style.italic);
+        assert!(
+            run.font
+                .style
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("italic"),
+            "italic override must request an italic font face/style, got {:?}",
+            run.font.style
+        );
+    }
+
+    #[test]
     fn layout_splits_lines_on_mandatory_breaks() {
         let mut track = parse_track(
             "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,seed",

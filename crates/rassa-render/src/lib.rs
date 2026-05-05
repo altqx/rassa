@@ -74,6 +74,29 @@ fn renderer_blur_radius(blur: f64) -> u32 {
     (blur * 4.0).ceil().max(1.0) as u32
 }
 
+fn style_clip_bleed(style: &ParsedSpanStyle) -> i32 {
+    let border_bleed = style.border_x.max(style.border_y).max(style.border) * 4.0;
+    let shadow_bleed = style
+        .shadow_x
+        .abs()
+        .max(style.shadow_y.abs())
+        .max(style.shadow);
+    let blur_bleed = renderer_blur_radius(style.blur.max(style.be)) as f64;
+    (border_bleed + shadow_bleed + blur_bleed).ceil().max(0.0) as i32
+}
+
+fn expand_rect(rect: Rect, amount: i32) -> Rect {
+    if amount <= 0 {
+        return rect;
+    }
+    Rect {
+        x_min: rect.x_min - amount,
+        y_min: rect.y_min - amount,
+        x_max: rect.x_max + amount,
+        y_max: rect.y_max + amount,
+    }
+}
+
 impl RenderEngine {
     pub fn new() -> Self {
         Self::default()
@@ -176,6 +199,7 @@ impl RenderEngine {
             let mut outline_planes = Vec::new();
             let mut character_planes = Vec::new();
             let mut opaque_box_rects = Vec::new();
+            let mut clip_mask_bleed = 0;
             let effective_position = scale_position(
                 resolve_event_position(track, event, now_ms),
                 render_scale_x,
@@ -279,6 +303,7 @@ impl RenderEngine {
                         config,
                         render_scale,
                     );
+                    clip_mask_bleed = clip_mask_bleed.max(style_clip_bleed(&effective_style));
                     let run_origin_x = text_origin_x + line_pen_x;
                     if let Some(drawing) = &run.drawing {
                         if let Some(plane) = image_plane_from_drawing(
@@ -534,6 +559,11 @@ impl RenderEngine {
                 event_planes = transform_event_planes(event_planes, transform, origin);
             }
             if let Some(clip_rect) = event.clip_rect {
+                let clip_rect = if event.inverse_clip {
+                    expand_rect(clip_rect, clip_mask_bleed)
+                } else {
+                    clip_rect
+                };
                 event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
             } else if let Some(vector_clip) = &event.vector_clip {
                 event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
@@ -3262,6 +3292,49 @@ mod tests {
         assert_eq!(
             parts.iter().map(|plane| plane.bitmap.len()).sum::<usize>(),
             20
+        );
+    }
+
+    #[test]
+    fn inverse_clip_bleed_covers_outline_growth_to_prevent_stray_glyph_leakage() {
+        let style = ParsedSpanStyle {
+            border: 5.0,
+            border_x: 5.0,
+            border_y: 5.0,
+            shadow: 0.0,
+            shadow_x: 0.0,
+            shadow_y: 0.0,
+            blur: 0.0,
+            be: 0.0,
+            ..ParsedSpanStyle::default()
+        };
+        let clip = Rect {
+            x_min: 20,
+            y_min: 0,
+            x_max: 24,
+            y_max: 10,
+        };
+        let glyph = ImagePlane {
+            size: Size {
+                width: 44,
+                height: 10,
+            },
+            stride: 44,
+            color: RgbaColor(0x00FF_FFFF),
+            destination: Point { x: 0, y: 0 },
+            kind: ass::ImageType::Outline,
+            bitmap: vec![255; 440],
+        };
+
+        let expanded = expand_rect(clip, style_clip_bleed(&style));
+        let parts = inverse_clip_plane(glyph, expanded);
+
+        assert!(
+            parts
+                .iter()
+                .all(|plane| plane.destination.x + plane.size.width <= 0
+                    || plane.destination.x >= 44),
+            "inverse clip must mask outline bleed around the nominal clip, got {parts:?}"
         );
     }
 
