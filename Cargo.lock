@@ -703,6 +703,7 @@ dependencies = [
  "rassa-parse",
  "rassa-raster",
  "rassa-shape",
+ "rassa-unibreak",
  "rassa-unicode",
 ]
 

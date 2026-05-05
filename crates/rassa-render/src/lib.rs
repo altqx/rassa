@@ -385,11 +385,8 @@ impl RenderEngine {
                         let outline_source_glyphs =
                             rasterizer.outline_glyphs(&raster_glyphs, outline_radius);
                         shadow_source_glyphs = outline_source_glyphs.clone();
-                        let mut outline_glyphs = outline_source_glyphs;
-                        if effective_blur > 0.0 {
-                            outline_glyphs = rasterizer
-                                .blur_glyphs(&outline_glyphs, renderer_blur_radius(effective_blur));
-                        }
+                        let outline_glyphs = outline_source_glyphs;
+                        let outline_blur = renderer_blur_radius(effective_blur);
                         if let Some(plane) = combined_image_plane_from_glyphs(
                             &outline_glyphs,
                             glyph_origin_x,
@@ -397,7 +394,7 @@ impl RenderEngine {
                             run_line_ascender,
                             effective_style.outline_colour,
                             ass::ImageType::Outline,
-                            0,
+                            outline_blur,
                         ) {
                             outline_planes.push(plane);
                         }
@@ -421,20 +418,14 @@ impl RenderEngine {
                             character_planes.push(plane);
                         }
                     } else {
-                        let fill_glyphs = if effective_blur > 0.0 {
-                            rasterizer
-                                .blur_glyphs(&raster_glyphs, renderer_blur_radius(effective_blur))
-                        } else {
-                            raster_glyphs.clone()
-                        };
                         let maybe_fill_plane = combined_image_plane_from_glyphs(
-                            &fill_glyphs,
+                            &raster_glyphs,
                             glyph_origin_x,
                             text_line_top,
                             run_line_ascender,
                             fill_color,
                             ass::ImageType::Character,
-                            0,
+                            renderer_blur_radius(effective_blur),
                         );
                         if run.karaoke.is_some() {
                             let fill_planes = maybe_fill_plane.into_iter().collect();
@@ -468,11 +459,7 @@ impl RenderEngine {
                     if effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON
                     {
-                        let mut shadow_glyphs = shadow_source_glyphs.clone();
-                        if effective_blur > 0.0 {
-                            shadow_glyphs = rasterizer
-                                .blur_glyphs(&shadow_glyphs, renderer_blur_radius(effective_blur));
-                        }
+                        let shadow_glyphs = shadow_source_glyphs.clone();
                         if let Some(plane) = combined_image_plane_from_glyphs(
                             &shadow_glyphs,
                             glyph_origin_x + effective_style.shadow_x.round() as i32,
@@ -480,7 +467,7 @@ impl RenderEngine {
                             run_line_ascender,
                             effective_style.back_colour,
                             ass::ImageType::Shadow,
-                            0,
+                            renderer_blur_radius(effective_blur),
                         ) {
                             shadow_planes.push(plane);
                         }
@@ -528,10 +515,17 @@ impl RenderEngine {
             let mut event_planes = shadow_planes;
             event_planes.extend(outline_planes);
             event_planes.extend(character_planes);
-            if let Some(rotation_z) =
-                event_rotation_z(event, track.events.get(event.event_index), now_ms)
+            if let Some(transform) =
+                event_transform(event, track.events.get(event.event_index), now_ms)
             {
-                event_planes = rotate_event_planes(event_planes, rotation_z);
+                let origin = event_transform_origin(
+                    event,
+                    &event_planes,
+                    effective_position,
+                    render_scale_x,
+                    render_scale_y,
+                );
+                event_planes = transform_event_planes(event_planes, transform, origin);
             }
             if let Some(clip_rect) = event.clip_rect {
                 event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
@@ -1141,32 +1135,92 @@ fn rgba_color_from_ass(color: u32) -> RgbaColor {
     RgbaColor(ass_color_to_rgba(color))
 }
 
-fn event_rotation_z(
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct EventTransform {
+    rotation_x: f64,
+    rotation_y: f64,
+    rotation_z: f64,
+    shear_x: f64,
+    shear_y: f64,
+}
+
+impl EventTransform {
+    fn is_identity(self) -> bool {
+        [
+            self.rotation_x,
+            self.rotation_y,
+            self.rotation_z,
+            self.shear_x,
+            self.shear_y,
+        ]
+        .iter()
+        .all(|value| value.is_finite() && value.abs() < f64::EPSILON)
+    }
+}
+
+fn event_transform(
     event: &LayoutEvent,
     source_event: Option<&ParsedEvent>,
     now_ms: i64,
-) -> Option<f64> {
+) -> Option<EventTransform> {
     event
         .lines
         .iter()
         .flat_map(|line| line.runs.iter())
-        .map(|run| resolve_run_style(run, source_event, now_ms).rotation_z)
-        .find(|rotation| rotation.is_finite() && rotation.abs() >= f64::EPSILON)
+        .map(|run| resolve_run_style(run, source_event, now_ms))
+        .map(|style| EventTransform {
+            rotation_x: style.rotation_x,
+            rotation_y: style.rotation_y,
+            rotation_z: style.rotation_z,
+            shear_x: style.shear_x,
+            shear_y: style.shear_y,
+        })
+        .find(|transform| !transform.is_identity())
 }
 
-fn rotate_event_planes(planes: Vec<ImagePlane>, rotation_degrees: f64) -> Vec<ImagePlane> {
-    if planes.is_empty() || !rotation_degrees.is_finite() || rotation_degrees.abs() < f64::EPSILON {
+fn event_transform_origin(
+    event: &LayoutEvent,
+    planes: &[ImagePlane],
+    effective_position: Option<(i32, i32)>,
+    scale_x: f64,
+    scale_y: f64,
+) -> (f64, f64) {
+    if let Some((x, y)) = event.origin {
+        return (
+            f64::from((f64::from(x) * style_scale(scale_x)).round() as i32),
+            f64::from((f64::from(y) * style_scale(scale_y)).round() as i32),
+        );
+    }
+    if let Some((x, y)) = effective_position {
+        return (f64::from(x), f64::from(y));
+    }
+    planes_bounds(planes)
+        .map(|bounds| {
+            (
+                f64::from(bounds.x_min + bounds.x_max) / 2.0,
+                f64::from(bounds.y_min + bounds.y_max) / 2.0,
+            )
+        })
+        .unwrap_or((0.0, 0.0))
+}
+
+fn transform_event_planes(
+    planes: Vec<ImagePlane>,
+    transform: EventTransform,
+    origin: (f64, f64),
+) -> Vec<ImagePlane> {
+    if planes.is_empty() || transform.is_identity() {
         return planes;
     }
 
-    let Some(bounds) = planes_bounds(&planes) else {
+    let matrix = TransformMatrix::from_ass_transform(transform);
+    if matrix.is_identity() {
         return planes;
-    };
-    let center_x = f64::from(bounds.x_min + bounds.x_max) / 2.0;
-    let center_y = f64::from(bounds.y_min + bounds.y_max) / 2.0;
+    }
+
     planes
         .into_iter()
-        .filter_map(|plane| rotate_plane(plane, rotation_degrees, center_x, center_y))
+        .filter_map(|plane| transform_plane(plane, matrix, origin.0, origin.1))
         .collect()
 }
 
@@ -1316,19 +1370,84 @@ fn planes_bounds(planes: &[ImagePlane]) -> Option<Rect> {
     Some(bounds)
 }
 
-fn rotate_plane(
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TransformMatrix {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+}
+
+impl TransformMatrix {
+    fn from_ass_transform(transform: EventTransform) -> Self {
+        let rz = transform.rotation_z.to_radians();
+        let sin_z = rz.sin();
+        let cos_z = rz.cos();
+        let scale_x = transform.rotation_y.to_radians().cos().abs().max(0.05);
+        let scale_y = transform.rotation_x.to_radians().cos().abs().max(0.05);
+        let shear_x = finite_or_zero(transform.shear_x);
+        let shear_y = finite_or_zero(transform.shear_y);
+
+        // Local ASS-style approximation before z-rotation:
+        // x/y rotations flatten the bitmap along their projected axes; fax/fay shear
+        // in script space. This is intentionally applied around \org/default origin.
+        let local_a = scale_x;
+        let local_b = shear_x * scale_x;
+        let local_c = shear_y * scale_y;
+        let local_d = scale_y;
+
+        Self {
+            a: cos_z * local_a - sin_z * local_c,
+            b: cos_z * local_b - sin_z * local_d,
+            c: sin_z * local_a + cos_z * local_c,
+            d: sin_z * local_b + cos_z * local_d,
+        }
+    }
+
+    fn is_identity(self) -> bool {
+        (self.a - 1.0).abs() < f64::EPSILON
+            && self.b.abs() < f64::EPSILON
+            && self.c.abs() < f64::EPSILON
+            && (self.d - 1.0).abs() < f64::EPSILON
+    }
+
+    fn transform_point(self, x: f64, y: f64, origin_x: f64, origin_y: f64) -> (f64, f64) {
+        let dx = x - origin_x;
+        let dy = y - origin_y;
+        (
+            origin_x + self.a * dx + self.b * dy,
+            origin_y + self.c * dx + self.d * dy,
+        )
+    }
+
+    fn inverse(self) -> Option<Self> {
+        let determinant = self.a * self.d - self.b * self.c;
+        if determinant.abs() < 1.0e-6 || !determinant.is_finite() {
+            return None;
+        }
+        Some(Self {
+            a: self.d / determinant,
+            b: -self.b / determinant,
+            c: -self.c / determinant,
+            d: self.a / determinant,
+        })
+    }
+}
+
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn transform_plane(
     plane: ImagePlane,
-    rotation_degrees: f64,
-    center_x: f64,
-    center_y: f64,
+    matrix: TransformMatrix,
+    origin_x: f64,
+    origin_y: f64,
 ) -> Option<ImagePlane> {
     if plane.size.width <= 0 || plane.size.height <= 0 || plane.bitmap.is_empty() {
         return Some(plane);
     }
-
-    let radians = rotation_degrees.to_radians();
-    let sin = radians.sin();
-    let cos = radians.cos();
+    let inverse = matrix.inverse()?;
     let corners = [
         (
             f64::from(plane.destination.x),
@@ -1347,23 +1466,23 @@ fn rotate_plane(
             f64::from(plane.destination.y + plane.size.height),
         ),
     ];
-    let rotated = corners.map(|(x, y)| rotate_point(x, y, center_x, center_y, sin, cos));
-    let min_x = rotated
+    let transformed = corners.map(|(x, y)| matrix.transform_point(x, y, origin_x, origin_y));
+    let min_x = transformed
         .iter()
         .map(|(x, _)| *x)
         .fold(f64::INFINITY, f64::min)
         .floor() as i32;
-    let min_y = rotated
+    let min_y = transformed
         .iter()
         .map(|(_, y)| *y)
         .fold(f64::INFINITY, f64::min)
         .floor() as i32;
-    let max_x = rotated
+    let max_x = transformed
         .iter()
         .map(|(x, _)| *x)
         .fold(f64::NEG_INFINITY, f64::max)
         .ceil() as i32;
-    let max_y = rotated
+    let max_y = transformed
         .iter()
         .map(|(_, y)| *y)
         .fold(f64::NEG_INFINITY, f64::max)
@@ -1374,24 +1493,24 @@ fn rotate_plane(
     let src_stride = plane.stride.max(0) as usize;
     let src_width = plane.size.width as usize;
     let src_height = plane.size.height as usize;
-    let inv_sin = -sin;
 
     for row in 0..height {
         for column in 0..width {
             let dest_x = f64::from(min_x) + column as f64 + 0.5;
             let dest_y = f64::from(min_y) + row as f64 + 0.5;
             let (src_global_x, src_global_y) =
-                rotate_point(dest_x, dest_y, center_x, center_y, inv_sin, cos);
-            let src_x = (src_global_x - f64::from(plane.destination.x)).floor() as i32;
-            let src_y = (src_global_y - f64::from(plane.destination.y)).floor() as i32;
-            if src_x >= 0
-                && src_y >= 0
-                && (src_x as usize) < src_width
-                && (src_y as usize) < src_height
-            {
-                let value = plane.bitmap[src_y as usize * src_stride + src_x as usize];
-                bitmap[row * width + column] = value;
-            }
+                inverse.transform_point(dest_x, dest_y, origin_x, origin_y);
+            let src_x = src_global_x - f64::from(plane.destination.x) - 0.5;
+            let src_y = src_global_y - f64::from(plane.destination.y) - 0.5;
+            let value = sample_bitmap_bilinear(
+                &plane.bitmap,
+                src_stride,
+                src_width,
+                src_height,
+                src_x,
+                src_y,
+            );
+            bitmap[row * width + column] = value;
         }
     }
 
@@ -1407,13 +1526,30 @@ fn rotate_plane(
     })
 }
 
-fn rotate_point(x: f64, y: f64, center_x: f64, center_y: f64, sin: f64, cos: f64) -> (f64, f64) {
-    let dx = x - center_x;
-    let dy = y - center_y;
-    (
-        center_x + dx * cos - dy * sin,
-        center_y + dx * sin + dy * cos,
-    )
+fn sample_bitmap_bilinear(
+    bitmap: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+) -> u8 {
+    if !(x.is_finite() && y.is_finite()) || x < 0.0 || y < 0.0 {
+        return 0;
+    }
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    if x0 < 0 || y0 < 0 || x0 as usize >= width || y0 as usize >= height {
+        return 0;
+    }
+    let x1 = (x0 + 1).min(width.saturating_sub(1) as i32);
+    let y1 = (y0 + 1).min(height.saturating_sub(1) as i32);
+    let wx = x - f64::from(x0);
+    let wy = y - f64::from(y0);
+    let at = |xx: i32, yy: i32| -> f64 { bitmap[yy as usize * stride + xx as usize] as f64 };
+    let top = at(x0, y0) * (1.0 - wx) + at(x1, y0) * wx;
+    let bottom = at(x0, y1) * (1.0 - wx) + at(x1, y1) * wx;
+    (top * (1.0 - wy) + bottom * wy).round().clamp(0.0, 255.0) as u8
 }
 
 pub fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {

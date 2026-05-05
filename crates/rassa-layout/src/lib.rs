@@ -1,10 +1,13 @@
 use rassa_core::{RassaError, RassaResult, Rect, ass};
-use rassa_fonts::{FontMatch, FontProvider, FontQuery};
+use rassa_fonts::{
+    FontMatch, FontProvider, FontQuery, font_match_supports_text, resolve_system_font_for_char,
+};
 use rassa_parse::{
     ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedSpanStyle,
-    ParsedSpanTransform, ParsedTrack, ParsedVectorClip, parse_dialogue_text,
+    ParsedSpanTransform, ParsedStyle, ParsedTrack, ParsedVectorClip, parse_dialogue_text,
 };
 use rassa_shape::{GlyphInfo, ShapeEngine, ShapeRequest, ShapingMode};
+use rassa_unibreak::{LineBreakOpportunity, classify_line_breaks};
 use rassa_unicode::BidiDirection;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,7 +89,7 @@ impl LayoutEngine {
             family: style.font_name.clone(),
             style: None,
         });
-        let lines = parsed_text
+        let explicit_lines = parsed_text
             .lines
             .iter()
             .map(|line| {
@@ -101,6 +104,12 @@ impl LayoutEngine {
                 )
             })
             .collect::<RassaResult<Vec<_>>>()?;
+        let wrap_style = parsed_text
+            .wrap_style
+            .unwrap_or(track.wrap_style)
+            .clamp(0, 3);
+        let max_width = auto_wrap_width(track, event, style);
+        let lines = wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?;
 
         Ok(LayoutEvent {
             event_index,
@@ -178,28 +187,37 @@ fn layout_line_from_text<P: FontProvider>(
             });
             continue;
         }
-        let shaped = shaper.shape_text(
+        let shaped_chunks = split_text_by_font(
+            &span.text,
             provider,
-            &ShapeRequest::new(&span.text, &span.style.font_name)
-                .with_style(font_style_name(&span.style).unwrap_or_default())
-                .with_language(language)
-                .with_font_size(span.style.font_size as f32)
-                .with_mode(shaping_mode),
-        )?;
-        for shaped_run in shaped.runs {
-            line_direction = shaped_run.direction;
-            runs.push(LayoutGlyphRun {
-                text: shaped_run.text,
-                direction: shaped_run.direction,
-                font_family: font.family.clone(),
-                font: font.clone(),
-                width: text_run_width(&shaped_run.glyphs, &span.style),
-                glyphs: shaped_run.glyphs,
-                style: span.style.clone(),
-                transforms: span.transforms.clone(),
-                karaoke: span.karaoke,
-                drawing: None,
-            });
+            &span.style.font_name,
+            font_style_name(&span.style),
+        );
+        for (chunk_text, chunk_font) in shaped_chunks {
+            let shaped = shaper.shape_text(
+                provider,
+                &ShapeRequest::new(&chunk_text, &chunk_font.family)
+                    .with_style(chunk_font.style.clone().unwrap_or_default())
+                    .with_language(language)
+                    .with_font_size(span.style.font_size as f32)
+                    .with_mode(shaping_mode),
+            )?;
+            for shaped_run in shaped.runs {
+                line_direction = shaped_run.direction;
+                let run_font = shaped_run.font.clone();
+                runs.push(LayoutGlyphRun {
+                    text: shaped_run.text,
+                    direction: shaped_run.direction,
+                    font_family: run_font.family.clone(),
+                    font: run_font,
+                    width: text_run_width(&shaped_run.glyphs, &span.style),
+                    glyphs: shaped_run.glyphs,
+                    style: span.style.clone(),
+                    transforms: span.transforms.clone(),
+                    karaoke: span.karaoke,
+                    drawing: None,
+                });
+            }
         }
     }
 
@@ -216,6 +234,199 @@ fn layout_line_from_text<P: FontProvider>(
     })
 }
 
+fn auto_wrap_width(track: &ParsedTrack, event: &ParsedEvent, style: &ParsedStyle) -> f32 {
+    if track.play_res_x == ParsedTrack::default().play_res_x
+        && track.play_res_y == ParsedTrack::default().play_res_y
+        && track.layout_res_x == 0
+        && track.layout_res_y == 0
+    {
+        return f32::INFINITY;
+    }
+    let margin_l = resolve_margin(event.margin_l, style.margin_l).max(0);
+    let margin_r = resolve_margin(event.margin_r, style.margin_r).max(0);
+    (track.play_res_x - margin_l - margin_r).max(0) as f32
+}
+
+fn wrap_layout_lines(
+    lines: Vec<LayoutLine>,
+    max_width: f32,
+    wrap_style: i32,
+    language: &str,
+) -> RassaResult<Vec<LayoutLine>> {
+    if wrap_style == 2 || max_width <= 0.0 || !max_width.is_finite() {
+        return Ok(lines);
+    }
+
+    let mut wrapped = Vec::new();
+    for line in lines {
+        wrapped.extend(wrap_layout_line(line, max_width, language)?);
+    }
+    Ok(wrapped)
+}
+
+#[derive(Clone, Debug)]
+struct LayoutPiece {
+    text: String,
+    run: LayoutGlyphRun,
+    width: f32,
+    char_index: usize,
+}
+
+fn wrap_layout_line(
+    line: LayoutLine,
+    max_width: f32,
+    language: &str,
+) -> RassaResult<Vec<LayoutLine>> {
+    if line.width <= max_width || line.text.chars().count() <= 1 {
+        return Ok(vec![line]);
+    }
+
+    let breaks = classify_line_breaks(&line.text, Some(language))?;
+    let pieces = line_to_pieces(&line);
+    if pieces.len() <= 1 {
+        return Ok(vec![line]);
+    }
+
+    let mut output = Vec::new();
+    let mut current: Vec<LayoutPiece> = Vec::new();
+    let mut current_width = 0.0_f32;
+    let mut last_break_pos: Option<usize> = None;
+
+    for piece in pieces {
+        current_width += piece.width;
+        current.push(piece);
+        let char_index = current.last().map(|piece| piece.char_index).unwrap_or(0);
+        if matches!(
+            breaks.get(char_index),
+            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
+        ) {
+            last_break_pos = Some(current.len());
+        }
+
+        if current_width > max_width && current.len() > 1 {
+            let split_at = last_break_pos
+                .filter(|pos| *pos > 0 && *pos < current.len())
+                .unwrap_or(current.len() - 1);
+            let mut remainder = current.split_off(split_at);
+            trim_wrapped_line_edges(&mut current, false);
+            if !current.is_empty() {
+                output.push(line_from_pieces(&line, &current));
+            }
+            trim_wrapped_line_edges(&mut remainder, true);
+            current_width = pieces_width(&remainder);
+            current = remainder;
+            last_break_pos = last_allowed_break_pos(&current, &breaks);
+        }
+    }
+
+    trim_wrapped_line_edges(&mut current, false);
+    if !current.is_empty() {
+        output.push(line_from_pieces(&line, &current));
+    }
+
+    if output.is_empty() {
+        Ok(vec![line])
+    } else {
+        Ok(output)
+    }
+}
+
+fn line_to_pieces(line: &LayoutLine) -> Vec<LayoutPiece> {
+    let mut pieces = Vec::new();
+    let mut char_index = 0_usize;
+    for run in &line.runs {
+        let chars = run.text.chars().collect::<Vec<_>>();
+        if run.drawing.is_some() || chars.is_empty() || chars.len() != run.glyphs.len() {
+            pieces.push(LayoutPiece {
+                text: run.text.clone(),
+                run: run.clone(),
+                width: run.width,
+                char_index: char_index + chars.len().saturating_sub(1),
+            });
+            char_index += chars.len();
+            continue;
+        }
+
+        let scale_x = run.style.scale_x.max(0.0) as f32;
+        let spacing = if run.style.spacing.is_finite() {
+            run.style.spacing as f32 * scale_x
+        } else {
+            0.0
+        };
+        for (offset, (character, glyph)) in chars.into_iter().zip(run.glyphs.iter()).enumerate() {
+            let mut piece_run = run.clone();
+            piece_run.text = character.to_string();
+            piece_run.glyphs = vec![glyph.clone()];
+            piece_run.width = glyph.x_advance * scale_x + spacing;
+            pieces.push(LayoutPiece {
+                text: character.to_string(),
+                width: piece_run.width,
+                run: piece_run,
+                char_index: char_index + offset,
+            });
+        }
+        char_index += run.text.chars().count();
+    }
+    pieces
+}
+
+fn trim_wrapped_line_edges(pieces: &mut Vec<LayoutPiece>, trim_leading: bool) {
+    while pieces
+        .last()
+        .is_some_and(|piece| piece.text.chars().all(char::is_whitespace))
+    {
+        pieces.pop();
+    }
+    if trim_leading {
+        let leading = pieces
+            .iter()
+            .take_while(|piece| piece.text.chars().all(char::is_whitespace))
+            .count();
+        if leading > 0 {
+            pieces.drain(0..leading);
+        }
+    }
+}
+
+fn pieces_width(pieces: &[LayoutPiece]) -> f32 {
+    pieces.iter().map(|piece| piece.width).sum()
+}
+
+fn last_allowed_break_pos(
+    pieces: &[LayoutPiece],
+    breaks: &[LineBreakOpportunity],
+) -> Option<usize> {
+    pieces.iter().enumerate().rev().find_map(|(index, piece)| {
+        matches!(
+            breaks.get(piece.char_index),
+            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
+        )
+        .then_some(index + 1)
+    })
+}
+
+fn line_from_pieces(source: &LayoutLine, pieces: &[LayoutPiece]) -> LayoutLine {
+    let runs = pieces
+        .iter()
+        .map(|piece| piece.run.clone())
+        .collect::<Vec<_>>();
+    let text = pieces
+        .iter()
+        .map(|piece| piece.text.as_str())
+        .collect::<String>();
+    let glyph_count = runs.iter().map(|run| run.glyphs.len()).sum();
+    let width = runs.iter().map(|run| run.width).sum();
+    LayoutLine {
+        event_index: source.event_index,
+        style_index: source.style_index,
+        text,
+        direction: source.direction,
+        glyph_count,
+        width,
+        runs,
+    }
+}
+
 fn text_run_width(glyphs: &[GlyphInfo], style: &ParsedSpanStyle) -> f32 {
     let scale_x = style.scale_x.max(0.0) as f32;
     let spacing = if style.spacing.is_finite() {
@@ -227,6 +438,55 @@ fn text_run_width(glyphs: &[GlyphInfo], style: &ParsedSpanStyle) -> f32 {
         .iter()
         .map(|glyph| glyph.x_advance * scale_x + spacing)
         .sum()
+}
+
+fn split_text_by_font<P: FontProvider>(
+    text: &str,
+    provider: &P,
+    family: &str,
+    style: Option<String>,
+) -> Vec<(String, FontMatch)> {
+    let base_font = provider.resolve(&FontQuery {
+        family: family.to_string(),
+        style: style.clone(),
+    });
+    let mut chunks: Vec<(String, FontMatch)> = Vec::new();
+
+    for character in text.chars() {
+        let font = if base_font.path.is_none()
+            || character.is_whitespace()
+            || character.is_control()
+            || base_font
+                .path
+                .as_ref()
+                .is_some_and(|_| font_match_supports_text(&base_font, &character.to_string()))
+        {
+            base_font.clone()
+        } else {
+            resolve_system_font_for_char(family, style.as_deref(), character)
+                .map(|(resolved_family, resolved_path)| FontMatch {
+                    family: resolved_family,
+                    path: resolved_path,
+                    style: style.clone(),
+                    provider: base_font.provider,
+                })
+                .unwrap_or_else(|| base_font.clone())
+        };
+
+        if let Some((chunk, chunk_font)) = chunks.last_mut() {
+            if same_font_match(chunk_font, &font) {
+                chunk.push(character);
+                continue;
+            }
+        }
+        chunks.push((character.to_string(), font));
+    }
+
+    chunks
+}
+
+fn same_font_match(left: &FontMatch, right: &FontMatch) -> bool {
+    left.family == right.family && left.path == right.path && left.style == right.style
 }
 
 fn font_style_name(style: &ParsedSpanStyle) -> Option<String> {
@@ -277,7 +537,7 @@ fn normalize_justify(justify: i32, alignment: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rassa_fonts::{FontconfigProvider, NullFontProvider};
+    use rassa_fonts::{FontconfigProvider, NullFontProvider, font_match_supports_text};
     use rassa_parse::{ParsedKaraokeMode, ParsedTrack, parse_script_text};
 
     fn parse_track(input: &str) -> ParsedTrack {
@@ -323,6 +583,84 @@ mod tests {
     }
 
     #[test]
+    fn layout_wraps_long_text_at_unicode_line_breaks() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 20
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,1,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert!(layout.lines.len() > 1);
+        assert!(layout.lines.iter().all(|line| line.width <= 16.0));
+        assert!(layout.lines.iter().all(|line| !line.text.starts_with(' ')));
+        assert!(layout.lines.iter().all(|line| !line.text.ends_with(' ')));
+    }
+
+    #[test]
+    fn layout_q2_disables_automatic_wrapping() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 20
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,1,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\q2}alpha beta gamma delta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.lines.len(), 1);
+        assert!(layout.lines[0].width > 16.0);
+    }
+
+    #[test]
+    fn layout_wraps_cjk_using_unicode_line_break_opportunities() {
+        let track = parse_track(
+            "[Script Info]
+Language: ja
+PlayResX: 9
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,1,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert!(layout.lines.len() > 1);
+        assert!(layout.lines.iter().all(|line| line.width <= 5.0));
+    }
+
+    #[test]
     fn layout_applies_font_override_runs() {
         let track = parse_track(
             "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\fnDejaVu Sans}Hello{\\fnArial} world",
@@ -337,6 +675,31 @@ mod tests {
         assert_eq!(layout.lines[0].runs.len(), 2);
         assert_eq!(layout.lines[0].runs[0].style.font_name, "DejaVu Sans");
         assert_eq!(layout.lines[0].runs[1].style.font_name, "Arial");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn layout_splits_cjk_text_to_covered_fallback_font_run() {
+        if resolve_system_font_for_char("DejaVu Sans", None, '日').is_none() {
+            eprintln!("skipping: system fontconfig has no CJK-capable fallback font");
+            return;
+        }
+        let track = parse_track(
+            "[Script Info]\nLanguage: ja\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,DejaVu Sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,abc 日本語",
+        );
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        let cjk_run = layout.lines[0]
+            .runs
+            .iter()
+            .find(|run| run.text.contains('日'))
+            .expect("CJK text should be retained in a glyph run");
+        assert!(font_match_supports_text(&cjk_run.font, "日本語"));
+        assert_ne!(cjk_run.font_family, "DejaVu Sans");
     }
 
     #[test]

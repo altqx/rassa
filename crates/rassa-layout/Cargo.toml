@@ -15,6 +15,7 @@ rassa-fonts = { path = "../rassa-fonts", version = "0.2.0" }
 rassa-parse = { path = "../rassa-parse", version = "0.2.0" }
 rassa-raster = { path = "../rassa-raster", version = "0.2.0" }
 rassa-shape = { path = "../rassa-shape", version = "0.2.0" }
+rassa-unibreak = { path = "../rassa-unibreak", version = "0.2.0" }
 rassa-unicode = { path = "../rassa-unicode", version = "0.2.0" }
 
 [lib]

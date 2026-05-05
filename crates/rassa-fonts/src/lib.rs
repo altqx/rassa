@@ -168,7 +168,7 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
     database.load_system_fonts();
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(path) = fontconfig_match_path(family) {
+    if let Some(path) = fontconfig_match_path(family, style, None) {
         let resolved_family = load_face_metadata(&path)
             .map(|(family, _)| family)
             .unwrap_or_else(|| family.to_owned());
@@ -230,6 +230,53 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
     Some((resolved_family, path))
 }
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+pub fn resolve_system_font_for_char(
+    family: &str,
+    style: Option<&str>,
+    character: char,
+) -> Option<(String, Option<PathBuf>)> {
+    let path = fontconfig_match_path(family, style, Some(character))?;
+    if !font_file_supports_char(&path, character) {
+        return None;
+    }
+    let resolved_family = load_face_metadata(&path)
+        .map(|(family, _)| family)
+        .unwrap_or_else(|| family.to_owned());
+    Some((resolved_family, Some(path)))
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"), not(target_arch = "wasm32"))))]
+pub fn resolve_system_font_for_char(
+    _family: &str,
+    _style: Option<&str>,
+    _character: char,
+) -> Option<(String, Option<PathBuf>)> {
+    None
+}
+
+pub fn font_match_supports_text(font: &FontMatch, text: &str) -> bool {
+    let Some(path) = &font.path else {
+        return false;
+    };
+    text.chars()
+        .filter(|character| !character.is_whitespace() && !character.is_control())
+        .all(|character| font_file_supports_char(path, character))
+}
+
+pub fn font_file_supports_char(path: &Path, character: char) -> bool {
+    let Ok(data) = fs::read(path) else {
+        return false;
+    };
+    let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
+    (0..face_count).any(|index| {
+        ttf_parser::Face::parse(&data, index)
+            .ok()
+            .and_then(|face| face.glyph_index(character))
+            .is_some_and(|glyph| glyph.0 != 0)
+    })
+}
+
 #[cfg(windows)]
 fn windows_known_font_path(family: &str) -> Option<PathBuf> {
     let normalized = normalize_font_key(family);
@@ -255,9 +302,14 @@ fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn fontconfig_match_path(family: &str) -> Option<PathBuf> {
+fn fontconfig_match_path(
+    family: &str,
+    style: Option<&str>,
+    character: Option<char>,
+) -> Option<PathBuf> {
+    let pattern = fontconfig_pattern(family, style, character);
     let output = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", family])
+        .args(["-f", "%{file}", &pattern])
         .output()
         .ok()?;
     if !output.status.success() || output.stdout.is_empty() {
@@ -265,6 +317,20 @@ fn fontconfig_match_path(family: &str) -> Option<PathBuf> {
     }
     let path = PathBuf::from(String::from_utf8(output.stdout).ok()?);
     path.exists().then_some(path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fontconfig_pattern(family: &str, style: Option<&str>, character: Option<char>) -> String {
+    let mut pattern = family.to_owned();
+    if let Some(style) = style.filter(|value| !value.trim().is_empty()) {
+        pattern.push_str(":style=");
+        pattern.push_str(style.trim());
+    }
+    if let Some(character) = character {
+        pattern.push_str(":charset=");
+        pattern.push_str(&format!("{:x}", character as u32));
+    }
+    pattern
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -523,6 +589,42 @@ mod tests {
         let result = provider.resolve(&FontQuery::new("sans"));
 
         assert_eq!(result.path, Some(expected_path));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn fontconfig_provider_respects_requested_weight_style() {
+        let expected = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "DejaVu Sans:style=Bold"])
+            .output()
+            .expect("fc-match should be available with fontconfig");
+        assert!(expected.status.success());
+        let expected_path = PathBuf::from(String::from_utf8(expected.stdout).expect("utf8 path"));
+        if !expected_path.exists()
+            || expected_path
+                .file_name()
+                .is_none_or(|name| !name.to_string_lossy().contains("Bold"))
+        {
+            eprintln!("skipping: system fontconfig has no DejaVu Sans Bold fixture");
+            return;
+        }
+
+        let provider = FontconfigProvider::new();
+        let result = provider.resolve(&FontQuery::new("DejaVu Sans").with_style("Bold"));
+
+        assert_eq!(result.path, Some(expected_path));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn fontconfig_can_resolve_cjk_font_for_character_coverage() {
+        let Some(result) = resolve_system_font_for_char("DejaVu Sans", None, '日') else {
+            eprintln!("skipping: system fontconfig has no CJK-capable fallback font");
+            return;
+        };
+
+        assert!(result.1.as_ref().is_some_and(|path| path.exists()));
+        assert!(font_file_supports_char(result.1.as_ref().unwrap(), '日'));
     }
 
     #[test]
