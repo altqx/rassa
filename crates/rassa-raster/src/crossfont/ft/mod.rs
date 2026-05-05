@@ -62,6 +62,7 @@ struct FaceLoadingProperties {
     pixelsize_fixup_factor: Option<f64>,
     ft_face: Rc<FtFace>,
     rgba: Rgba,
+    fontconfig_charset: Option<CharSet>,
 }
 
 impl fmt::Debug for FaceLoadingProperties {
@@ -396,6 +397,7 @@ impl Rasterize for FreeTypeRasterizer {
                 pixelsize_fixup_factor: None,
                 ft_face,
                 rgba: Rgba::Unknown,
+                fontconfig_charset: None,
             },
         );
         Ok(key)
@@ -418,6 +420,7 @@ impl Rasterize for FreeTypeRasterizer {
                 pixelsize_fixup_factor: None,
                 ft_face,
                 rgba: Rgba::Unknown,
+                fontconfig_charset: None,
             },
         );
         Ok(key)
@@ -595,10 +598,15 @@ impl FreeTypeRasterizer {
 
     fn face_for_glyph(&mut self, glyph_key: GlyphKey) -> FontKey {
         if let Some(face) = self.loader.faces.get(&glyph_key.font_key) {
-            if face
-                .ft_face
-                .get_char_index(glyph_key.character as usize)
-                .is_some()
+            let allowed_by_fontconfig = face
+                .fontconfig_charset
+                .as_ref()
+                .is_none_or(|charset| charset.has_char(glyph_key.character));
+            if allowed_by_fontconfig
+                && face
+                    .ft_face
+                    .get_char_index(glyph_key.character as usize)
+                    .is_some()
             {
                 return glyph_key.font_key;
             }
@@ -928,6 +936,7 @@ impl FreeTypeLoader {
             let pixelsize_fixup_factor = pattern.pixelsizefixupfactor().next();
 
             let rgba = pattern.rgba().next().unwrap_or(Rgba::Unknown);
+            let fontconfig_charset = pattern.get_charset().map(ToOwned::to_owned);
 
             let face = FaceLoadingProperties {
                 load_flags: Self::ft_load_flags(pattern),
@@ -940,6 +949,7 @@ impl FreeTypeLoader {
                 pixelsize_fixup_factor,
                 ft_face,
                 rgba,
+                fontconfig_charset,
             };
 
             debug!("Loaded Face {face:?}");

@@ -26,8 +26,8 @@ use core_text::font_descriptor::{
     kCTFontDefaultOrientation, kCTFontEnabledAttribute,
 };
 use core_text::font_manager::create_font_descriptor;
-use objc2::rc::{Retained, autoreleasepool};
-use objc2_foundation::{NSNumber, NSObject, NSObjectProtocol, NSString, NSUserDefaults, ns_string};
+use objc2::rc::autoreleasepool;
+use objc2_foundation::{NSNumber, NSString, NSUserDefaults, ns_string};
 
 use log::{trace, warn};
 use once_cell::sync::Lazy;
@@ -43,6 +43,7 @@ use super::{
 /// According to the documentation, the index of 0 must be a missing glyph character:
 /// https://developer.apple.com/fonts/TrueType-Reference-Manual/RM07/appendixB.html
 const MISSING_GLYPH_INDEX: u32 = 0;
+const NON_ANTIALIASED_BOUNDS_PADDING: f64 = 8.0;
 
 /// Font descriptor.
 ///
@@ -341,44 +342,34 @@ fn descriptors_for_family(family: &str) -> Vec<Descriptor> {
 // enabled.
 static FONT_SMOOTHING_ENABLED: Lazy<bool> = Lazy::new(|| {
     autoreleasepool(|_| {
-        let value = unsafe {
-            NSUserDefaults::standardUserDefaults().objectForKey(ns_string!("AppleFontSmoothing"))
-        };
+        let value =
+            NSUserDefaults::standardUserDefaults().objectForKey(ns_string!("AppleFontSmoothing"));
 
         let value = match value {
             Some(value) => value,
             None => return true,
         };
 
-        // SAFETY: The values in `NSUserDefaults` are always subclasses of
-        // `NSObject`.
-        let value: Retained<NSObject> = unsafe { Retained::cast(value) };
+        match value.downcast::<NSNumber>() {
+            Ok(value) => {
+                // NSNumber's objCType method returns one of these strings depending on the size:
+                // q = quad (long long), l = long, i = int, s = short.
+                // This is done to reject booleans, which are NSNumbers with an objCType of "c", but
+                // macOS does not treat them the same as an integer 0 or 1 for this setting,
+                // it just ignores it.
+                let int_specifiers: [&[u8]; 4] = [b"q", b"l", b"i", b"s"];
 
-        if value.is_kind_of::<NSNumber>() {
-            // SAFETY: Just checked that the value is a NSNumber
-            let value: Retained<NSNumber> = unsafe { Retained::cast(value) };
+                let encoding = unsafe { CStr::from_ptr(value.objCType().as_ptr()).to_bytes() };
+                if !int_specifiers.contains(&encoding) {
+                    return true;
+                }
 
-            // NSNumber's objCType method returns one of these strings depending on the size:
-            // q = quad (long long), l = long, i = int, s = short.
-            // This is done to reject booleans, which are NSNumbers with an objCType of "c", but
-            // macOS does not treat them the same as an integer 0 or 1 for this setting,
-            // it just ignores it.
-            let int_specifiers: [&[u8]; 4] = [b"q", b"l", b"i", b"s"];
-
-            let encoding = unsafe { CStr::from_ptr(value.objCType().as_ptr()).to_bytes() };
-            if !int_specifiers.contains(&encoding) {
-                return true;
+                value.integerValue() != 0
             }
-
-            let smoothing = value.integerValue();
-            smoothing != 0
-        } else if value.is_kind_of::<NSString>() {
-            // SAFETY: Just checked that the value is a NSString
-            let value: Retained<NSString> = unsafe { Retained::cast(value) };
-            let smoothing = unsafe { value.integerValue() };
-            smoothing != 0
-        } else {
-            true
+            Err(value) => match value.downcast::<NSString>() {
+                Ok(value) => value.integerValue() != 0,
+                Err(_) => true,
+            },
         }
     })
 });
@@ -451,11 +442,24 @@ impl Font {
             .ct_font
             .get_bounding_rects_for_glyphs(kCTFontDefaultOrientation, &[glyph_index as CGGlyph]);
 
-        let rasterized_left = bounds.origin.x.floor() as i32;
-        let rasterized_width =
-            (bounds.origin.x - f64::from(rasterized_left) + bounds.size.width).ceil() as u32;
-        let rasterized_descent = (-bounds.origin.y).ceil() as i32;
-        let rasterized_ascent = (bounds.size.height + bounds.origin.y).ceil() as i32;
+        let antialias = macos_antialias_enabled();
+        let bounds_padding = if antialias {
+            0.0
+        } else {
+            // CTFontGetBoundingRectsForGlyphs describes the outline bounds. For
+            // pixel-hinted, non-antialiased rendering CoreGraphics can draw outside
+            // that rectangle, so keep a generous guard band instead of cropping
+            // hinted stems at the cell edge.
+            NON_ANTIALIASED_BOUNDS_PADDING
+        };
+        let rasterized_left = (bounds.origin.x - bounds_padding).floor() as i32;
+        let rasterized_width = ((bounds.origin.x + bounds.size.width + bounds_padding).ceil()
+            as i32
+            - rasterized_left)
+            .max(0) as u32;
+        let rasterized_descent = (-bounds.origin.y + bounds_padding).ceil() as i32;
+        let rasterized_ascent =
+            (bounds.size.height + bounds.origin.y + bounds_padding).ceil() as i32;
         let rasterized_height = (rasterized_descent + rasterized_ascent) as u32;
 
         if rasterized_width == 0 || rasterized_height == 0 {
@@ -499,7 +503,6 @@ impl Font {
         cg_context.set_should_subpixel_quantize_fonts(true);
         cg_context.set_allows_font_subpixel_positioning(true);
         cg_context.set_should_subpixel_position_fonts(true);
-        let antialias = macos_antialias_enabled();
         cg_context.set_allows_antialiasing(antialias);
         cg_context.set_should_antialias(antialias);
 
