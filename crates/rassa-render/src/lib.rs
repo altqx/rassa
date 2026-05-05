@@ -1249,14 +1249,14 @@ fn transform_event_planes(
         return planes;
     }
 
-    let matrix = TransformMatrix::from_ass_transform(transform);
+    let matrix = ProjectiveMatrix::from_ass_transform_at_origin(transform, origin.0, origin.1);
     if matrix.is_identity() {
         return planes;
     }
 
     planes
         .into_iter()
-        .filter_map(|plane| transform_plane(plane, matrix, origin.0, origin.1))
+        .filter_map(|plane| transform_plane(plane, matrix))
         .collect()
 }
 
@@ -1407,65 +1407,114 @@ fn planes_bounds(planes: &[ImagePlane]) -> Option<Rect> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct TransformMatrix {
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
+struct ProjectiveMatrix {
+    m: [[f64; 3]; 3],
 }
 
-impl TransformMatrix {
-    fn from_ass_transform(transform: EventTransform) -> Self {
-        let rz = transform.rotation_z.to_radians();
-        let sin_z = rz.sin();
-        let cos_z = rz.cos();
-        let scale_x = transform.rotation_y.to_radians().cos().abs().max(0.05);
-        let scale_y = transform.rotation_x.to_radians().cos().abs().max(0.05);
+impl ProjectiveMatrix {
+    fn from_ass_transform_at_origin(
+        transform: EventTransform,
+        origin_x: f64,
+        origin_y: f64,
+    ) -> Self {
+        let frx = transform.rotation_x.to_radians();
+        let fry = transform.rotation_y.to_radians();
+        let frz = transform.rotation_z.to_radians();
+        let sx = -frx.sin();
+        let cx = frx.cos();
+        let sy = fry.sin();
+        let cy = fry.cos();
+        let sz = -frz.sin();
+        let cz = frz.cos();
         let shear_x = finite_or_zero(transform.shear_x);
         let shear_y = finite_or_zero(transform.shear_y);
 
-        // Local ASS-style approximation before z-rotation:
-        // x/y rotations flatten the bitmap along their projected axes; fax/fay shear
-        // in script space. This is intentionally applied around \org/default origin.
-        let local_a = scale_x;
-        let local_b = shear_x * scale_x;
-        let local_c = shear_y * scale_y;
-        let local_d = scale_y;
+        let x2_dx = cz - shear_y * sz;
+        let x2_dy = shear_x * cz - sz;
+        let y2_dx = sz + shear_y * cz;
+        let y2_dy = shear_x * sz + cz;
+
+        let y3_dx = y2_dx * cx;
+        let y3_dy = y2_dy * cx;
+        let z3_dx = y2_dx * sx;
+        let z3_dy = y2_dy * sx;
+
+        let x4_dx = x2_dx * cy - z3_dx * sy;
+        let x4_dy = x2_dy * cy - z3_dy * sy;
+        let z4_dx = x2_dx * sy + z3_dx * cy;
+        let z4_dy = x2_dy * sy + z3_dy * cy;
+
+        // libass uses a camera distance of 20000 in 26.6 positioning units.
+        // Our render planes are in pixels, so use the equivalent pixel distance.
+        let dist = 20000.0 / 64.0;
+
+        let x_num_dx = dist * x4_dx + origin_x * z4_dx;
+        let x_num_dy = dist * x4_dy + origin_x * z4_dy;
+        let y_num_dx = dist * y3_dx + origin_y * z4_dx;
+        let y_num_dy = dist * y3_dy + origin_y * z4_dy;
+
+        let x_const = origin_x * dist - x_num_dx * origin_x - x_num_dy * origin_y;
+        let y_const = origin_y * dist - y_num_dx * origin_x - y_num_dy * origin_y;
+        let w_const = dist - z4_dx * origin_x - z4_dy * origin_y;
 
         Self {
-            a: cos_z * local_a - sin_z * local_c,
-            b: cos_z * local_b - sin_z * local_d,
-            c: sin_z * local_a + cos_z * local_c,
-            d: sin_z * local_b + cos_z * local_d,
+            m: [
+                [x_num_dx, x_num_dy, x_const],
+                [y_num_dx, y_num_dy, y_const],
+                [z4_dx, z4_dy, w_const],
+            ],
         }
     }
 
     fn is_identity(self) -> bool {
-        (self.a - 1.0).abs() < f64::EPSILON
-            && self.b.abs() < f64::EPSILON
-            && self.c.abs() < f64::EPSILON
-            && (self.d - 1.0).abs() < f64::EPSILON
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        self.m
+            .iter()
+            .zip(identity.iter())
+            .all(|(row, identity_row)| {
+                row.iter()
+                    .zip(identity_row.iter())
+                    .all(|(value, expected)| (*value - *expected).abs() < 1.0e-9)
+            })
     }
 
-    fn transform_point(self, x: f64, y: f64, origin_x: f64, origin_y: f64) -> (f64, f64) {
-        let dx = x - origin_x;
-        let dy = y - origin_y;
-        (
-            origin_x + self.a * dx + self.b * dy,
-            origin_y + self.c * dx + self.d * dy,
-        )
+    fn transform_point(self, x: f64, y: f64) -> (f64, f64) {
+        let tx = self.m[0][0] * x + self.m[0][1] * y + self.m[0][2];
+        let ty = self.m[1][0] * x + self.m[1][1] * y + self.m[1][2];
+        let tw = self.m[2][0] * x + self.m[2][1] * y + self.m[2][2];
+        if !tw.is_finite() || tw.abs() < 1.0e-6 {
+            return (tx, ty);
+        }
+        (tx / tw, ty / tw)
     }
 
     fn inverse(self) -> Option<Self> {
-        let determinant = self.a * self.d - self.b * self.c;
+        let m = self.m;
+        let determinant = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
         if determinant.abs() < 1.0e-6 || !determinant.is_finite() {
             return None;
         }
+        let inv_det = 1.0 / determinant;
         Some(Self {
-            a: self.d / determinant,
-            b: -self.b / determinant,
-            c: -self.c / determinant,
-            d: self.a / determinant,
+            m: [
+                [
+                    (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+                    (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+                    (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+                ],
+                [
+                    (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+                    (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+                    (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+                ],
+                [
+                    (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+                    (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+                    (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+                ],
+            ],
         })
     }
 }
@@ -1474,12 +1523,7 @@ fn finite_or_zero(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-fn transform_plane(
-    plane: ImagePlane,
-    matrix: TransformMatrix,
-    origin_x: f64,
-    origin_y: f64,
-) -> Option<ImagePlane> {
+fn transform_plane(plane: ImagePlane, matrix: ProjectiveMatrix) -> Option<ImagePlane> {
     if plane.size.width <= 0 || plane.size.height <= 0 || plane.bitmap.is_empty() {
         return Some(plane);
     }
@@ -1502,7 +1546,7 @@ fn transform_plane(
             f64::from(plane.destination.y + plane.size.height),
         ),
     ];
-    let transformed = corners.map(|(x, y)| matrix.transform_point(x, y, origin_x, origin_y));
+    let transformed = corners.map(|(x, y)| matrix.transform_point(x, y));
     let min_x = transformed
         .iter()
         .map(|(x, _)| *x)
@@ -1534,8 +1578,7 @@ fn transform_plane(
         for column in 0..width {
             let dest_x = f64::from(min_x) + column as f64 + 0.5;
             let dest_y = f64::from(min_y) + row as f64 + 0.5;
-            let (src_global_x, src_global_y) =
-                inverse.transform_point(dest_x, dest_y, origin_x, origin_y);
+            let (src_global_x, src_global_y) = inverse.transform_point(dest_x, dest_y);
             let src_x = src_global_x - f64::from(plane.destination.x) - 0.5;
             let src_y = src_global_y - f64::from(plane.destination.y) - 0.5;
             let value = sample_bitmap_bilinear(
@@ -2952,6 +2995,66 @@ mod tests {
             }
         }
         bounds
+    }
+
+    #[test]
+    fn projective_transform_keeps_frx_and_fry_axes_distinct() {
+        let origin = (320.0, 180.0);
+        let frx = ProjectiveMatrix::from_ass_transform_at_origin(
+            EventTransform {
+                rotation_x: 45.0,
+                ..EventTransform::default()
+            },
+            origin.0,
+            origin.1,
+        );
+        let fry = ProjectiveMatrix::from_ass_transform_at_origin(
+            EventTransform {
+                rotation_y: 45.0,
+                ..EventTransform::default()
+            },
+            origin.0,
+            origin.1,
+        );
+
+        let (frx_x, frx_y) = frx.transform_point(320.0, 140.0);
+        let (fry_x, fry_y) = fry.transform_point(360.0, 180.0);
+
+        assert!(
+            (frx_x - 320.0).abs() < 0.5,
+            "frx must not act like fry: {frx_x}"
+        );
+        assert!(
+            frx_y > 140.0,
+            "positive frx should pitch the top edge downward: {frx_y}"
+        );
+        assert!(
+            fry_x < 360.0,
+            "positive fry should yaw the right edge leftward: {fry_x}"
+        );
+        assert!(
+            (fry_y - 180.0).abs() < 0.5,
+            "fry must not act like frx: {fry_y}"
+        );
+    }
+
+    #[test]
+    fn projective_transform_uses_deep_org_as_perspective_lever_arm() {
+        let transform = EventTransform {
+            rotation_x: 55.0,
+            ..EventTransform::default()
+        };
+        let shallow = ProjectiveMatrix::from_ass_transform_at_origin(transform, 320.0, 240.0);
+        let deep = ProjectiveMatrix::from_ass_transform_at_origin(transform, 320.0, 420.0);
+
+        let (_, shallow_y) = shallow.transform_point(320.0, 240.0);
+        let (_, deep_y) = deep.transform_point(320.0, 240.0);
+
+        assert!((shallow_y - 240.0).abs() < 0.5);
+        assert!(
+            deep_y > 340.0,
+            "deep \\org below text should pull frx text down like libass, got y={deep_y}"
+        );
     }
 
     #[test]
