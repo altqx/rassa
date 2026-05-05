@@ -77,7 +77,6 @@ jobs:
           else
             crates=(
               rassa-core
-              rassa-unibreak-sys
               rassa-fonts
               rassa-parse
               rassa-unibreak
@@ -132,8 +131,6 @@ jobs:
             build-essential \
             libfontconfig1-dev \
             libfreetype6-dev \
-            libfribidi-dev \
-            libunibreak-dev \
             pkg-config
 
       - name: Install Rust toolchain
@@ -160,7 +157,6 @@ jobs:
 
           crates=(
             rassa-core
-            rassa-unibreak-sys
             rassa-fonts
             rassa-parse
             rassa-unibreak

@@ -30,8 +30,6 @@ jobs:
             build-essential \
             libfontconfig1-dev \
             libfreetype6-dev \
-            libfribidi-dev \
-            libunibreak-dev \
             pkg-config
 
       - name: Install Rust toolchain
@@ -258,8 +256,6 @@ jobs:
             build-essential \
             libfontconfig1-dev \
             libfreetype6-dev \
-            libfribidi-dev \
-            libunibreak-dev \
             pkg-config
 
       - name: Install Rust toolchain

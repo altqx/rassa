@@ -11,7 +11,7 @@ keywords.workspace = true
 
 [dependencies]
 iconv-native.workspace = true
-rassa-core = { path = "../rassa-core", version = "0.1.1" }
+rassa-core = { path = "../rassa-core", version = "0.2.0" }
 
 [lib]
 path = "src/lib.rs"
