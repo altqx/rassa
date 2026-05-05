@@ -10,9 +10,9 @@ readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core", version = "0.1.0" }
-rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
-rassa-shape = { path = "../rassa-shape", version = "0.1.0" }
+rassa-core = { path = "../rassa-core", version = "0.1.1" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.1.1" }
+rassa-shape = { path = "../rassa-shape", version = "0.1.1" }
 freetype-rs = "0.38.0"
 
 [lib]

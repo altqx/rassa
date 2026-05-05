@@ -19,7 +19,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
@@ -28,4 +28,5 @@ readme = "README.md"
 keywords = ["subtitles", "ass", "renderer", "libass", "rust"]
 
 [workspace.dependencies]
+iconv-native = "0.1.0"
 libc = "0.2"

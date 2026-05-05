@@ -14,8 +14,8 @@ build = "build.rs"
 pkg-config = "0.3"
 
 [dependencies]
-rassa-core = { path = "../rassa-core", version = "0.1.0" }
-rassa-unibreak = { path = "../rassa-unibreak", version = "0.1.0" }
+rassa-core = { path = "../rassa-core", version = "0.1.1" }
+rassa-unibreak = { path = "../rassa-unibreak", version = "0.1.1" }
 
 [lib]
 path = "src/lib.rs"

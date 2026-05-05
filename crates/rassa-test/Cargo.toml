@@ -12,9 +12,9 @@ publish = false
 
 [dependencies]
 png = "0.17"
-rassa-core = { path = "../rassa-core", version = "0.1.0" }
-rassa = { path = "../rassa", version = "0.1.0" }
-rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.0" }
-rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
-rassa-parse = { path = "../rassa-parse", version = "0.1.0" }
-rassa-render = { path = "../rassa-render", version = "0.1.0" }
+rassa-core = { path = "../rassa-core", version = "0.1.1" }
+rassa = { path = "../rassa", version = "0.1.1" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.1" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.1.1" }
+rassa-parse = { path = "../rassa-parse", version = "0.1.1" }
+rassa-render = { path = "../rassa-render", version = "0.1.1" }

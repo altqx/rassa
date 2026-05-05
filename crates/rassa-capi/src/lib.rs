@@ -18,7 +18,10 @@ use rassa_fonts::{
     AttachedFontProvider, DefaultFontFileProvider, FontAttachment as ProviderFontAttachment,
     FontProvider, FontconfigProvider, MergedFontProvider, NullFontProvider,
 };
-use rassa_parse::{ParsedAttachment, ParsedEvent, ParsedStyle, ParsedTrack, parse_script_bytes};
+use rassa_parse::{
+    ParsedAttachment, ParsedEvent, ParsedStyle, ParsedTrack, parse_script_bytes,
+    parse_script_bytes_with_codepage,
+};
 use rassa_render::RenderEngine;
 
 pub struct ASS_Library {
@@ -951,15 +954,16 @@ pub unsafe extern "C" fn ass_flush_events(track: *mut ASS_Track) {
 pub unsafe extern "C" fn ass_read_file(
     library: *mut ASS_Library,
     fname: *const c_char,
-    _codepage: *const c_char,
+    codepage: *const c_char,
 ) -> *mut ASS_Track {
     let Some(path) = string_option_from_ptr(fname) else {
         return ptr::null_mut();
     };
+    let codepage = string_option_from_ptr(codepage);
     let Ok(bytes) = fs::read(path) else {
         return ptr::null_mut();
     };
-    let Ok(parsed) = parse_script_bytes(&bytes) else {
+    let Ok(parsed) = parse_script_bytes_with_codepage(&bytes, codepage.as_deref()) else {
         return ptr::null_mut();
     };
     maybe_extract_fonts_to_library(library, &parsed.attachments);
@@ -973,14 +977,15 @@ pub unsafe extern "C" fn ass_read_memory(
     library: *mut ASS_Library,
     buf: *mut c_char,
     bufsize: usize,
-    _codepage: *const c_char,
+    codepage: *const c_char,
 ) -> *mut ASS_Track {
     if buf.is_null() {
         return ptr::null_mut();
     }
 
+    let codepage = string_option_from_ptr(codepage);
     let bytes = slice::from_raw_parts(buf as *const u8, bufsize);
-    let Ok(parsed) = parse_script_bytes(bytes) else {
+    let Ok(parsed) = parse_script_bytes_with_codepage(bytes, codepage.as_deref()) else {
         return ptr::null_mut();
     };
     maybe_extract_fonts_to_library(library, &parsed.attachments);
@@ -993,15 +998,16 @@ pub unsafe extern "C" fn ass_read_memory(
 pub unsafe extern "C" fn ass_read_styles(
     track: *mut ASS_Track,
     fname: *const c_char,
-    _codepage: *const c_char,
+    codepage: *const c_char,
 ) -> c_int {
     let Some(path) = string_option_from_ptr(fname) else {
         return 1;
     };
+    let codepage = string_option_from_ptr(codepage);
     let Ok(bytes) = fs::read(path) else {
         return 1;
     };
-    let Ok(parsed) = parse_script_bytes(&bytes) else {
+    let Ok(parsed) = parse_script_bytes_with_codepage(&bytes, codepage.as_deref()) else {
         return 1;
     };
     let Some(track_ref) = track.as_mut() else {

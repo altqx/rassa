@@ -11,7 +11,7 @@ keywords.workspace = true
 build = "build.rs"
 
 [dependencies]
-rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.0" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.1" }
 
 [lib]
 name = "ass"

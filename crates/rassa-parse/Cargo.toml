@@ -10,7 +10,8 @@ readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core", version = "0.1.0" }
+iconv-native.workspace = true
+rassa-core = { path = "../rassa-core", version = "0.1.1" }
 
 [lib]
 path = "src/lib.rs"

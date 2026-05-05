@@ -1,5 +1,5 @@
 use rassa_core::{
-    Point, RassaResult, Rect,
+    Point, RassaError, RassaResult, Rect,
     ass::{self, TrackType, YCbCrMatrix},
 };
 
@@ -384,6 +384,22 @@ impl Default for ParsedTrack {
 }
 
 pub fn parse_script_bytes(bytes: &[u8]) -> RassaResult<ParsedTrack> {
+    parse_script_bytes_with_codepage(bytes, None)
+}
+
+pub fn parse_script_bytes_with_codepage(
+    bytes: &[u8],
+    codepage: Option<&str>,
+) -> RassaResult<ParsedTrack> {
+    if let Some(codepage) = codepage.filter(|value| !value.trim().is_empty()) {
+        let text = iconv_native::decode(bytes, codepage).map_err(|error| {
+            RassaError::new(format!(
+                "failed to decode subtitle data from codepage {codepage:?}: {error}"
+            ))
+        })?;
+        return parse_script_text(&text);
+    }
+
     match std::str::from_utf8(bytes) {
         Ok(text) => parse_script_text(text),
         Err(_) => parse_script_text(&String::from_utf8_lossy(bytes)),
@@ -1902,6 +1918,22 @@ mod tests {
             track.styles[0].alignment,
             ass::VALIGN_SUB | ass::HALIGN_CENTER
         );
+    }
+
+    #[test]
+    fn decodes_legacy_codepage_bytes_before_parsing() {
+        let mut input = b"[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n".to_vec();
+        input.extend_from_slice(&[
+            68, 105, 97, 108, 111, 103, 117, 101, 58, 32, 48, 44, 48, 58, 48, 48, 58, 48, 48, 46,
+            48, 48, 44, 48, 58, 48, 48, 58, 48, 49, 46, 48, 48, 44, 68, 101, 102, 97, 117, 108,
+            116, 44, 44, 48, 44, 48, 44, 48, 44, 44, 147, 250, 150, 123, 140, 234,
+        ]);
+
+        let track = parse_script_bytes_with_codepage(&input, Some("SHIFT_JIS"))
+            .expect("Shift-JIS script should parse");
+
+        assert_eq!(track.events.len(), 1);
+        assert_eq!(track.events[0].text, "日本語");
     }
 
     #[test]

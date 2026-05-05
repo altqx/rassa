@@ -71,7 +71,7 @@ mod tests {
     use rassa_fonts::{AttachedFontProvider, FontAttachment, FontProvider};
     use std::{
         env,
-        ffi::{CString, c_char},
+        ffi::{CStr, CString, c_char},
         fs,
         path::PathBuf,
         process::Command,
@@ -1594,6 +1594,36 @@ mod tests {
             rassa_capi::ass_library_done(library);
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_memory_reencodes_legacy_codepage() {
+        let mut fixture = b"[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n".to_vec();
+        fixture.extend_from_slice(&[
+            68, 105, 97, 108, 111, 103, 117, 101, 58, 32, 48, 44, 48, 58, 48, 48, 58, 48, 48, 46,
+            48, 48, 44, 48, 58, 48, 48, 58, 48, 49, 46, 48, 48, 44, 68, 101, 102, 97, 117, 108,
+            116, 44, 44, 48, 44, 48, 44, 48, 44, 44, 147, 250, 150, 123, 140, 234,
+        ]);
+        let mut fixture: Vec<c_char> = fixture.into_iter().map(|byte| byte as c_char).collect();
+        let codepage = CString::new("SHIFT_JIS").expect("codepage cstring");
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_mut_ptr(),
+                fixture.len(),
+                codepage.as_ptr(),
+            );
+
+            assert!(!track.is_null());
+            assert_eq!((*track).n_events, 1);
+            let text = CStr::from_ptr((*(*track).events).Text).to_string_lossy();
+            assert_eq!(text, "日本語");
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
     }
 
     #[test]
