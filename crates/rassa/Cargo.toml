@@ -7,9 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 rassa-core = { path = "../rassa-core" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi" }
 rassa-fonts = { path = "../rassa-fonts" }
 rassa-parse = { path = "../rassa-parse" }
 rassa-render = { path = "../rassa-render" }
 
 [lib]
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]

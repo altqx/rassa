@@ -1668,8 +1668,8 @@ mod tests {
             "rassa-capi should remain an internal Rust rlib implementation, not a second public C cdylib"
         );
         assert!(
-            !root.join("pkgconfig/rassa.pc").exists(),
-            "rassa Rust ABI should be exposed through Cargo, not a misleading pkg-config C ABI"
+            root.join("pkgconfig/rassa.pc").exists(),
+            "new applications should be able to discover the native rassa shared library through pkg-config"
         );
     }
 
@@ -1694,8 +1694,8 @@ mod tests {
             "rassa Rust API should build as a normal Rust library"
         );
         assert!(
-            !rassa_toml.contains("cdylib"),
-            "rassa Rust ABI should not be exposed as another C ABI artifact"
+            rassa_toml.contains("crate-type = [\"rlib\", \"cdylib\"]"),
+            "rassa should build both the Rust rlib and native librassa.so for new applications"
         );
     }
 

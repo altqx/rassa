@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/..
+exec_prefix=${prefix}
+libdir=${prefix}/target/release
+includedir=${prefix}/include
+
+Name: rassa
+Description: rassa native C ABI shared library
+Version: 0.1.0
+Libs: -L${libdir} -lrassa
+Cflags: -I${includedir}

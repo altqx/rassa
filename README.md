@@ -1,10 +1,10 @@
 # rassa
 
-`rassa` is a clean-room Rust reimplementation of the libass subtitle rendering stack. The project is split into small Rust crates for parsing, font lookup, shaping, rasterization, layout, rendering, and C ABI compatibility.
+`rassa` is a Rust rewrite of the ASS subtitle rendering stack. The project is split into small Rust crates for parsing, font lookup, shaping, rasterization, layout, rendering, and C ABI packaging.
 
-The main compatibility goal is to provide a libass-style public C API and shared library that downstream applications can link against as `libass.so`, while keeping the implementation in Rust.
+The preferred integration target for new applications is the rassa-branded shared library, `librassa.so`, built from the `rassa` crate. A separate compatibility package can still build `libass.so` for applications that specifically need a libass-shaped linker target.
 
-> Status: early parity work. The public ABI surface is intended to look like libass, but rendering and feature parity are still being actively improved. Treat this as experimental until your own integration tests pass.
+> Status: experimental. `librassa.so` is the forward-looking ABI target and may evolve with rassa. `libass.so` is provided as a compatibility target, but this project does not promise to track every upstream libass behavior forever.
 
 ## Repository layout
 
@@ -15,13 +15,14 @@ The main compatibility goal is to provide a libass-style public C API and shared
 - `crates/rassa-raster` — Rust glyph rasterization helpers.
 - `crates/rassa-layout` — subtitle event layout.
 - `crates/rassa-render` — image-plane renderer.
-- `crates/rassa` — Rust API crate.
+- `crates/rassa` — Rust API crate and native shared-library target, producing `librassa.so`.
 - `crates/rassa-capi` — C ABI implementation exported from Rust.
 - `crates/rassa-libass-capi` — libass-compatible shared-library target named `ass`, producing `libass.so`.
 - `crates/rassa-check` — command-line checker/debug utility.
 - `crates/rassa-test` — compatibility and pixel-diff tests.
-- `include/ass` — public C headers compatible with libass-style consumers.
-- `pkgconfig/libass.pc` — pkg-config metadata for local development.
+- `include/ass` — current public C headers.
+- `pkgconfig/rassa.pc` — pkg-config metadata for the native rassa shared library.
+- `pkgconfig/libass.pc` — pkg-config metadata for the libass-compatible target.
 
 ## Requirements
 
@@ -37,29 +38,72 @@ Build all Rust crates:
 cargo build --workspace
 ```
 
-Build the release libass-compatible shared object:
+Build the release rassa shared object for new applications:
+
+```sh
+cargo build --release -p rassa
+```
+
+The native shared object is produced by Cargo as:
+
+```text
+target/release/librassa.so
+```
+
+Build the release libass-compatible shared object only when an application expects `libass.so` or `-lass`:
 
 ```sh
 cargo build --release -p rassa-libass-capi
 ```
 
-The shared object is produced by Cargo as:
+The compatibility shared object is produced by Cargo as:
 
 ```text
 target/release/libass.so
 ```
 
-The crate also sets the ELF SONAME to `libass.so` for libass-style dynamic linking.
+The compatibility crate also sets the ELF SONAME to `libass.so` for libass-style dynamic linking.
 
 Build the checker utility and C ABI crates used during development:
 
 ```sh
-cargo build --release -p rassa-check -p rassa-capi -p rassa-libass-capi
+cargo build --release -p rassa-check -p rassa -p rassa-libass-capi
 ```
 
-## C ABI usage (`libass.so`)
+## Native C ABI usage (`librassa.so`)
 
-The open-source integration path is the libass-compatible C ABI:
+Use this path for new applications that want to depend on rassa without making a strict libass compatibility promise:
+
+- Header include path: `include/`
+- Current public headers: `include/ass/ass.h` and `include/ass/ass_types.h`
+- Library name: `librassa.so`
+- Linker flag: `-lrassa`
+- pkg-config file: `pkgconfig/rassa.pc`
+
+For local development from the repository root:
+
+```sh
+cargo build --release -p rassa
+export PKG_CONFIG_PATH="$PWD/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+```
+
+Compile a C file against the rassa shared object:
+
+```sh
+cc example.c $(pkg-config --cflags --libs rassa) -Wl,-rpath,"$PWD/target/release" -o example
+```
+
+Or without pkg-config:
+
+```sh
+cc example.c -Iinclude -Ltarget/release -lrassa -Wl,-rpath,"$PWD/target/release" -o example
+```
+
+The current native C ABI reuses the same public entry points as the compatibility layer. New applications should link to `librassa.so` / `-lrassa` so their dependency is on rassa itself, not on the `libass.so` drop-in package name.
+
+## Compatibility C ABI usage (`libass.so`)
+
+Use this path only for applications or plugins that already expect a libass-shaped package:
 
 - Header include path: `include/`
 - Public headers: `include/ass/ass.h` and `include/ass/ass_types.h`
@@ -180,7 +224,7 @@ The Rust API is exposed through the workspace crates. For internal development, 
 rassa = { path = "crates/rassa" }
 ```
 
-The Rust API is not the same as the libass C ABI. Use `rassa-libass-capi` when you need `ass_*` symbols and `libass.so`; use the Rust crates when you want native Rust integration.
+The Rust API is not the same as either shared-library package. Use the `rassa` crate directly for native Rust integration, `librassa.so` for new C/C++ integrations, and `rassa-libass-capi` only when you need the `libass.so` package name.
 
 ## Verification commands
 
@@ -190,7 +234,7 @@ Common local checks:
 cargo fmt --all
 cargo test -q
 cargo clippy --all-targets -- -D warnings
-cargo build --release -p rassa-check -p rassa-capi -p rassa-libass-capi
+cargo build --release -p rassa-check -p rassa -p rassa-libass-capi
 ```
 
 Strict broad corpus pixel-diff gate:
@@ -216,7 +260,7 @@ RASSA_BROAD_FILTER=broad_box RASSA_STRICT_BROAD_PIXEL_DIFF=1 \
 
 ## Open-source contribution guidelines
 
-- Keep this project a clean-room Rust implementation. Do not vendor, compile, or wrap upstream libass C source in production code.
+- Keep this project a Rust rewrite. Do not vendor, compile, or wrap upstream libass C source in production code.
 - Upstream libass fixtures, public headers, and generated reference artifacts may be used as compatibility test oracles when their licensing allows it.
 - Keep ABI compatibility and rendering parity separate when reporting status: a symbol may exist before its behavior is fully compatible.
 - Add tests for compatibility fixes. Prefer small focused tests plus corpus coverage for renderer changes.

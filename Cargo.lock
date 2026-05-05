@@ -326,6 +326,7 @@ dependencies = [
 name = "rassa"
 version = "0.1.0"
 dependencies = [
+ "rassa-capi",
  "rassa-core",
  "rassa-fonts",
  "rassa-parse",
