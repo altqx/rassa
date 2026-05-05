@@ -638,6 +638,7 @@ pub fn parse_dialogue_text(
                 }
                 Some(next) => {
                     characters.next();
+                    buffer.push('\\');
                     buffer.push(next);
                 }
                 None => buffer.push(character),
@@ -1389,11 +1390,11 @@ fn parse_alpha_tag(value: &str, fallback: u8) -> u8 {
 }
 
 fn alpha_of(color: u32) -> u8 {
-    (color & 0xFF) as u8
+    ((color >> 24) & 0xFF) as u8
 }
 
 fn with_alpha(color: u32, alpha: u8) -> u32 {
-    (color & 0xFFFF_FF00) | u32::from(alpha)
+    (color & 0x00FF_FFFF) | (u32::from(alpha) << 24)
 }
 
 fn parse_override_bool(value: &str, fallback: bool) -> bool {
@@ -1990,6 +1991,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_text_preserves_unknown_literal_backslash_escapes() {
+        let style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("animated \\t and drawing \\p", &style, &[]);
+
+        assert_eq!(parsed.lines.len(), 1);
+        assert_eq!(parsed.lines[0].spans.len(), 1);
+        assert_eq!(
+            parsed.lines[0].spans[0].text,
+            "animated \\t and drawing \\p"
+        );
+    }
+
+    #[test]
+    fn override_alpha_tags_update_ass_alpha_byte() {
+        let style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\alpha&H40&\\1a&H00&\\3a&H20&\\4a&H80&}alpha",
+            &style,
+            &[],
+        );
+        let span_style = &parsed.lines[0].spans[0].style;
+
+        assert_eq!((span_style.primary_colour >> 24) & 0xff, 0x00);
+        assert_eq!((span_style.secondary_colour >> 24) & 0xff, 0x40);
+        assert_eq!((span_style.outline_colour >> 24) & 0xff, 0x20);
+        assert_eq!((span_style.back_colour >> 24) & 0xff, 0x80);
+    }
+
+    #[test]
     fn parses_rectangular_clip_overrides() {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\clip(10,20,30,40)}Clip", &base_style, &[]);
@@ -2297,7 +2327,7 @@ mod tests {
 
         assert_eq!(parsed.lines.len(), 1);
         assert_eq!(parsed.lines[0].spans.len(), 1);
-        assert_eq!(parsed.lines[0].spans[0].style.primary_colour, 0x0011_2280);
+        assert_eq!(parsed.lines[0].spans[0].style.primary_colour, 0x8011_2233);
         assert_eq!(parsed.lines[0].spans[0].style.back_colour, 0x0044_5566);
         assert_eq!(parsed.lines[0].spans[0].style.shadow, 3.5);
         assert_eq!(parsed.lines[0].spans[0].style.blur, 1.5);

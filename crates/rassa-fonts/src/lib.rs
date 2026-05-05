@@ -349,14 +349,36 @@ fn fontconfig_match_path(
 fn fontconfig_pattern(family: &str, style: Option<&str>, character: Option<char>) -> String {
     let mut pattern = family.to_owned();
     if let Some(style) = style.filter(|value| !value.trim().is_empty()) {
-        pattern.push_str(":style=");
-        pattern.push_str(style.trim());
+        let normalized = normalize_font_key(style);
+        if normalized.contains("bold") {
+            pattern.push_str(":weight=bold");
+        }
+        if normalized.contains("italic") || normalized.contains("oblique") {
+            pattern.push_str(":slant=italic");
+        }
+        if !normalized.contains("bold")
+            && !normalized.contains("italic")
+            && !normalized.contains("oblique")
+        {
+            pattern.push_str(":style=");
+            pattern.push_str(style.trim());
+        }
     }
     if let Some(character) = character {
         pattern.push_str(":charset=");
         pattern.push_str(&format!("{:x}", character as u32));
     }
     pattern
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn fontconfig_pattern_requests_weight_and_slant_for_bold_italic() {
+    let pattern = fontconfig_pattern("DejaVu Sans", Some("Bold Italic"), None);
+
+    assert!(pattern.contains(":weight=bold"));
+    assert!(pattern.contains(":slant=italic"));
+    assert!(!pattern.contains(":style=Bold Italic"));
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

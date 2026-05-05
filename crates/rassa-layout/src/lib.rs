@@ -239,8 +239,8 @@ fn auto_wrap_width(
     track: &ParsedTrack,
     event: &ParsedEvent,
     style: &ParsedStyle,
-    position: Option<(i32, i32)>,
-    alignment: i32,
+    _position: Option<(i32, i32)>,
+    _alignment: i32,
 ) -> f32 {
     if track.play_res_x == ParsedTrack::default().play_res_x
         && track.play_res_y == ParsedTrack::default().play_res_y
@@ -251,18 +251,7 @@ fn auto_wrap_width(
     }
     let margin_l = resolve_margin(event.margin_l, style.margin_l).max(0);
     let margin_r = resolve_margin(event.margin_r, style.margin_r).max(0);
-    let full_width = (track.play_res_x - margin_l - margin_r).max(0);
-    let Some((x, _)) = position else {
-        return full_width as f32;
-    };
-
-    let left = (x - margin_l).max(0);
-    let right = (track.play_res_x - margin_r - x).max(0);
-    match alignment & 0x3 {
-        ass::HALIGN_LEFT => right as f32,
-        ass::HALIGN_RIGHT => left as f32,
-        _ => (left.min(right) * 2).min(full_width) as f32,
-    }
+    (track.play_res_x - margin_l - margin_r).max(0) as f32
 }
 
 fn wrap_layout_lines(
@@ -277,7 +266,7 @@ fn wrap_layout_lines(
 
     let mut wrapped = Vec::new();
     for line in lines {
-        wrapped.extend(wrap_layout_line(line, max_width, language)?);
+        wrapped.extend(wrap_layout_line(line, max_width, wrap_style, language)?);
     }
     Ok(wrapped)
 }
@@ -293,6 +282,7 @@ struct LayoutPiece {
 fn wrap_layout_line(
     line: LayoutLine,
     max_width: f32,
+    wrap_style: i32,
     language: &str,
 ) -> RassaResult<Vec<LayoutLine>> {
     if line.width <= max_width || line.text.chars().count() <= 1 {
@@ -310,7 +300,7 @@ fn wrap_layout_line(
     let mut current_width = 0.0_f32;
     let mut last_break_pos: Option<usize> = None;
 
-    for piece in pieces {
+    for piece in pieces.iter().cloned() {
         current_width += piece.width;
         current.push(piece);
         let char_index = current.last().map(|piece| piece.char_index).unwrap_or(0);
@@ -342,11 +332,62 @@ fn wrap_layout_line(
         output.push(line_from_pieces(&line, &current));
     }
 
+    if wrap_style == 0 && output.len() == 2 {
+        if let Some(balanced) = balanced_two_line_wrap(&line, &pieces, &breaks, max_width) {
+            return Ok(balanced);
+        }
+    }
+
     if output.is_empty() {
         Ok(vec![line])
     } else {
         Ok(output)
     }
+}
+
+fn balanced_two_line_wrap(
+    source: &LayoutLine,
+    pieces: &[LayoutPiece],
+    breaks: &[LineBreakOpportunity],
+    max_width: f32,
+) -> Option<Vec<LayoutLine>> {
+    let total = pieces_width(pieces);
+    let mut best: Option<(usize, f32)> = None;
+    for index in 1..pieces.len() {
+        let previous = &pieces[index - 1];
+        if !matches!(
+            breaks.get(previous.char_index),
+            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
+        ) {
+            continue;
+        }
+        let left_width = pieces_width(&pieces[..index]);
+        let right_width = total - left_width;
+        if left_width <= 0.0
+            || right_width <= 0.0
+            || left_width > max_width
+            || right_width > max_width
+        {
+            continue;
+        }
+        let score = (left_width - right_width).abs();
+        if best.is_none_or(|(_, best_score)| score < best_score) {
+            best = Some((index, score));
+        }
+    }
+
+    let (split_at, _) = best?;
+    let mut first = pieces[..split_at].to_vec();
+    let mut second = pieces[split_at..].to_vec();
+    trim_wrapped_line_edges(&mut first, false);
+    trim_wrapped_line_edges(&mut second, true);
+    if first.is_empty() || second.is_empty() {
+        return None;
+    }
+    Some(vec![
+        line_from_pieces(source, &first),
+        line_from_pieces(source, &second),
+    ])
 }
 
 fn line_to_pieces(line: &LayoutLine) -> Vec<LayoutPiece> {
@@ -657,7 +698,7 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\q2}alpha beta gamm
     }
 
     #[test]
-    fn layout_wraps_positioned_center_text_within_anchor_space() {
+    fn layout_wraps_positioned_center_text_against_margins_not_anchor_space() {
         let track = parse_track(
             "[Script Info]
 PlayResX: 40
@@ -677,8 +718,8 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(10,20)\\an5\\q
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
 
-        assert!(layout.lines.len() > 1);
-        assert!(layout.lines.iter().all(|line| line.width <= 16.0));
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].text, "alpha beta gamma delta");
     }
 
     #[test]
