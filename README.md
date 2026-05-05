@@ -44,10 +44,17 @@ Build the release rassa shared object for new applications:
 cargo build --release -p rassa
 ```
 
-The native shared object is produced by Cargo as:
+The native shared library is produced by Cargo as:
 
 ```text
+# Linux
 target/release/librassa.so
+
+# Windows GNU target
+target/x86_64-pc-windows-gnu/release/rassa.dll
+
+# Web/wasm target
+target/wasm32-unknown-unknown/release/rassa.wasm
 ```
 
 Build the release libass-compatible shared object only when an application expects `libass.so` or `-lass`:
@@ -56,13 +63,20 @@ Build the release libass-compatible shared object only when an application expec
 cargo build --release -p rassa-libass-capi
 ```
 
-The compatibility shared object is produced by Cargo as:
+The compatibility shared library is produced by Cargo as:
 
 ```text
+# Linux
 target/release/libass.so
+
+# Windows GNU target
+target/x86_64-pc-windows-gnu/release/ass.dll
+
+# Web/wasm target
+target/wasm32-unknown-unknown/release/ass.wasm
 ```
 
-The compatibility crate also sets the ELF SONAME to `libass.so` for libass-style dynamic linking.
+The compatibility crate sets the ELF SONAME to `libass.so` only on ELF targets, so Windows DLL, Darwin dylib/check, and WebAssembly builds do not receive ELF-only linker flags.
 
 Build the checker utility and C ABI crates used during development:
 

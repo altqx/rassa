@@ -4,7 +4,7 @@ libdir=${prefix}/target/release
 includedir=${prefix}/include
 
 Name: libass
-Description: rassa clean-room libass-compatible C ABI library
+Description: rassa Rust rewrite libass-compatible C ABI library
 Version: 0.17.4
 Libs: -L${libdir} -lass
 Cflags: -I${includedir}

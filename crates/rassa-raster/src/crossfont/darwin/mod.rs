@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::fs;
 use std::iter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use core_foundation::array::{CFArray, CFIndex};
@@ -24,6 +25,7 @@ use core_text::font_descriptor::{
     self, CTFontDescriptor, SymbolicTraitAccessors, kCTFontColorGlyphsTrait,
     kCTFontDefaultOrientation, kCTFontEnabledAttribute,
 };
+use core_text::font_manager::create_font_descriptor;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_foundation::{NSNumber, NSObject, NSObjectProtocol, NSString, NSUserDefaults, ns_string};
 
@@ -135,6 +137,31 @@ impl crate::crossfont::Rasterize for CoreTextRasterizer {
             })
     }
 
+    fn load_font_path(&mut self, path: &Path, size: Size) -> Result<FontKey, Error> {
+        let bytes = fs::read(path).map_err(|error| {
+            Error::PlatformError(format!(
+                "failed to read CoreText font '{}': {error}",
+                path.display()
+            ))
+        })?;
+        self.load_font_bytes(&bytes, size)
+    }
+
+    fn load_font_bytes(&mut self, bytes: &[u8], size: Size) -> Result<FontKey, Error> {
+        let descriptor = create_font_descriptor(bytes)
+            .map_err(|_| Error::PlatformError("CoreText rejected font bytes".to_owned()))?;
+        let ct_font = ct_new_from_descriptor(&descriptor, f64::from(size.as_pt()));
+        let key = FontKey::next();
+        self.fonts.insert(
+            key,
+            Font {
+                ct_font,
+                fallbacks: Vec::new(),
+            },
+        );
+        Ok(key)
+    }
+
     /// Get rasterized glyph for given glyph key.
     fn get_glyph(&mut self, glyph: GlyphKey) -> Result<RasterizedGlyph, Error> {
         // Get loaded font.
@@ -159,6 +186,28 @@ impl crate::crossfont::Rasterize for CoreTextRasterizer {
         } else {
             Ok(glyph)
         }
+    }
+
+    fn get_glyph_id(
+        &mut self,
+        glyph: crate::crossfont::GlyphIdKey,
+    ) -> Result<RasterizedGlyph, Error> {
+        let font = self
+            .fonts
+            .get(&glyph.font_key)
+            .ok_or(Error::UnknownFontKey)?;
+        Ok(font.get_glyph('\0', glyph.glyph_id))
+    }
+
+    fn drop_font(&mut self, key: FontKey) -> Result<(), Error> {
+        self.fonts.remove(&key).ok_or(Error::UnknownFontKey)?;
+        self.keys.retain(|_, existing| *existing != key);
+        Ok(())
+    }
+
+    fn evict_cache(&mut self) {
+        self.fonts.clear();
+        self.keys.clear();
     }
 
     fn kerning(&mut self, _left: GlyphKey, _right: GlyphKey) -> (f32, f32) {
@@ -450,8 +499,9 @@ impl Font {
         cg_context.set_should_subpixel_quantize_fonts(true);
         cg_context.set_allows_font_subpixel_positioning(true);
         cg_context.set_should_subpixel_position_fonts(true);
-        cg_context.set_allows_antialiasing(true);
-        cg_context.set_should_antialias(true);
+        let antialias = macos_antialias_enabled();
+        cg_context.set_allows_antialiasing(antialias);
+        cg_context.set_should_antialias(antialias);
 
         // Set fill color to white for drawing the glyph.
         cg_context.set_rgb_fill_color(1.0, 1.0, 1.0, 1.0);
@@ -560,4 +610,10 @@ mod tests {
             }
         }
     }
+}
+
+fn macos_antialias_enabled() -> bool {
+    std::env::var_os("RASSA_CROSSFONT_MACOS_ANTIALIAS")
+        .and_then(|value| value.into_string().ok())
+        .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
 }

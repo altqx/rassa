@@ -5,14 +5,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::path::Path;
+use std::sync::Arc;
 
 use dwrote::{
-    DWRITE_GLYPH_RUN, FontCollection, FontFace, FontFallback, FontStretch, FontStyle, FontWeight,
-    GlyphOffset, GlyphRunAnalysis, TextAnalysisSource, TextAnalysisSourceMethods,
+    DWRITE_GLYPH_RUN, FontCollection, FontFace, FontFallback, FontFile, FontStretch, FontStyle,
+    FontWeight, GlyphOffset, GlyphRunAnalysis, TextAnalysisSource, TextAnalysisSourceMethods,
 };
 
 use winapi::shared::ntdef::{HRESULT, LOCALE_NAME_MAX_LENGTH};
-use winapi::um::dwrite;
+use winapi::um::dwrite::{self, DWRITE_FONT_SIMULATIONS_NONE};
 use winapi::um::winnls::GetUserDefaultLocaleName;
 
 use super::{
@@ -80,9 +82,9 @@ impl DirectWriteRasterizer {
         let bounds =
             glyph_analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1)?;
 
-        let buffer = BitmapBuffer::Rgb(
+        let buffer = BitmapBuffer::Rgb(normalize_cleartype_layout(
             glyph_analysis.create_alpha_texture(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1, bounds)?,
-        );
+        ));
 
         Ok(RasterizedGlyph {
             character,
@@ -93,6 +95,28 @@ impl DirectWriteRasterizer {
             advance: (0, 0),
             buffer,
         })
+    }
+
+    fn load_font_file(
+        &mut self,
+        font_file: FontFile,
+        family_name: String,
+    ) -> Result<FontKey, Error> {
+        let face = font_file
+            .create_face(0, DWRITE_FONT_SIMULATIONS_NONE)
+            .map_err(Error::from)?;
+        let key = FontKey::next();
+        self.fonts.insert(
+            key,
+            Font {
+                face,
+                family_name,
+                weight: FontWeight::Regular,
+                style: FontStyle::Normal,
+                stretch: FontStretch::Normal,
+            },
+        );
+        Ok(key)
     }
 
     fn get_loaded_font(&self, font_key: FontKey) -> Result<&Font, Error> {
@@ -238,6 +262,23 @@ impl crate::crossfont::Rasterize for DirectWriteRasterizer {
         Ok(key)
     }
 
+    fn load_font_path(&mut self, path: &Path, _size: Size) -> Result<FontKey, Error> {
+        let font_file = FontFile::new_from_path(path).ok_or_else(|| {
+            Error::PlatformError(format!(
+                "failed to load DirectWrite font '{}'",
+                path.display()
+            ))
+        })?;
+        self.load_font_file(font_file, path.display().to_string())
+    }
+
+    fn load_font_bytes(&mut self, bytes: &[u8], _size: Size) -> Result<FontKey, Error> {
+        let font_file = FontFile::new_from_buffer(Arc::new(bytes.to_vec())).ok_or_else(|| {
+            Error::PlatformError("failed to load DirectWrite font from bytes".to_owned())
+        })?;
+        self.load_font_file(font_file, "<memory>".to_owned())
+    }
+
     fn get_glyph(&mut self, glyph: GlyphKey) -> Result<RasterizedGlyph, Error> {
         let loaded_font = self.get_loaded_font(glyph.font_key)?;
 
@@ -260,6 +301,35 @@ impl crate::crossfont::Rasterize for DirectWriteRasterizer {
         } else {
             Ok(rasterized_glyph)
         }
+    }
+
+    fn get_glyph_id(
+        &mut self,
+        glyph: crate::crossfont::GlyphIdKey,
+    ) -> Result<RasterizedGlyph, Error> {
+        let loaded_font = self.get_loaded_font(glyph.font_key)?;
+        self.rasterize_glyph(
+            &loaded_font.face,
+            glyph.size,
+            '\0',
+            glyph.glyph_id.try_into().map_err(|_| {
+                Error::PlatformError(format!(
+                    "DirectWrite glyph id {} exceeds u16",
+                    glyph.glyph_id
+                ))
+            })?,
+        )
+    }
+
+    fn drop_font(&mut self, key: FontKey) -> Result<(), Error> {
+        self.fonts.remove(&key).ok_or(Error::UnknownFontKey)?;
+        self.keys.retain(|_, existing| *existing != key);
+        Ok(())
+    }
+
+    fn evict_cache(&mut self) {
+        self.fonts.clear();
+        self.keys.clear();
     }
 
     fn kerning(&mut self, _left: GlyphKey, _right: GlyphKey) -> (f32, f32) {
@@ -330,4 +400,19 @@ impl From<HRESULT> for Error {
         let message = format!("a DirectWrite rendering error occurred: {:X}", hresult);
         Error::PlatformError(message)
     }
+}
+
+fn normalize_cleartype_layout(mut bytes: Vec<u8>) -> Vec<u8> {
+    // DirectWrite returns ClearType samples in RGB order by default. Some LCD panels
+    // use BGR subpixel geometry; allow embedders/tests to request that layout without
+    // changing the public crossfont API.
+    let bgr = std::env::var_os("RASSA_CROSSFONT_WINDOWS_SUBPIXEL")
+        .and_then(|value| value.into_string().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("bgr"));
+    if bgr {
+        for pixel in bytes.chunks_exact_mut(3) {
+            pixel.swap(0, 2);
+        }
+    }
+    bytes
 }

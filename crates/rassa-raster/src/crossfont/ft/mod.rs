@@ -548,13 +548,9 @@ impl FreeTypeRasterizer {
         let coverage = CharSet::new();
         let list: Vec<FallbackFont> = matched_fonts
             .filter_map(|fallback_font| {
-                // Ignore colored outline fonts, since we can not render them.
-                let color = fallback_font.color().next().unwrap_or_default();
-                let outline = fallback_font.outline().next().unwrap_or_default();
-                if color && outline {
-                    return None;
-                }
-
+                // Keep mixed normal/color fonts in the fallback set. Some families advertise
+                // color support while still providing monochrome outlines for normal glyphs;
+                // filtering the whole face makes those glyphs unreachable.
                 let charset = fallback_font.get_charset()?;
                 // Exclude fonts that don't contribute to the coverage, since those won't
                 // be picked up ever.

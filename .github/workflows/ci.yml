@@ -51,12 +51,17 @@ jobs:
       - name: Build shared libraries
         run: cargo build --release -p rassa -p rassa-libass-capi -p rassa-check
 
+      - name: Run Linux C ABI E2E smoke test
+        run: scripts/e2e-linux-capi.sh
+
       - name: Verify shared-library outputs
         run: |
           test -f target/release/librassa.so
           test -f target/release/libass.so
           file target/release/librassa.so target/release/libass.so
           nm -D --defined-only target/release/librassa.so \
+            | grep -E ' ass_library_init$| ass_library_version$| ass_render_frame$'
+          nm -D --defined-only target/release/libass.so \
             | grep -E ' ass_library_init$| ass_library_version$| ass_render_frame$'
 
       - name: Check package file lists
@@ -81,6 +86,71 @@ jobs:
           for crate in "${crates[@]}"; do
             cargo package -p "$crate" --list >/dev/null
           done
+
+
+  cross-platform-e2e:
+    name: cross-platform compile and artifact checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            gcc-mingw-w64-x86-64 \
+            wabt \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            pkg-config
+
+      - name: Install Rust toolchain and targets
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+          rustup target add \
+            x86_64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-gnu \
+            wasm32-unknown-unknown
+
+      - name: Cross-target check macOS and web backends
+        run: |
+          set -euo pipefail
+          for target in \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            wasm32-unknown-unknown; do
+            cargo check -p rassa --target "$target" --quiet
+          done
+
+      - name: Build Linux, Windows DLL, and Web artifacts
+        run: |
+          set -euo pipefail
+          cargo build --release -p rassa -p rassa-libass-capi --target x86_64-unknown-linux-gnu
+          cargo build --release -p rassa -p rassa-libass-capi --target x86_64-pc-windows-gnu
+          cargo build --release -p rassa -p rassa-libass-capi --target wasm32-unknown-unknown
+
+      - name: Verify cross-platform artifacts
+        run: |
+          set -euo pipefail
+          file \
+            target/x86_64-unknown-linux-gnu/release/librassa.so \
+            target/x86_64-unknown-linux-gnu/release/libass.so \
+            target/x86_64-pc-windows-gnu/release/rassa.dll \
+            target/x86_64-pc-windows-gnu/release/ass.dll \
+            target/wasm32-unknown-unknown/release/rassa.wasm \
+            target/wasm32-unknown-unknown/release/ass.wasm
+          x86_64-w64-mingw32-nm -g target/x86_64-pc-windows-gnu/release/ass.dll \
+            | grep -E 'ass_library_init|ass_library_version|ass_render_frame'
+          wasm-objdump -x target/wasm32-unknown-unknown/release/ass.wasm \
+            | grep -E 'ass_library_init|ass_library_version|ass_render_frame'
 
   broad-corpus:
     name: strict broad corpus
