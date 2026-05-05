@@ -7,6 +7,11 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+use freetype::{
+    Bitmap, GlyphSlot, Library, RenderMode, StrokerLineCap, StrokerLineJoin, face::LoadFlag, ffi,
+};
+
 use crate::crossfont::{BitmapBuffer, FontDesc, GlyphIdKey, Rasterize, Size, Style};
 use rassa_core::{RassaError, RassaResult, ass};
 use rassa_fonts::{FontMatch, FontProviderKind};
@@ -122,12 +127,85 @@ impl Rasterizer {
         glyphs: &[GlyphInfo],
         radius: i32,
     ) -> RassaResult<Vec<RasterGlyph>> {
-        let glyphs = self.rasterize_glyphs(font, glyphs)?;
         if radius <= 0 {
-            Ok(glyphs)
-        } else {
-            Ok(self.outline_glyphs(&glyphs, radius))
+            return self.rasterize_glyphs(font, glyphs);
         }
+
+        #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+        if let Some(font_path) = font.path.as_ref() {
+            let library = Library::init()
+                .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
+            let mut face = library.new_face(font_path, 0).map_err(|error| {
+                RassaError::new(format!(
+                    "failed to load font '{}': {error:?}",
+                    font_path.display()
+                ))
+            })?;
+            request_real_dim_size(&mut face, self.options.size_26_6.max(64))?;
+            let stroker = library.new_stroker().map_err(|error| {
+                RassaError::new(format!("freetype stroker init failed: {error:?}"))
+            })?;
+            stroker.set(
+                (radius.max(1) * 64).into(),
+                StrokerLineCap::Round,
+                StrokerLineJoin::Round,
+                0,
+            );
+
+            let mut load_flags = load_flags_for_hinting(self.options.hinting);
+            load_flags.remove(LoadFlag::RENDER);
+            let mut outlined = Vec::with_capacity(glyphs.len());
+            for glyph in glyphs {
+                face.load_glyph(glyph.glyph_id, load_flags)
+                    .map_err(|error| {
+                        RassaError::new(format!(
+                            "failed to load outline glyph {}: {error:?}",
+                            glyph.glyph_id
+                        ))
+                    })?;
+                let slot = face.glyph();
+                let advance = slot.advance();
+                let stroked = slot
+                    .get_glyph()
+                    .and_then(|glyph| glyph.stroke(&stroker))
+                    .map_err(|error| {
+                        RassaError::new(format!(
+                            "failed to stroke outline glyph {}: {error:?}",
+                            glyph.glyph_id
+                        ))
+                    })?;
+                let bitmap_glyph =
+                    stroked
+                        .to_bitmap(RenderMode::Normal, None)
+                        .map_err(|error| {
+                            RassaError::new(format!(
+                                "failed to render outline glyph {}: {error:?}",
+                                glyph.glyph_id
+                            ))
+                        })?;
+                let bitmap = bitmap_glyph.bitmap();
+                let stride = bitmap.pitch().abs();
+                outlined.push(RasterGlyph {
+                    glyph_id: glyph.glyph_id,
+                    cluster: glyph.cluster,
+                    width: bitmap.width(),
+                    height: bitmap.rows(),
+                    stride,
+                    left: bitmap_glyph.left(),
+                    top: bitmap_glyph.top(),
+                    offset_x: glyph.x_offset.round() as i32,
+                    offset_y: (-glyph.y_offset).round() as i32,
+                    advance_x: (advance.x >> 6) as i32,
+                    advance_y: (advance.y >> 6) as i32,
+                    pixel_mode: classify_pixel_mode(&bitmap),
+                    bitmap: copy_bitmap_rows(&bitmap),
+                });
+            }
+            return Ok(outlined);
+        }
+
+        let glyphs = self.rasterize_glyphs(font, glyphs)?;
+        Ok(self.outline_glyphs(&glyphs, radius))
     }
 
     pub fn blur_glyphs(&self, glyphs: &[RasterGlyph], radius: u32) -> Vec<RasterGlyph> {
@@ -158,11 +236,105 @@ fn glyph_cache() -> &'static Mutex<HashMap<GlyphCacheKey, RasterGlyph>> {
     GLYPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn rasterize_freetype_glyphs(
+    font: &FontMatch,
+    glyphs: &[GlyphInfo],
+    options: RasterOptions,
+) -> RassaResult<Vec<RasterGlyph>> {
+    let font_path = font
+        .path
+        .as_ref()
+        .ok_or_else(|| RassaError::new(format!("font '{}' is unresolved", font.family)))?;
+    let library = Library::init()
+        .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
+    let mut face = library.new_face(font_path, 0).map_err(|error| {
+        RassaError::new(format!(
+            "failed to load font '{}': {error:?}",
+            font_path.display()
+        ))
+    })?;
+    request_real_dim_size(&mut face, options.size_26_6.max(64))?;
+
+    let mut rasterized = Vec::with_capacity(glyphs.len());
+    let mut load_flags = load_flags_for_hinting(options.hinting);
+    load_flags.remove(LoadFlag::RENDER);
+    for glyph in glyphs {
+        let cache_key = GlyphCacheKey {
+            family: font.family.clone(),
+            style: font.style.clone(),
+            glyph_id: glyph.glyph_id,
+            size_26_6: options.size_26_6,
+            hinting: options.hinting,
+        };
+        if let Some(cached) = glyph_cache()
+            .lock()
+            .expect("glyph cache mutex poisoned")
+            .get(&cache_key)
+            .cloned()
+        {
+            rasterized.push(RasterGlyph {
+                cluster: glyph.cluster,
+                offset_x: glyph.x_offset.round() as i32,
+                offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
+                advance_x: cached.advance_x,
+                advance_y: cached.advance_y,
+                ..cached
+            });
+            continue;
+        }
+
+        face.load_glyph(glyph.glyph_id, load_flags)
+            .map_err(|error| {
+                RassaError::new(format!(
+                    "failed to load glyph {}: {error:?}",
+                    glyph.glyph_id
+                ))
+            })?;
+        let slot = face.glyph();
+        let advance = slot.advance();
+        let rendered = render_slot_to_gray_bitmap(slot, glyph.glyph_id)?;
+        let rendered = RasterGlyph {
+            glyph_id: glyph.glyph_id,
+            cluster: glyph.cluster,
+            width: rendered.width,
+            height: rendered.height,
+            stride: rendered.stride,
+            left: rendered.left,
+            top: rendered.top,
+            offset_x: glyph.x_offset.round() as i32,
+            offset_y: (-glyph.y_offset).round() as i32 + rendered.offset_y,
+            advance_x: (advance.x >> 6) as i32,
+            advance_y: (advance.y >> 6) as i32,
+            pixel_mode: RasterPixelMode::Gray,
+            bitmap: rendered.bitmap,
+        };
+        let cache_entry = RasterGlyph {
+            cluster: 0,
+            offset_x: 0,
+            offset_y: rendered.offset_y - (-glyph.y_offset).round() as i32,
+            ..rendered.clone()
+        };
+        glyph_cache()
+            .lock()
+            .expect("glyph cache mutex poisoned")
+            .insert(cache_key, cache_entry);
+        rasterized.push(rendered);
+    }
+
+    Ok(rasterized)
+}
+
 fn rasterize_system_glyphs(
     font: &FontMatch,
     glyphs: &[GlyphInfo],
     options: RasterOptions,
 ) -> RassaResult<Vec<RasterGlyph>> {
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    if font.path.is_some() {
+        return rasterize_freetype_glyphs(font, glyphs, options);
+    }
+
     if font.path.is_none() && font.provider != FontProviderKind::Fontconfig {
         return Ok(Rasterizer::new().rasterize(glyphs));
     }
@@ -290,7 +462,7 @@ fn crossfont_bitmap_to_gray(
     }
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResult<()> {
     let mut request = ffi::FT_Size_RequestRec {
         size_request_type: ffi::FT_SIZE_REQUEST_TYPE_REAL_DIM,
@@ -314,7 +486,7 @@ fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResu
     }
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn load_flags_for_hinting(hinting: ass::Hinting) -> LoadFlag {
     let base = LoadFlag::RENDER
         | LoadFlag::NO_BITMAP
@@ -328,7 +500,7 @@ fn load_flags_for_hinting(hinting: ass::Hinting) -> LoadFlag {
     }
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn classify_pixel_mode(bitmap: &Bitmap) -> RasterPixelMode {
     match bitmap.pixel_mode() {
         Ok(freetype::bitmap::PixelMode::Mono) => RasterPixelMode::Mono,
@@ -337,7 +509,7 @@ fn classify_pixel_mode(bitmap: &Bitmap) -> RasterPixelMode {
     }
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn copy_bitmap_rows(bitmap: &Bitmap) -> Vec<u8> {
     let stride = bitmap.pitch().unsigned_abs() as usize;
     let rows = bitmap.rows().max(0) as usize;
@@ -363,7 +535,7 @@ fn copy_bitmap_rows(bitmap: &Bitmap) -> Vec<u8> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 struct OutlineBitmap {
     width: i32,
     height: i32,
@@ -374,7 +546,7 @@ struct OutlineBitmap {
     bitmap: Vec<u8>,
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn render_slot_to_gray_bitmap(slot: &GlyphSlot, glyph_id: u32) -> RassaResult<OutlineBitmap> {
     if slot.outline().is_none() {
         let bitmap = slot.bitmap();
@@ -404,7 +576,7 @@ struct PointF {
     y: f64,
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn rasterize_ft_outline(outline: &ffi::FT_Outline, glyph_id: u32) -> RassaResult<OutlineBitmap> {
     if outline.n_points <= 0 || outline.n_contours <= 0 {
         return Ok(OutlineBitmap::default());
@@ -476,7 +648,7 @@ fn rasterize_ft_outline(outline: &ffi::FT_Outline, glyph_id: u32) -> RassaResult
     })
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn flatten_ft_outline(
     points: &[ffi::FT_Vector],
     tags: &[i8],
@@ -498,7 +670,7 @@ fn flatten_ft_outline(
     Ok(flattened)
 }
 
-#[cfg(any())]
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn flatten_contour(
     points: &[ffi::FT_Vector],
     tags: &[i8],
@@ -1262,7 +1434,7 @@ mod tests {
         );
     }
 
-    #[cfg(any())]
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
     #[test]
     fn hinting_modes_map_to_expected_freetype_flags() {
         assert!(load_flags_for_hinting(ass::Hinting::None).contains(LoadFlag::NO_HINTING));
