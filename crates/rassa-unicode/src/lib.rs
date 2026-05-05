@@ -1,40 +1,8 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-
 use std::ops::Range;
-#[cfg(fribidi_available)]
-use std::os::raw::c_int;
 
 use rassa_core::RassaResult;
 use rassa_unibreak::{BreakAnalysis, LineBreakOpportunity, WordBreakOpportunity, analyze_breaks};
-
-#[cfg(fribidi_available)]
-const FRIBIDI_MASK_RTL: u32 = 0x0000_0001;
-#[cfg(fribidi_available)]
-const FRIBIDI_MASK_WEAK: u32 = 0x0000_0020;
-#[cfg(fribidi_available)]
-const FRIBIDI_PAR_ON: u32 = 0x0000_0040;
-
-#[cfg(fribidi_available)]
-type FriBidiChar = u32;
-#[cfg(fribidi_available)]
-type FriBidiStrIndex = c_int;
-#[cfg(fribidi_available)]
-type FriBidiParType = u32;
-#[cfg(fribidi_available)]
-type FriBidiLevel = u8;
-
-#[cfg(fribidi_available)]
-unsafe extern "C" {
-    fn fribidi_log2vis(
-        input: *const FriBidiChar,
-        len: FriBidiStrIndex,
-        base_dir: *mut FriBidiParType,
-        visual_str: *mut FriBidiChar,
-        positions_l_to_v: *mut FriBidiStrIndex,
-        positions_v_to_l: *mut FriBidiStrIndex,
-        embedding_levels: *mut FriBidiLevel,
-    ) -> FriBidiLevel;
-}
+use unicode_bidi::{BidiClass, BidiInfo};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BidiDirection {
@@ -103,93 +71,45 @@ pub fn analyze_bidi(text: &str) -> RassaResult<BidiAnalysis> {
         return Ok(BidiAnalysis::default());
     }
 
-    #[cfg(fribidi_available)]
-    {
-        analyze_bidi_with_fribidi(text)
-    }
-
-    #[cfg(not(fribidi_available))]
-    {
-        Ok(fallback_bidi_analysis(text))
-    }
+    Ok(analyze_bidi_with_unicode_bidi(text))
 }
 
-#[cfg(fribidi_available)]
-fn analyze_bidi_with_fribidi(text: &str) -> RassaResult<BidiAnalysis> {
-    let logical = text.chars().map(u32::from).collect::<Vec<_>>();
-    let mut visual = vec![0_u32; logical.len()];
-    let mut logical_to_visual = vec![0_i32; logical.len()];
-    let mut visual_to_logical = vec![0_i32; logical.len()];
-    let mut embedding_levels = vec![0_u8; logical.len()];
-    let mut base_dir = FRIBIDI_PAR_ON;
-
-    let max_level = unsafe {
-        fribidi_log2vis(
-            logical.as_ptr(),
-            logical.len() as FriBidiStrIndex,
-            &mut base_dir,
-            visual.as_mut_ptr(),
-            logical_to_visual.as_mut_ptr(),
-            visual_to_logical.as_mut_ptr(),
-            embedding_levels.as_mut_ptr(),
-        )
+fn analyze_bidi_with_unicode_bidi(text: &str) -> BidiAnalysis {
+    let bidi_info = BidiInfo::new(text, None);
+    let Some(paragraph) = bidi_info.paragraphs.first() else {
+        return BidiAnalysis::default();
     };
 
-    if max_level == 0 {
-        return Ok(fallback_bidi_analysis(text));
-    }
-
-    Ok(BidiAnalysis {
-        direction: map_bidi_direction(base_dir),
-        visual_text: utf32_to_string(&visual),
-        logical_to_visual: normalize_indices(&logical_to_visual),
-        visual_to_logical: normalize_indices(&visual_to_logical),
-        embedding_levels,
-    })
-}
-
-fn fallback_bidi_analysis(text: &str) -> BidiAnalysis {
-    let char_count = text.chars().count();
-    BidiAnalysis {
-        direction: BidiDirection::Neutral,
-        visual_text: text.to_string(),
-        logical_to_visual: (0..char_count).collect(),
-        visual_to_logical: (0..char_count).collect(),
-        embedding_levels: vec![0; char_count],
-    }
-}
-
-#[cfg(fribidi_available)]
-fn map_bidi_direction(value: u32) -> BidiDirection {
-    if value == FRIBIDI_PAR_ON {
-        BidiDirection::Neutral
-    } else if value & FRIBIDI_MASK_WEAK != 0 {
-        if value & FRIBIDI_MASK_RTL != 0 {
-            BidiDirection::WeakRightToLeft
-        } else {
-            BidiDirection::WeakLeftToRight
+    let levels = bidi_info.reordered_levels_per_char(paragraph, paragraph.range.clone());
+    let visual_to_logical = BidiInfo::reorder_visual(&levels);
+    let mut logical_to_visual = vec![0; visual_to_logical.len()];
+    for (visual_index, logical_index) in visual_to_logical.iter().copied().enumerate() {
+        if let Some(slot) = logical_to_visual.get_mut(logical_index) {
+            *slot = visual_index;
         }
-    } else if value & FRIBIDI_MASK_RTL != 0 {
-        BidiDirection::RightToLeft
-    } else {
-        BidiDirection::LeftToRight
+    }
+
+    BidiAnalysis {
+        direction: first_strong_direction(&bidi_info),
+        visual_text: bidi_info
+            .reorder_line(paragraph, paragraph.range.clone())
+            .into_owned(),
+        logical_to_visual,
+        visual_to_logical,
+        embedding_levels: levels.iter().map(|level| level.number()).collect(),
     }
 }
 
-#[cfg(fribidi_available)]
-fn normalize_indices(indices: &[i32]) -> Vec<usize> {
-    indices
+fn first_strong_direction(bidi_info: &BidiInfo<'_>) -> BidiDirection {
+    bidi_info
+        .original_classes
         .iter()
-        .map(|index| (*index).max(0) as usize)
-        .collect()
-}
-
-#[cfg(fribidi_available)]
-fn utf32_to_string(codepoints: &[u32]) -> String {
-    codepoints
-        .iter()
-        .filter_map(|codepoint| char::from_u32(*codepoint))
-        .collect()
+        .find_map(|class| match class {
+            BidiClass::L => Some(BidiDirection::LeftToRight),
+            BidiClass::R | BidiClass::AL => Some(BidiDirection::RightToLeft),
+            _ => None,
+        })
+        .unwrap_or(BidiDirection::Neutral)
 }
 
 fn segment_by_mandatory_breaks(text: &str, analysis: &BreakAnalysis) -> Vec<TextSegment> {
@@ -276,5 +196,29 @@ mod tests {
         assert_eq!(analysis.logical_to_visual.len(), 3);
         assert_eq!(analysis.visual_to_logical.len(), 3);
         assert_eq!(analysis.embedding_levels.len(), 3);
+    }
+
+    #[test]
+    fn bidi_fallback_reorders_rtl_runs() {
+        let analysis = analyze_bidi_with_unicode_bidi("abc אבג");
+
+        assert_eq!(analysis.direction, BidiDirection::LeftToRight);
+        assert_eq!(analysis.visual_text, "abc גבא");
+        assert_ne!(analysis.logical_to_visual, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert!(analysis.embedding_levels.iter().any(|level| *level > 0));
+    }
+
+    #[test]
+    fn bidi_fallback_detects_rtl_paragraph_direction() {
+        let analysis = analyze_bidi_with_unicode_bidi("אבג abc");
+
+        assert_eq!(analysis.direction, BidiDirection::RightToLeft);
+        assert_ne!(analysis.visual_text, "אבג abc");
+        assert!(
+            analysis
+                .embedding_levels
+                .iter()
+                .any(|level| *level % 2 == 1)
+        );
     }
 }

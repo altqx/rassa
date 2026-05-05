@@ -4,18 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Unicode helpers for the rassa ASS subtitle renderer."
+description = "Pure-Rust Unicode bidi and segmentation helpers for rassa."
 repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
-build = "build.rs"
-
-[build-dependencies]
-pkg-config = "0.3"
 
 [dependencies]
 rassa-core = { path = "../rassa-core", version = "0.1.1" }
 rassa-unibreak = { path = "../rassa-unibreak", version = "0.1.1" }
+unicode-bidi = "0.3.18"
 
 [lib]
 path = "src/lib.rs"

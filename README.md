@@ -318,10 +318,9 @@ The first published version is `0.1.0`.
 | `rassa` | Safe Rust facade and native `librassa.so` target | <https://docs.rs/rassa> |
 | `rassa-core` | Shared data types and ASS enums | <https://docs.rs/rassa-core> |
 | `rassa-parse` | ASS/SSA parser | <https://docs.rs/rassa-parse> |
-| `rassa-fonts` | Font provider traits and fontconfig integration | <https://docs.rs/rassa-fonts> |
-| `rassa-unibreak-sys` | FFI bindings for libunibreak | <https://docs.rs/rassa-unibreak-sys> |
-| `rassa-unibreak` | Safe line-break wrapper | <https://docs.rs/rassa-unibreak> |
-| `rassa-unicode` | Unicode helpers | <https://docs.rs/rassa-unicode> |
+| `rassa-fonts` | Cross-platform font provider traits and discovery | <https://docs.rs/rassa-fonts> |
+| `rassa-unibreak` | Pure-Rust Unicode line and word breaking | <https://docs.rs/rassa-unibreak> |
+| `rassa-unicode` | Pure-Rust Unicode bidi and segmentation helpers | <https://docs.rs/rassa-unicode> |
 | `rassa-shape` | Text shaping | <https://docs.rs/rassa-shape> |
 | `rassa-raster` | Glyph rasterization helpers | <https://docs.rs/rassa-raster> |
 | `rassa-layout` | Subtitle event layout | <https://docs.rs/rassa-layout> |

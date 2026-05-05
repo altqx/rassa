@@ -3,7 +3,6 @@ members = [
 	"crates/rassa-core",
 	"crates/rassa-parse",
 	"crates/rassa-unicode",
-	"crates/rassa-unibreak-sys",
 	"crates/rassa-unibreak",
 	"crates/rassa-fonts",
 	"crates/rassa-shape",
