@@ -4,7 +4,8 @@ use rassa_fonts::{
 };
 use rassa_parse::{
     ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedSpanStyle,
-    ParsedSpanTransform, ParsedStyle, ParsedTrack, ParsedVectorClip, parse_dialogue_text,
+    ParsedSpanTransform, ParsedStyle, ParsedTrack, ParsedVectorClip,
+    parse_dialogue_text_with_wrap_style,
 };
 use rassa_shape::{GlyphInfo, ShapeEngine, ShapeRequest, ShapingMode};
 use rassa_unibreak::{LineBreakOpportunity, classify_line_breaks};
@@ -84,7 +85,12 @@ impl LayoutEngine {
             .styles
             .get(style_index)
             .unwrap_or(&track.styles[track.default_style as usize]);
-        let parsed_text = parse_dialogue_text(&event.text, style, &track.styles);
+        let parsed_text = parse_dialogue_text_with_wrap_style(
+            &event.text,
+            style,
+            &track.styles,
+            track.wrap_style,
+        );
         let font = provider.resolve(&FontQuery {
             family: style.font_name.clone(),
             style: None,

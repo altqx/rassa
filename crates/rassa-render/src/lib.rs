@@ -268,34 +268,6 @@ impl RenderEngine {
                     },
                 ) + if has_karaoke_run { 1 } else { 0 };
                 let mut line_pen_x = 0;
-                if style.border_style == 3 {
-                    let box_scale = renderer_font_scale(config) * style_scale(render_scale);
-                    let compensation = if track.scaled_border_and_shadow {
-                        1.0
-                    } else {
-                        border_shadow_compensation_scale(track, config)
-                    };
-                    let box_padding =
-                        (style.outline * box_scale / compensation).round().max(0.0) as i32;
-                    let box_height = (style.font_size * style_scale(render_scale_y) * 1.24)
-                        .round()
-                        .max(1.0) as i32;
-                    let box_top = if let Some((_, y)) = effective_position {
-                        match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
-                            ass::VALIGN_TOP => y,
-                            ass::VALIGN_CENTER => y - box_height / 2,
-                            _ => y - box_height,
-                        }
-                    } else {
-                        line_top
-                    };
-                    opaque_box_rects.push(Rect {
-                        x_min: origin_x + box_padding / 2 - 1,
-                        y_min: box_top - box_padding / 2 + box_padding / 3 + 5,
-                        x_max: origin_x + scaled_line_width - box_padding / 2 + 1,
-                        y_max: box_top + box_height - box_padding / 3 - 6,
-                    });
-                }
                 for run in &line.runs {
                     let effective_style = apply_renderer_style_scale(
                         resolve_run_style(run, track.events.get(event.event_index), now_ms),
@@ -508,6 +480,47 @@ impl RenderEngine {
                         .iter()
                         .map(|glyph| glyph.advance_x)
                         .sum::<i32>();
+                }
+                if style.border_style == 3 {
+                    let box_scale = renderer_font_scale(config) * style_scale(render_scale);
+                    let compensation = if track.scaled_border_and_shadow {
+                        1.0
+                    } else {
+                        border_shadow_compensation_scale(track, config)
+                    };
+                    let box_padding =
+                        (style.outline * box_scale / compensation).round().max(0.0) as i32;
+                    let box_visible_height = (style.font_size * style_scale(render_scale_y))
+                        .round()
+                        .max(1.0) as i32
+                        + box_padding * 2;
+                    let box_visible_top = if let Some((_, y)) = effective_position {
+                        match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+                            ass::VALIGN_TOP => y,
+                            ass::VALIGN_CENTER => y - box_visible_height / 2,
+                            _ => y - box_visible_height,
+                        }
+                    } else {
+                        line_top
+                    };
+                    let box_line_width = if line_pen_x > 0 {
+                        line_pen_x
+                    } else {
+                        scaled_line_width
+                    };
+                    let box_origin_x = compute_horizontal_origin(
+                        track,
+                        event,
+                        box_line_width,
+                        effective_position,
+                        render_scale_x,
+                    );
+                    opaque_box_rects.push(Rect {
+                        x_min: box_origin_x - box_padding,
+                        y_min: box_visible_top - 1,
+                        x_max: box_origin_x + box_line_width + box_padding,
+                        y_max: box_visible_top + box_visible_height + 1,
+                    });
                 }
             }
 
@@ -3205,7 +3218,7 @@ mod tests {
 
     #[test]
     fn render_frame_emits_opaque_box_for_border_style_3() {
-        let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00010203,&H00111111,0,0,0,0,100,100,0,0,3,4,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(30,30)}Hi").expect("script should parse");
+        let track = parse_script_text("[Script Info]\nPlayResX: 500\nPlayResY: 160\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,DejaVu Sans,30,&H00000000,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,3,2,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Box,,0000,0000,0000,,{\\an5\\pos(250,80)}BorderStyle=3 opaque box").expect("script should parse");
         let engine = RenderEngine::new();
         let provider = FontconfigProvider::new();
         let planes = engine.render_frame_with_provider(&track, &provider, 500);
@@ -3223,10 +3236,30 @@ mod tests {
         let _character = visible_bounds(&character_planes).expect("character bounds");
         let outline = outline_planes
             .iter()
-            .find(|plane| plane.color.0 == 0x0302_0100 && plane.bitmap.contains(&255))
+            .find(|plane| plane.color.0 == 0x0000_0000 && plane.bitmap.contains(&255))
             .expect("opaque border-style box plane uses outline colour");
         assert!(outline.size.width > 0);
         assert!(outline.size.height > 0);
+        let bounds = visible_bounds(std::slice::from_ref(outline)).expect("opaque box bounds");
+        let center_x = (bounds.x_min + bounds.x_max) / 2;
+        assert!(
+            (center_x - 250).abs() <= 2,
+            "opaque box should stay centered at \\pos, got {bounds:?}"
+        );
+        let center_y = (bounds.y_min + bounds.y_max) / 2;
+        assert!(
+            (center_y - 80).abs() <= 1,
+            "opaque box should stay vertically centered at \\pos like libass, got {bounds:?}"
+        );
+        assert_eq!(
+            bounds.height(),
+            36,
+            "BorderStyle=3 box plane height should be font size plus two borders plus edge rows like libass"
+        );
+        assert!(
+            bounds.width() < 370,
+            "opaque box should use actual raster advance like libass, not inflated layout width: {bounds:?}"
+        );
     }
 
     #[test]

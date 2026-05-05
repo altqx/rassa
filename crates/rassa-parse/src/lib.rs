@@ -585,7 +585,17 @@ pub fn parse_dialogue_text(
     base_style: &ParsedStyle,
     styles: &[ParsedStyle],
 ) -> ParsedDialogueText {
+    parse_dialogue_text_with_wrap_style(text, base_style, styles, 0)
+}
+
+pub fn parse_dialogue_text_with_wrap_style(
+    text: &str,
+    base_style: &ParsedStyle,
+    styles: &[ParsedStyle],
+    inherited_wrap_style: i32,
+) -> ParsedDialogueText {
     let mut parsed = ParsedDialogueText::default();
+    let mut current_wrap_style = inherited_wrap_style.clamp(0, 3);
     let mut current_style = ParsedSpanStyle::from_style(base_style);
     let mut active_line = ParsedTextLine::default();
     let mut buffer = String::new();
@@ -617,20 +627,41 @@ pub fn parse_dialogue_text(
                     &mut karaoke_cursor_ms,
                     &mut drawing_scale,
                     &mut current_transforms,
+                    &mut current_wrap_style,
                 );
             }
             '\\' => match characters.peek().copied() {
-                Some('N') | Some('n') => {
+                Some('N') => {
                     characters.next();
-                    flush_span(
-                        &mut buffer,
-                        &current_style,
-                        pending_karaoke,
-                        drawing_scale,
-                        &current_transforms,
-                        &mut active_line,
-                    );
-                    push_line(&mut parsed, &mut active_line);
+                    if drawing_scale > 0 {
+                        buffer.push(' ');
+                    } else {
+                        flush_span(
+                            &mut buffer,
+                            &current_style,
+                            pending_karaoke,
+                            drawing_scale,
+                            &current_transforms,
+                            &mut active_line,
+                        );
+                        push_line(&mut parsed, &mut active_line);
+                    }
+                }
+                Some('n') => {
+                    characters.next();
+                    if drawing_scale > 0 || current_wrap_style != 2 {
+                        buffer.push(' ');
+                    } else {
+                        flush_span(
+                            &mut buffer,
+                            &current_style,
+                            pending_karaoke,
+                            drawing_scale,
+                            &current_transforms,
+                            &mut active_line,
+                        );
+                        push_line(&mut parsed, &mut active_line);
+                    }
                 }
                 Some('h') => {
                     characters.next();
@@ -946,6 +977,7 @@ fn apply_override_block(
     karaoke_cursor_ms: &mut i32,
     drawing_scale: &mut i32,
     current_transforms: &mut Vec<ParsedSpanTransform>,
+    current_wrap_style: &mut i32,
 ) {
     for raw_tag in split_override_tags(block) {
         let tag = raw_tag.trim();
@@ -1122,7 +1154,9 @@ fn apply_override_block(
             }
         } else if let Some(rest) = tag.strip_prefix('q') {
             if let Ok(value) = rest.trim().parse::<i32>() {
-                parsed.wrap_style = Some(value.clamp(0, 3));
+                let value = value.clamp(0, 3);
+                parsed.wrap_style = Some(value);
+                *current_wrap_style = value;
             }
         } else if let Some(rest) = tag.strip_prefix("org") {
             parsed.origin = parse_pos(rest);
@@ -2197,6 +2231,35 @@ mod tests {
         assert_eq!(parsed.lines[0].spans[3].style.scale_y, 0.5);
         assert_eq!(parsed.lines[0].spans[4].style.scale_x, 1.2);
         assert_eq!(parsed.lines[0].spans[4].style.scale_y, 0.8);
+    }
+
+    #[test]
+    fn parses_backslash_n_as_space_unless_wrap_style_two() {
+        let base_style = ParsedStyle::default();
+        let normal = parse_dialogue_text("one\\ntwo", &base_style, &[]);
+        assert_eq!(normal.lines.len(), 1);
+        assert_eq!(normal.lines[0].spans[0].text, "one two");
+
+        let q2 = parse_dialogue_text("{\\q2}one\\ntwo", &base_style, &[]);
+        assert_eq!(q2.lines.len(), 2);
+        assert_eq!(q2.lines[0].spans[0].text, "one");
+        assert_eq!(q2.lines[1].spans[0].text, "two");
+    }
+
+    #[test]
+    fn drawing_mode_treats_newline_escapes_as_path_whitespace() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\p1}m 0 0 l 10 0\\N l 10 10 l 0 10", &base_style, &[]);
+
+        assert_eq!(parsed.lines.len(), 1);
+        assert_eq!(parsed.lines[0].spans.len(), 1);
+        let drawing = parsed.lines[0].spans[0]
+            .drawing
+            .as_ref()
+            .expect("drawing should continue across \\N like libass");
+        assert_eq!(drawing.polygons.len(), 1);
+        assert_eq!(drawing.bounds().expect("bounds").x_max, 11);
+        assert_eq!(drawing.bounds().expect("bounds").y_max, 11);
     }
 
     #[test]
