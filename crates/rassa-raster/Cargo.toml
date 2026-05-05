@@ -21,6 +21,7 @@ fontdue = "0.9.3"
 [target.'cfg(not(any(target_os = "macos", windows, target_arch = "wasm32")))'.dependencies]
 yeslogic-fontconfig-sys = "6.0.0"
 freetype-rs = "0.36.0"
+resvg = { version = "0.45.1", default-features = false }
 
 [target.'cfg(not(any(target_os = "macos", windows, target_arch = "wasm32")))'.build-dependencies]
 pkg-config = "0.3"

@@ -15,6 +15,7 @@ use libc::{c_long, c_uint};
 use log::{debug, trace};
 
 pub mod fc;
+mod svg;
 
 use fc::{CharSet, FtFaceLocation, Pattern, PatternHash, PatternRef, Rgba};
 
@@ -387,7 +388,7 @@ impl Rasterize for FreeTypeRasterizer {
         self.loader.faces.insert(
             key,
             FaceLoadingProperties {
-                load_flags: LoadFlag::RENDER | LoadFlag::NO_BITMAP,
+                load_flags: LoadFlag::RENDER | LoadFlag::NO_BITMAP | LoadFlag::COLOR,
                 render_mode: freetype::RenderMode::Normal,
                 lcd_filter: freetype::ffi::FT_LCD_FILTER_DEFAULT,
                 non_scalable: None,
@@ -410,7 +411,7 @@ impl Rasterize for FreeTypeRasterizer {
         self.loader.faces.insert(
             key,
             FaceLoadingProperties {
-                load_flags: LoadFlag::RENDER | LoadFlag::NO_BITMAP,
+                load_flags: LoadFlag::RENDER | LoadFlag::NO_BITMAP | LoadFlag::COLOR,
                 render_mode: freetype::RenderMode::Normal,
                 lcd_filter: freetype::ffi::FT_LCD_FILTER_DEFAULT,
                 non_scalable: None,
@@ -860,6 +861,40 @@ impl From<freetype::Error> for Error {
 
 unsafe impl Send for FreeTypeRasterizer {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_ot_svg_glyphs_from_font_bytes() {
+        let bytes = include_bytes!("../../../tests/fixtures/otsvg-red-square.ttf");
+        let mut rasterizer = FreeTypeRasterizer::new().expect("create FreeType rasterizer");
+        let font_key = rasterizer
+            .load_font_bytes(bytes, Size::new(48.0))
+            .expect("load OT-SVG test font");
+
+        let glyph = rasterizer
+            .get_glyph(GlyphKey {
+                font_key,
+                character: '\u{e000}',
+                size: Size::new(48.0),
+            })
+            .expect("render OT-SVG glyph");
+
+        assert!(glyph.width > 0, "OT-SVG glyph should have width");
+        assert!(glyph.height > 0, "OT-SVG glyph should have height");
+        let BitmapBuffer::Rgba(buffer) = glyph.buffer else {
+            panic!("OT-SVG glyph should render as color RGBA bitmap");
+        };
+        assert!(
+            buffer
+                .chunks_exact(4)
+                .any(|rgba| rgba[0] > 200 && rgba[1] < 40 && rgba[2] < 40 && rgba[3] > 200),
+            "OT-SVG glyph should contain visible red pixels"
+        );
+    }
+}
+
 struct FreeTypeLoader {
     library: Library,
     faces: HashMap<FontKey, FaceLoadingProperties>,
@@ -872,6 +907,13 @@ impl FreeTypeLoader {
 
         // Initialize default properties, like user preferred interpreter.
         unsafe { freetype_sys::FT_Set_Default_Properties(library.raw()) };
+
+        // Install FreeType's OT-SVG hooks when the `ot-svg` module is present.
+        // Without this, SVG glyphs are loaded as color glyphs but cannot be
+        // rendered by FreeType.
+        if let Err(error) = svg::register(library.raw()) {
+            debug!("FreeType OT-SVG hooks unavailable: {error}");
+        }
 
         Ok(FreeTypeLoader {
             library,
@@ -938,8 +980,16 @@ impl FreeTypeLoader {
             let rgba = pattern.rgba().next().unwrap_or(Rgba::Unknown);
             let fontconfig_charset = pattern.get_charset().map(ToOwned::to_owned);
 
+            let load_flags = {
+                let mut flags = Self::ft_load_flags(pattern);
+                if ft_face.has_color() {
+                    flags |= LoadFlag::COLOR;
+                }
+                flags
+            };
+
             let face = FaceLoadingProperties {
-                load_flags: Self::ft_load_flags(pattern),
+                load_flags,
                 render_mode: Self::ft_render_mode(pattern),
                 lcd_filter: Self::ft_lcd_filter(pattern),
                 non_scalable,
