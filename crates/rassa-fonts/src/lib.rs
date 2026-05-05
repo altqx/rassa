@@ -249,7 +249,7 @@ fn windows_known_font_path(family: &str) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_arch = "wasm32")))]
 fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
     None
 }
