@@ -203,7 +203,7 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
         stretch: Stretch::Normal,
         style: fontdb_style,
     };
-    let id = database.query(&query).or_else(|| {
+    let Some(id) = database.query(&query).or_else(|| {
         let fallback = Query {
             families: &[family_query],
             weight: Weight::NORMAL,
@@ -211,7 +211,9 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
             style: FontdbStyle::Normal,
         };
         database.query(&fallback)
-    })?;
+    }) else {
+        return windows_known_font_path(family).map(|path| (family.to_owned(), Some(path)));
+    };
     let face = database.face(id)?;
     let resolved_family = face
         .families
@@ -222,8 +224,34 @@ fn resolve_system_font(family: &str, style: Option<&str>) -> Option<(String, Opt
         Source::File(path) => Some(path.clone()),
         Source::SharedFile(path, _) => Some(path.clone()),
         _ => None,
-    };
+    }
+    .or_else(|| windows_known_font_path(&resolved_family))
+    .or_else(|| windows_known_font_path(family));
     Some((resolved_family, path))
+}
+
+#[cfg(windows)]
+fn windows_known_font_path(family: &str) -> Option<PathBuf> {
+    let normalized = normalize_font_key(family);
+    let candidates: &[&str] = match normalized.as_str() {
+        "arial" | "sans" | "sansserif" => &["arial.ttf", "segoeui.ttf"],
+        "segoeui" | "segoe ui" => &["segoeui.ttf"],
+        "timesnewroman" | "times new roman" | "serif" => &["times.ttf"],
+        "couriernew" | "courier new" | "mono" | "monospace" => &["cour.ttf", "consola.ttf"],
+        _ => &[],
+    };
+    let windows_dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    candidates
+        .iter()
+        .map(|candidate| windows_dir.join("Fonts").join(candidate))
+        .find(|path| path.exists())
+}
+
+#[cfg(not(windows))]
+fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
