@@ -175,31 +175,24 @@ jobs:
             rassa-check
           )
 
-          new_publishes=0
           for crate in "${crates[@]}"; do
             if curl -A "rassa-release-workflow" -fsS "https://crates.io/api/v1/crates/$crate/${{ needs.detect-version.outputs.version }}" >/dev/null 2>&1; then
               echo "$crate ${{ needs.detect-version.outputs.version }} is already on crates.io; skipping."
               continue
             fi
 
-            for attempt in 1 2 3 4 5 6; do
+            for attempt in 1 2 3 4 5; do
               if cargo publish -p "$crate"; then
-                new_publishes=$((new_publishes + 1))
                 break
               fi
-              if [ "$attempt" = 6 ]; then
+              if [ "$attempt" = 5 ]; then
                 exit 1
               fi
-              echo "Publish failed for $crate; waiting before retry $((attempt + 1))/6."
-              sleep 120
+              echo "Publish failed for $crate; waiting for crates.io index before retry $((attempt + 1))/5."
+              sleep 60
             done
 
-            if [ $((new_publishes % 5)) -eq 0 ] && [ "$new_publishes" -gt 0 ]; then
-              echo "Published $new_publishes new crates in this run; waiting for crates.io new-crate rate limit window."
-              sleep 600
-            else
-              sleep 60
-            fi
+            sleep 60
           done
 
   github-release:
