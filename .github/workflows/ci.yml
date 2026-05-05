@@ -152,6 +152,61 @@ jobs:
           wasm-objdump -x target/wasm32-unknown-unknown/release/ass.wasm \
             | grep -E 'ass_library_init|ass_library_version|ass_render_frame'
 
+  native-runtime-visual:
+    name: ${{ matrix.os }} runtime visual smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+
+      - name: Run native raster tests
+        shell: bash
+        run: cargo test -p rassa-raster --lib --quiet
+
+      - name: Build native shared libraries and checker
+        shell: bash
+        run: cargo build --release -p rassa -p rassa-libass-capi -p rassa-check
+
+      - name: Render PNG visual smoke frame
+        shell: bash
+        env:
+          RASSA_CROSSFONT_WINDOWS_SUBPIXEL: auto
+        run: |
+          set -euo pipefail
+          mkdir -p target/runtime-visual
+          cargo run --release -p rassa-check -- \
+            --output target/runtime-visual/frame.png \
+            --format png \
+            --time-ms 500 \
+            --width 320 \
+            --height 180
+          cat > target/runtime-visual/validate_png.py <<'PY'
+          from pathlib import Path
+          path = Path('target/runtime-visual/frame.png')
+          data = path.read_bytes()
+          assert data.startswith(b'\x89PNG\r\n\x1a\n'), 'rendered frame is not a PNG'
+          assert len(data) > 512, f'rendered PNG is unexpectedly small: {len(data)} bytes'
+          print(f'native visual PNG ok: {path} ({len(data)} bytes)')
+          PY
+          if command -v python3 >/dev/null 2>&1; then
+            python3 target/runtime-visual/validate_png.py
+          else
+            python target/runtime-visual/validate_png.py
+          fi
+
   broad-corpus:
     name: strict broad corpus
     runs-on: ubuntu-latest

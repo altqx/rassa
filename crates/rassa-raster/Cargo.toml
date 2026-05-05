@@ -42,6 +42,7 @@ objc2-foundation = { version = "0.3.2", features = [
 [target.'cfg(windows)'.dependencies]
 dwrote = { version = "0.11" }
 winapi = { version = "0.3", features = ["impl-default"] }
+winreg = "0.56.0"
 
 [lib]
 path = "src/lib.rs"

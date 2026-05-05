@@ -8,6 +8,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
+
 use dwrote::{
     DWRITE_GLYPH_RUN, FontCollection, FontFace, FontFallback, FontFile, FontStretch, FontStyle,
     FontWeight, GlyphOffset, GlyphRunAnalysis, TextAnalysisSource, TextAnalysisSourceMethods,
@@ -402,17 +405,116 @@ impl From<HRESULT> for Error {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubpixelLayout {
+    Rgb,
+    Bgr,
+}
+
 fn normalize_cleartype_layout(mut bytes: Vec<u8>) -> Vec<u8> {
     // DirectWrite returns ClearType samples in RGB order by default. Some LCD panels
-    // use BGR subpixel geometry; allow embedders/tests to request that layout without
-    // changing the public crossfont API.
-    let bgr = std::env::var_os("RASSA_CROSSFONT_WINDOWS_SUBPIXEL")
-        .and_then(|value| value.into_string().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("bgr"));
-    if bgr {
+    // use BGR subpixel geometry; normalize the texture to the user's configured or
+    // auto-detected physical layout before handing it to the renderer.
+    if configured_subpixel_layout() == SubpixelLayout::Bgr {
         for pixel in bytes.chunks_exact_mut(3) {
             pixel.swap(0, 2);
         }
     }
     bytes
+}
+
+fn configured_subpixel_layout() -> SubpixelLayout {
+    // Keep the existing explicit override for embedders and tests. `auto` (and an
+    // unset value) uses Windows' per-display ClearType registry keys.
+    if let Some(layout) = std::env::var_os("RASSA_CROSSFONT_WINDOWS_SUBPIXEL")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "rgb" => Some(SubpixelLayout::Rgb),
+            "bgr" => Some(SubpixelLayout::Bgr),
+            "auto" => None,
+            _ => None,
+        })
+    {
+        return layout;
+    }
+
+    registry_subpixel_layout().unwrap_or(SubpixelLayout::Rgb)
+}
+
+fn registry_subpixel_layout() -> Option<SubpixelLayout> {
+    // WPF/DirectWrite stores ClearType tuning under one key per display, for
+    // example `DISPLAY1` and `DISPLAY2`. The rasterizer has no window or monitor
+    // handle, so choose BGR if any configured display reports BGR; otherwise RGB
+    // if at least one display reports RGB. Unknown/flat/missing values fall back
+    // to DirectWrite's default RGB order.
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let graphics = hkcu
+        .open_subkey("Software\\Microsoft\\Avalon.Graphics")
+        .ok()?;
+
+    let mut saw_rgb = false;
+    for display_name in graphics.enum_keys().filter_map(Result::ok) {
+        let Ok(display) = graphics.open_subkey(display_name) else {
+            continue;
+        };
+        let Ok(pixel_structure) = display.get_value::<u32, _>("PixelStructure") else {
+            continue;
+        };
+        match layout_from_registry_pixel_structure(pixel_structure) {
+            Some(SubpixelLayout::Bgr) => return Some(SubpixelLayout::Bgr),
+            Some(SubpixelLayout::Rgb) => saw_rgb = true,
+            None => {}
+        }
+    }
+
+    saw_rgb.then_some(SubpixelLayout::Rgb)
+}
+
+fn layout_from_registry_pixel_structure(value: u32) -> Option<SubpixelLayout> {
+    match value {
+        // Windows stores `0` for flat/no subpixel AA, `1` for RGB, and `2` for BGR.
+        1 => Some(SubpixelLayout::Rgb),
+        2 => Some(SubpixelLayout::Bgr),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn registry_pixel_structure_values_map_to_layouts() {
+        assert_eq!(layout_from_registry_pixel_structure(0), None);
+        assert_eq!(
+            layout_from_registry_pixel_structure(1),
+            Some(SubpixelLayout::Rgb)
+        );
+        assert_eq!(
+            layout_from_registry_pixel_structure(2),
+            Some(SubpixelLayout::Bgr)
+        );
+        assert_eq!(layout_from_registry_pixel_structure(3), None);
+    }
+
+    #[test]
+    fn env_override_normalizes_bgr_cleartype_bytes() {
+        let _guard = ENV_LOCK.lock().expect("env test lock");
+        let previous = std::env::var_os("RASSA_CROSSFONT_WINDOWS_SUBPIXEL");
+        unsafe {
+            std::env::set_var("RASSA_CROSSFONT_WINDOWS_SUBPIXEL", "bgr");
+        }
+        let normalized = normalize_cleartype_layout(vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(normalized, vec![3, 2, 1, 6, 5, 4]);
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("RASSA_CROSSFONT_WINDOWS_SUBPIXEL", value);
+            } else {
+                std::env::remove_var("RASSA_CROSSFONT_WINDOWS_SUBPIXEL");
+            }
+        }
+    }
 }
