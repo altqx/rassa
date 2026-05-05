@@ -1,10 +1,4 @@
-//! Safe Rust API facade for rassa.
-//!
-//! The libass compatibility package lives in `rassa-libass-capi` and exports
-//! `ass_*` symbols as `libass.so`. This crate is the public Rust API surface
-//! for Cargo users and also builds the native `librassa.so` shared object for
-//! new applications that want the rassa-branded ABI surface instead of a
-//! libass-branded compatibility library.
+//! Safe Rust API and native `librassa.so` target for rassa.
 
 pub use rassa_core::{
     ImagePlane, Margins, Point, RassaError, RassaResult, Rect, RendererConfig, RgbaColor, Size, ass,
@@ -15,12 +9,7 @@ pub use rassa_parse::{
 };
 pub use rassa_render::{PreparedFrame, RenderEngine, RenderSelection, default_renderer_config};
 
-/// C ABI symbols exported by the native `librassa.so` build.
-///
-/// The current native shared object reuses the same implementation as the C ABI
-/// compatibility layer, but applications should link to `librassa.so` when they
-/// want to depend on rassa as a project rather than on a strict libass drop-in
-/// replacement promise.
+/// C ABI symbols exported by `librassa.so`.
 pub mod capi {
     pub use rassa_capi::*;
 }

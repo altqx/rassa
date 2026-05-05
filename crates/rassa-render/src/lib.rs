@@ -1126,9 +1126,6 @@ fn interpolate_alpha(
 }
 
 fn with_fade_alpha(color: u32, fade_alpha: u8) -> u32 {
-    // ASS_Image/RgbaColor stores RGB in the high three bytes and inverse alpha
-    // in the low byte. Fade tags compute an absolute event-level alpha, so
-    // apply it directly while preserving RGB channels.
     (color & 0xFFFF_FF00) | u32::from(fade_alpha)
 }
 
