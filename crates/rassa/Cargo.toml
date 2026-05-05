@@ -4,13 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Rust API and native shared-library target for the rassa ASS subtitle renderer."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core" }
-rassa_capi = { package = "rassa-capi", path = "../rassa-capi" }
-rassa-fonts = { path = "../rassa-fonts" }
-rassa-parse = { path = "../rassa-parse" }
-rassa-render = { path = "../rassa-render" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.0" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
+rassa-parse = { path = "../rassa-parse", version = "0.1.0" }
+rassa-render = { path = "../rassa-render", version = "0.1.0" }
 
 [lib]
 path = "src/lib.rs"

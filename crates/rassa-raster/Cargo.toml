@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Glyph and drawing rasterization pipeline for the rassa renderer."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core" }
-rassa-fonts = { path = "../rassa-fonts" }
-rassa-shape = { path = "../rassa-shape" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
+rassa-shape = { path = "../rassa-shape", version = "0.1.0" }
 freetype-rs = "0.38.0"
 
 [lib]

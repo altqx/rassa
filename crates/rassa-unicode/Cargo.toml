@@ -4,14 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Unicode helpers for the rassa ASS subtitle renderer."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 build = "build.rs"
 
 [build-dependencies]
 pkg-config = "0.3"
 
 [dependencies]
-rassa-core = { path = "../rassa-core" }
-rassa-unibreak = { path = "../rassa-unibreak" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
+rassa-unibreak = { path = "../rassa-unibreak", version = "0.1.0" }
 
 [lib]
 path = "src/lib.rs"

@@ -23,6 +23,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
+repository = "https://github.com/altqx/rassa"
+readme = "README.md"
+keywords = ["subtitles", "ass", "renderer", "libass", "rust"]
 
 [workspace.dependencies]
 libc = "0.2"

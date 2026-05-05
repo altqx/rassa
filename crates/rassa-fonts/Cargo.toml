@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Font discovery and font-facing utilities for the rassa ASS subtitle renderer."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
 fontconfig = { package = "fontconfig-rs", version = "0.1.1" }

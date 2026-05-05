@@ -4,14 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "libass-compatible C ABI shared-library target for rassa."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 build = "build.rs"
 
 [dependencies]
 libc.workspace = true
-rassa-core = { path = "../rassa-core" }
-rassa-fonts = { path = "../rassa-fonts" }
-rassa-parse = { path = "../rassa-parse" }
-rassa-render = { path = "../rassa-render" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
+rassa-parse = { path = "../rassa-parse", version = "0.1.0" }
+rassa-render = { path = "../rassa-render", version = "0.1.0" }
 
 [lib]
 name = "ass"

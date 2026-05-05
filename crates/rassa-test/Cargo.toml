@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Internal regression tests and reference fixtures for rassa."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+publish = false
 
 [dependencies]
 png = "0.17"
-rassa-core = { path = "../rassa-core" }
-rassa = { path = "../rassa" }
-rassa_capi = { package = "rassa-capi", path = "../rassa-capi" }
-rassa-fonts = { path = "../rassa-fonts" }
-rassa-parse = { path = "../rassa-parse" }
-rassa-render = { path = "../rassa-render" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
+rassa = { path = "../rassa", version = "0.1.0" }
+rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.1.0" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.1.0" }
+rassa-parse = { path = "../rassa-parse", version = "0.1.0" }
+rassa-render = { path = "../rassa-render", version = "0.1.0" }

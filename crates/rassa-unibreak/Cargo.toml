@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Safe Rust wrapper around libunibreak for rassa."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core" }
-rassa-unibreak-sys = { path = "../rassa-unibreak-sys" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
+rassa-unibreak-sys = { path = "../rassa-unibreak-sys", version = "0.1.0" }
 
 [lib]
 path = "src/lib.rs"

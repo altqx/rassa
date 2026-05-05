@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "ASS subtitle parser for the rassa renderer."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core" }
+rassa-core = { path = "../rassa-core", version = "0.1.0" }
 
 [lib]
 path = "src/lib.rs"
