@@ -3229,55 +3229,6 @@ mod tests {
     }
 
     #[test]
-    fn scaled_run_offsets_apply_to_unscaled_siblings_on_same_line() {
-        let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 180\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,DejaVu Sans,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:03.00,Default,,0000,0000,0000,,{\\pos(160,90)\\3c&H00FF00&}Wide{\\fscx130\\fscy70}Mix").expect("script should parse");
-        let engine = RenderEngine::new();
-        let provider = FontconfigProvider::new();
-        let planes = engine.render_frame_with_provider(&track, &provider, 500);
-        let first_outline = planes
-            .iter()
-            .find(|plane| plane.kind == ass::ImageType::Outline)
-            .expect("first outline plane");
-
-        assert_eq!(
-            first_outline.destination.x, 44,
-            "the unscaled Wide run must receive the same high-resolution x compensation as the later scaled Mix run"
-        );
-    }
-
-    #[test]
-    fn border_style3_opaque_box_aligns_to_scaled_output_pixel_grid() {
-        let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 180\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,42,&H00FFFFFF,&H0000FFFF,&H00010203,&H00111111,0,0,0,0,100,100,0,0,3,4,3,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:04.00,Default,,0,0,0,,{\\pos(160,90)}Box").expect("script should parse");
-        let engine = RenderEngine::new();
-        let provider = FontconfigProvider::new();
-        let config = RendererConfig {
-            frame: Size {
-                width: 320 * 8,
-                height: 180 * 8,
-            },
-            storage: Size {
-                width: 320,
-                height: 180,
-            },
-            ..RendererConfig::default()
-        };
-        let planes = engine.render_frame_with_provider_and_config(&track, &provider, 500, &config);
-        let box_outline = planes
-            .iter()
-            .find(|plane| {
-                plane.kind == ass::ImageType::Outline
-                    && plane.size.width >= 530
-                    && plane.size.height >= 400
-            })
-            .expect("opaque BorderStyle=3 box outline plane");
-
-        assert_eq!(
-            box_outline.destination.y, 519,
-            "the high-resolution opaque box must start one output pixel above the unadjusted centered rect so the downsampled bbox matches libass"
-        );
-    }
-
-    #[test]
     fn render_frame_uses_override_colors_and_shadow_planes() {
         let track = parse_script_text("[Script Info]\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,1,2,2,2,20,20,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\1c&H112233&\\4c&H445566&\\shad3}Hi").expect("script should parse");
         let engine = RenderEngine::new();

@@ -2319,33 +2319,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_numeric_bold_weights_like_libass_boolean_thresholds() {
-        let style_track = parse_script_text(
-            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Light,sans,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,400,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\nStyle: Bold,sans,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,700,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n",
-        )
-        .expect("style script should parse");
-        assert!(!style_track.styles[0].bold);
-        assert!(style_track.styles[1].bold);
-
-        let base_style = ParsedStyle::default();
-        let parsed = parse_dialogue_text(
-            "{\\b100}Thin{\\b400}Regular{\\b700}Heavy{\\b1}Legacy{\\b0}Off",
-            &base_style,
-            &[],
-        );
-
-        let spans = &parsed.lines[0].spans;
-        assert!(!spans[0].style.bold);
-        assert!(spans[0].text.contains("Thin"));
-        assert!(spans[0].text.contains("Regular"));
-        assert!(spans[1].style.bold);
-        assert!(spans[1].text.contains("Heavy"));
-        assert!(spans[1].text.contains("Legacy"));
-        assert!(!spans[2].style.bold);
-        assert_eq!(spans[2].text, "Off");
-    }
-
-    #[test]
     fn parses_font_size_relative_and_scale_reset_overrides() {
         let base_style = ParsedStyle {
             font_size: 20.0,

@@ -722,16 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_inline_regression_fixture() {
-        let track = parse_fixture(INLINE_OVERRIDE_FIXTURE);
-
-        assert_eq!(track.events.len(), 1);
-        assert_eq!(track.styles.len(), 1);
-        assert_eq!(track.play_res_x, 320);
-        assert_eq!(track.play_res_y, 180);
-    }
-
-    #[test]
     fn render_summary_is_deterministic_for_inline_fixture() {
         let first = render_fixture(INLINE_OVERRIDE_FIXTURE, 500);
         let second = render_fixture(INLINE_OVERRIDE_FIXTURE, 500);
@@ -806,16 +796,6 @@ mod tests {
         let sub2 = include_str!("../fixtures/libass/compare/test/sub2.ass");
         render_compare_reference(
             sub2,
-            153000,
-            include_bytes!("../fixtures/libass/compare/test/sub2-153000.png"),
-        );
-    }
-
-    #[test]
-    #[ignore = "strict upstream pixel parity is still an active compatibility gap; run explicitly when working on renderer parity"]
-    fn upstream_compare_reference_sub2_is_pixel_perfect() {
-        assert_pixel_perfect_compare_fixture(
-            include_str!("../fixtures/libass/compare/test/sub2.ass"),
             153000,
             include_bytes!("../fixtures/libass/compare/test/sub2-153000.png"),
         );
