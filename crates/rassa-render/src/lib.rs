@@ -379,13 +379,14 @@ impl RenderEngine {
                     } else {
                         renderer_blur_radius(effective_blur)
                     };
-                    let mut shadow_source_glyphs = raster_glyphs.clone();
+                    let mut outlined_shadow_source_glyphs = None;
                     if has_outline {
                         let outline_radius = effective_style.border.round().max(1.0) as i32;
-                        let outline_source_glyphs =
+                        let outline_glyphs =
                             rasterizer.outline_glyphs(&raster_glyphs, outline_radius);
-                        shadow_source_glyphs = outline_source_glyphs.clone();
-                        let outline_glyphs = outline_source_glyphs;
+                        if has_shadow {
+                            outlined_shadow_source_glyphs = Some(outline_glyphs.clone());
+                        }
                         let outline_blur = renderer_blur_radius(effective_blur);
                         if let Some(plane) = combined_image_plane_from_glyphs(
                             &outline_glyphs,
@@ -459,9 +460,11 @@ impl RenderEngine {
                     if effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON
                     {
-                        let shadow_glyphs = shadow_source_glyphs.clone();
+                        let shadow_glyphs = outlined_shadow_source_glyphs
+                            .as_deref()
+                            .unwrap_or(&raster_glyphs);
                         if let Some(plane) = combined_image_plane_from_glyphs(
-                            &shadow_glyphs,
+                            shadow_glyphs,
                             glyph_origin_x + effective_style.shadow_x.round() as i32,
                             text_line_top + effective_style.shadow_y.round() as i32,
                             run_line_ascender,
@@ -472,10 +475,7 @@ impl RenderEngine {
                             shadow_planes.push(plane);
                         }
                     }
-                    line_pen_x += raster_glyphs
-                        .iter()
-                        .map(|glyph| glyph.advance_x)
-                        .sum::<i32>();
+                    line_pen_x += run_advance;
                 }
                 if style.border_style == 3 {
                     let box_scale = renderer_font_scale(config) * style_scale(render_scale);
