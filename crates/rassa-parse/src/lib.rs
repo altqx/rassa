@@ -1839,8 +1839,8 @@ fn parse_fad(value: &str) -> Option<ParsedFade> {
     };
 
     Some(ParsedFade::Simple {
-        fade_in_ms: fade_in.parse::<i32>().ok()?.max(0),
-        fade_out_ms: fade_out.parse::<i32>().ok()?.max(0),
+        fade_in_ms: fade_in.parse::<i32>().ok()?,
+        fade_out_ms: fade_out.parse::<i32>().ok()?,
     })
 }
 

@@ -1104,24 +1104,23 @@ fn compute_fad_alpha(fade: ParsedFade, source_event: Option<&ParsedEvent>, now_m
     let Some(event) = source_event else {
         return 0;
     };
-    let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0));
-    let duration = event.duration.max(0);
+    let elapsed = now_ms - event.start;
+    let duration = event.duration.max(0) as i32;
 
-    match fade {
+    let alpha = match fade {
         ParsedFade::Simple {
             fade_in_ms,
             fade_out_ms,
-        } => {
-            if fade_in_ms > 0 && elapsed < i64::from(fade_in_ms) {
-                return (255 - ((elapsed * 255) / i64::from(fade_in_ms.max(1)))) as u8;
-            }
-            if fade_out_ms > 0 && elapsed > duration - i64::from(fade_out_ms) {
-                let fade_out_start = duration - i64::from(fade_out_ms);
-                let fade_elapsed = (elapsed - fade_out_start).max(0);
-                return ((fade_elapsed * 255) / i64::from(fade_out_ms.max(1))) as u8;
-            }
-            0
-        }
+        } => interpolate_alpha(
+            elapsed,
+            0,
+            fade_in_ms,
+            (duration as u32).wrapping_sub(fade_out_ms as u32) as i32,
+            duration,
+            0xFF,
+            0,
+            0xFF,
+        ),
         ParsedFade::Complex {
             alpha1,
             alpha2,
@@ -1133,13 +1132,14 @@ fn compute_fad_alpha(fade: ParsedFade, source_event: Option<&ParsedEvent>, now_m
         } => {
             if t1_ms == -1 && t4_ms == -1 {
                 t1_ms = 0;
-                t4_ms = duration as i32;
-                t3_ms = t4_ms.saturating_sub(t3_ms);
+                t4_ms = duration;
+                t3_ms = (t4_ms as u32).wrapping_sub(t3_ms as u32) as i32;
             }
             interpolate_alpha(elapsed, t1_ms, t2_ms, t3_ms, t4_ms, alpha1, alpha2, alpha3)
-                .clamp(0, 255) as u8
         }
-    }
+    };
+
+    alpha.clamp(0, 255) as u8
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1156,20 +1156,36 @@ fn interpolate_alpha(
     if now < i64::from(t1) {
         a1
     } else if now < i64::from(t2) {
-        let cf = (now - i64::from(t1)) as f64 / i64::from((t2 - t1).max(1)) as f64;
-        (f64::from(a1) * (1.0 - cf) + f64::from(a2) * cf).round() as i32
+        let denom = (t2 as u32).wrapping_sub(t1 as u32) as i32;
+        if denom == 0 {
+            a2
+        } else {
+            let cf = ((now as u32).wrapping_sub(t1 as u32) as i32) as f64 / f64::from(denom);
+            (f64::from(a1) * (1.0 - cf) + f64::from(a2) * cf) as i32
+        }
     } else if now < i64::from(t3) {
         a2
     } else if now < i64::from(t4) {
-        let cf = (now - i64::from(t3)) as f64 / i64::from((t4 - t3).max(1)) as f64;
-        (f64::from(a2) * (1.0 - cf) + f64::from(a3) * cf).round() as i32
+        let denom = (t4 as u32).wrapping_sub(t3 as u32) as i32;
+        if denom == 0 {
+            a3
+        } else {
+            let cf = ((now as u32).wrapping_sub(t3 as u32) as i32) as f64 / f64::from(denom);
+            (f64::from(a2) * (1.0 - cf) + f64::from(a3) * cf) as i32
+        }
     } else {
         a3
     }
 }
 
 fn with_fade_alpha(color: u32, fade_alpha: u8) -> u32 {
-    (color & 0xFFFF_FF00) | u32::from(fade_alpha)
+    if fade_alpha == 0 {
+        return color;
+    }
+    let existing_alpha = color & 0xFF;
+    let combined_alpha = existing_alpha - ((existing_alpha * u32::from(fade_alpha) + 0x7F) / 0xFF)
+        + u32::from(fade_alpha);
+    (color & 0xFFFF_FF00) | combined_alpha.min(0xFF)
 }
 
 fn ass_color_to_rgba(color: u32) -> u32 {
@@ -2938,6 +2954,77 @@ mod tests {
             .iter()
             .map(|plane| plane.size.width * plane.size.height)
             .sum()
+    }
+
+    #[test]
+    fn fad_uses_libass_truncating_alpha_interpolation() {
+        let event = ParsedEvent {
+            start: 0,
+            duration: 4000,
+            ..ParsedEvent::default()
+        };
+
+        assert_eq!(
+            compute_fad_alpha(
+                ParsedFade::Simple {
+                    fade_in_ms: 1000,
+                    fade_out_ms: 1000,
+                },
+                Some(&event),
+                500,
+            ),
+            127
+        );
+        assert_eq!(
+            compute_fad_alpha(
+                ParsedFade::Simple {
+                    fade_in_ms: 1000,
+                    fade_out_ms: 1000,
+                },
+                Some(&event),
+                3500,
+            ),
+            127
+        );
+    }
+
+    #[test]
+    fn fad_uses_libass_wrapping_out_start_when_fade_out_exceeds_duration() {
+        let event = ParsedEvent {
+            start: 0,
+            duration: 800,
+            ..ParsedEvent::default()
+        };
+
+        assert_eq!(
+            compute_fad_alpha(
+                ParsedFade::Simple {
+                    fade_in_ms: 100,
+                    fade_out_ms: 1000,
+                },
+                Some(&event),
+                100,
+            ),
+            76
+        );
+        assert_eq!(
+            compute_fad_alpha(
+                ParsedFade::Simple {
+                    fade_in_ms: 100,
+                    fade_out_ms: 1000,
+                },
+                Some(&event),
+                400,
+            ),
+            153
+        );
+    }
+
+    #[test]
+    fn fade_alpha_combines_with_existing_colour_alpha() {
+        assert_eq!(with_fade_alpha(0xFF00_0080, 0), 0xFF00_0080);
+        assert_eq!(with_fade_alpha(0xFF00_0000, 127), 0xFF00_007F);
+        assert_eq!(with_fade_alpha(0xFF00_0080, 127), 0xFF00_00BF);
     }
 
     fn vertical_span(planes: &[ImagePlane]) -> i32 {
