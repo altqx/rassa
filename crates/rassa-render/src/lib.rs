@@ -511,11 +511,12 @@ impl RenderEngine {
                         effective_position,
                         render_scale_x,
                     );
+                    let box_vertical_pixel = style_scale(render_scale_y).round().max(1.0) as i32;
                     opaque_box_rects.push(Rect {
                         x_min: box_origin_x - box_padding,
-                        y_min: box_visible_top - 1,
+                        y_min: box_visible_top - 1 - box_vertical_pixel,
                         x_max: box_origin_x + box_line_width + box_padding,
-                        y_max: box_visible_top + box_visible_height + 1,
+                        y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
                     });
                 }
             }
@@ -3241,6 +3242,38 @@ mod tests {
         assert_eq!(
             first_outline.destination.x, 44,
             "the unscaled Wide run must receive the same high-resolution x compensation as the later scaled Mix run"
+        );
+    }
+
+    #[test]
+    fn border_style3_opaque_box_aligns_to_scaled_output_pixel_grid() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 180\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,42,&H00FFFFFF,&H0000FFFF,&H00010203,&H00111111,0,0,0,0,100,100,0,0,3,4,3,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:04.00,Default,,0,0,0,,{\\pos(160,90)}Box").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let config = RendererConfig {
+            frame: Size {
+                width: 320 * 8,
+                height: 180 * 8,
+            },
+            storage: Size {
+                width: 320,
+                height: 180,
+            },
+            ..RendererConfig::default()
+        };
+        let planes = engine.render_frame_with_provider_and_config(&track, &provider, 500, &config);
+        let box_outline = planes
+            .iter()
+            .find(|plane| {
+                plane.kind == ass::ImageType::Outline
+                    && plane.size.width >= 530
+                    && plane.size.height >= 400
+            })
+            .expect("opaque BorderStyle=3 box outline plane");
+
+        assert_eq!(
+            box_outline.destination.y, 519,
+            "the high-resolution opaque box must start one output pixel above the unadjusted centered rect so the downsampled bbox matches libass"
         );
     }
 
