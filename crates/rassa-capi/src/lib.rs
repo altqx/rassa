@@ -289,7 +289,7 @@ impl OwnedStyleOverride {
                 secondary_colour: style.SecondaryColour,
                 outline_colour: style.OutlineColour,
                 back_colour: style.BackColour,
-                bold: style.Bold != 0,
+                bold: ffi_bold_is_active(style.Bold),
                 italic: style.Italic != 0,
                 underline: style.Underline != 0,
                 strike_out: style.StrikeOut != 0,
@@ -1223,7 +1223,7 @@ unsafe fn apply_style_override(style: &mut ASS_Style, field_name: &str, value: &
     } else if field_name.eq_ignore_ascii_case("FontSize") {
         style.FontSize = parse_override_f64(value, style.FontSize);
     } else if field_name.eq_ignore_ascii_case("Bold") {
-        style.Bold = parse_override_bool(value, style.Bold != 0) as c_int;
+        style.Bold = parse_override_bold(value, ffi_bold_is_active(style.Bold)) as c_int;
     } else if field_name.eq_ignore_ascii_case("Italic") {
         style.Italic = parse_override_bool(value, style.Italic != 0) as c_int;
     } else if field_name.eq_ignore_ascii_case("Underline") {
@@ -1287,6 +1287,24 @@ fn parse_override_bool(value: &str, default: bool) -> bool {
             .trim()
             .parse::<i32>()
             .map(|parsed| parsed != 0)
+            .unwrap_or(default)
+    }
+}
+
+fn ffi_bold_is_active(value: c_int) -> bool {
+    value == 1 || !(0..700).contains(&value)
+}
+
+fn parse_override_bold(value: &str, default: bool) -> bool {
+    if value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("true") {
+        true
+    } else if value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("false") {
+        false
+    } else {
+        value
+            .trim()
+            .parse::<c_int>()
+            .map(ffi_bold_is_active)
             .unwrap_or(default)
     }
 }
@@ -1709,7 +1727,7 @@ unsafe fn parsed_style_from_ffi(style: &ASS_Style) -> ParsedStyle {
         secondary_colour: style.SecondaryColour,
         outline_colour: style.OutlineColour,
         back_colour: style.BackColour,
-        bold: style.Bold != 0,
+        bold: ffi_bold_is_active(style.Bold),
         italic: style.Italic != 0,
         underline: style.Underline != 0,
         strike_out: style.StrikeOut != 0,

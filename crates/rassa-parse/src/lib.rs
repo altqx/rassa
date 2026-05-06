@@ -792,7 +792,7 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
             "backcolour" | "backcolor" => {
                 style.back_colour = parse_color(raw_value, style.back_colour)
             }
-            "bold" => style.bold = parse_bool(raw_value, style.bold),
+            "bold" => style.bold = parse_bold(raw_value, style.bold),
             "italic" => style.italic = parse_bool(raw_value, style.italic),
             "underline" => style.underline = parse_bool(raw_value, style.underline),
             "strikeout" => style.strike_out = parse_bool(raw_value, style.strike_out),
@@ -908,6 +908,13 @@ fn parse_bool(value: &str, fallback: bool) -> bool {
             "no" | "false" => false,
             _ => fallback,
         },
+    }
+}
+
+fn parse_bold(value: &str, fallback: bool) -> bool {
+    match value.trim().parse::<i32>() {
+        Ok(parsed) => parsed == 1 || !(0..700).contains(&parsed),
+        Err(_) => parse_bool(value, fallback),
     }
 }
 
@@ -1148,7 +1155,7 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix('s') {
             current_style.strike_out = parse_override_bool(rest, current_style.strike_out);
         } else if let Some(rest) = tag.strip_prefix('b') {
-            current_style.bold = parse_override_bool(rest, current_style.bold);
+            current_style.bold = parse_override_bold(rest, current_style.bold);
         } else if let Some(rest) = tag.strip_prefix('i') {
             current_style.italic = parse_override_bool(rest, current_style.italic);
         } else if let Some(rest) = tag.strip_prefix("an") {
@@ -1529,6 +1536,15 @@ fn parse_override_bool(value: &str, fallback: bool) -> bool {
         true
     } else {
         parse_bool(trimmed, fallback)
+    }
+}
+
+fn parse_override_bold(value: &str, fallback: bool) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        true
+    } else {
+        parse_bold(trimmed, fallback)
     }
 }
 
@@ -2300,6 +2316,33 @@ mod tests {
                 mode: ParsedKaraokeMode::FillSwap,
             })
         );
+    }
+
+    #[test]
+    fn parses_numeric_bold_weights_like_libass_boolean_thresholds() {
+        let style_track = parse_script_text(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Light,sans,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,400,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\nStyle: Bold,sans,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,700,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n",
+        )
+        .expect("style script should parse");
+        assert!(!style_track.styles[0].bold);
+        assert!(style_track.styles[1].bold);
+
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\b100}Thin{\\b400}Regular{\\b700}Heavy{\\b1}Legacy{\\b0}Off",
+            &base_style,
+            &[],
+        );
+
+        let spans = &parsed.lines[0].spans;
+        assert!(!spans[0].style.bold);
+        assert!(spans[0].text.contains("Thin"));
+        assert!(spans[0].text.contains("Regular"));
+        assert!(spans[1].style.bold);
+        assert!(spans[1].text.contains("Heavy"));
+        assert!(spans[1].text.contains("Legacy"));
+        assert!(!spans[2].style.bold);
+        assert_eq!(spans[2].text, "Off");
     }
 
     #[test]
