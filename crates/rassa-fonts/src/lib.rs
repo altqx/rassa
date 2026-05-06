@@ -49,6 +49,8 @@ pub struct FontMatch {
     pub path: Option<PathBuf>,
     pub face_index: Option<u32>,
     pub style: Option<String>,
+    pub synthetic_bold: bool,
+    pub synthetic_italic: bool,
     pub provider: FontProviderKind,
 }
 
@@ -63,6 +65,8 @@ impl FontMatch {
             path: None,
             face_index: None,
             style,
+            synthetic_bold: false,
+            synthetic_italic: false,
             provider,
         }
     }
@@ -129,12 +133,22 @@ impl CrossfontProvider {
     #[cfg(not(target_arch = "wasm32"))]
     fn find_font(&self, family: String, style: Option<String>) -> Option<FontMatch> {
         resolve_system_font(&family, style.as_deref()).map(
-            |(resolved_family, resolved_path, face_index)| FontMatch {
-                family: resolved_family,
-                path: resolved_path,
-                face_index,
-                style,
-                provider: FontProviderKind::Fontconfig,
+            |(resolved_family, resolved_path, face_index)| {
+                let resolved_style = resolved_path
+                    .as_deref()
+                    .and_then(|path| load_face_metadata(path).and_then(|(_, style)| style));
+                let (synthetic_bold, synthetic_italic) =
+                    synthetic_style_flags(style.as_deref(), resolved_style.as_deref());
+
+                FontMatch {
+                    family: resolved_family,
+                    path: resolved_path,
+                    face_index,
+                    style,
+                    synthetic_bold,
+                    synthetic_italic,
+                    provider: FontProviderKind::Fontconfig,
+                }
             },
         )
     }
@@ -434,11 +448,15 @@ impl FontProvider for AttachedFontProvider {
             .find(|font| font.aliases.iter().any(|alias| alias == &family_key));
 
         if let Some(font) = exact.or(fallback) {
+            let (synthetic_bold, synthetic_italic) =
+                synthetic_style_flags(query.style.as_deref(), font.style.as_deref());
             return FontMatch {
                 family: font.family.clone(),
                 path: Some(font.path.clone()),
                 face_index: None,
                 style: font.style.clone(),
+                synthetic_bold,
+                synthetic_italic,
                 provider: FontProviderKind::Attached,
             };
         }
@@ -506,9 +524,21 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
             path: Some(self.path.clone()),
             face_index: None,
             style: query.style.clone(),
+            synthetic_bold: false,
+            synthetic_italic: false,
             provider: FontProviderKind::DefaultFile,
         }
     }
+}
+
+fn synthetic_style_flags(requested: Option<&str>, resolved: Option<&str>) -> (bool, bool) {
+    let requested = requested.map(normalize_font_key).unwrap_or_default();
+    let resolved = resolved.map(normalize_font_key).unwrap_or_default();
+    (
+        requested.contains("bold") && !resolved.contains("bold"),
+        (requested.contains("italic") || requested.contains("oblique"))
+            && !(resolved.contains("italic") || resolved.contains("oblique")),
+    )
 }
 
 impl AttachedFontRecord {
@@ -663,6 +693,32 @@ mod tests {
         let result = provider.resolve(&FontQuery::new("DejaVu Sans").with_style("Bold"));
 
         assert_eq!(result.path, Some(expected_path));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn fontconfig_provider_does_not_synthesize_weight_for_real_bold_face() {
+        let expected = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "DejaVu Sans:weight=bold"])
+            .output()
+            .expect("fc-match should be available with fontconfig");
+        assert!(expected.status.success());
+        let expected_path = PathBuf::from(String::from_utf8(expected.stdout).expect("utf8 path"));
+        if !expected_path.exists()
+            || load_face_metadata(&expected_path)
+                .and_then(|(_, style)| style)
+                .is_none_or(|style| !normalize_font_key(&style).contains("bold"))
+        {
+            eprintln!("skipping: system fontconfig has no real DejaVu Sans Bold fixture");
+            return;
+        }
+
+        let provider = FontconfigProvider::new();
+        let result = provider.resolve(&FontQuery::new("DejaVu Sans").with_style("Bold"));
+
+        assert_eq!(result.path, Some(expected_path));
+        assert!(!result.synthetic_bold);
+        assert!(!result.synthetic_italic);
     }
 
     #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]

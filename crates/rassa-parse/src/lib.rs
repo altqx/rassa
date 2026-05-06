@@ -167,6 +167,13 @@ impl ParsedAnimatedStyle {
             && self.blur.is_none()
             && self.be.is_none()
     }
+
+    fn clear_colours(&mut self) {
+        self.primary_colour = None;
+        self.secondary_colour = None;
+        self.outline_colour = None;
+        self.back_colour = None;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1183,6 +1190,8 @@ fn apply_override_block(
             current_transforms.clear();
         }
 
+        suppress_transform_fields_for_override(tag, current_transforms);
+
         if *current_style != previous || *current_transforms != previous_transforms {
             flush_span(
                 buffer,
@@ -1194,6 +1203,89 @@ fn apply_override_block(
             );
         }
     }
+}
+
+fn suppress_transform_fields_for_override(
+    tag: &str,
+    current_transforms: &mut Vec<ParsedSpanTransform>,
+) {
+    if current_transforms.is_empty() || tag.strip_prefix('t').is_some() {
+        return;
+    }
+
+    for transform in current_transforms.iter_mut() {
+        let style = &mut transform.style;
+        if tag
+            .strip_prefix("1c")
+            .or_else(|| tag.strip_prefix('c'))
+            .is_some()
+        {
+            style.primary_colour = None;
+        } else if tag.strip_prefix("2c").is_some() {
+            style.secondary_colour = None;
+        } else if tag.strip_prefix("3c").is_some() {
+            style.outline_colour = None;
+        } else if tag.strip_prefix("4c").is_some() {
+            style.back_colour = None;
+        } else if tag.strip_prefix("alpha").is_some() {
+            style.clear_colours();
+        } else if tag.strip_prefix("1a").is_some() {
+            style.primary_colour = None;
+        } else if tag.strip_prefix("2a").is_some() {
+            style.secondary_colour = None;
+        } else if tag.strip_prefix("3a").is_some() {
+            style.outline_colour = None;
+        } else if tag.strip_prefix("4a").is_some() {
+            style.back_colour = None;
+        } else if tag.strip_prefix("fscx").is_some() {
+            style.scale_x = None;
+        } else if tag.strip_prefix("fscy").is_some() {
+            style.scale_y = None;
+        } else if tag == "fsc" {
+            style.scale_x = None;
+            style.scale_y = None;
+        } else if tag.strip_prefix("fsp").is_some() {
+            style.spacing = None;
+        } else if tag.strip_prefix("frx").is_some() {
+            style.rotation_x = None;
+        } else if tag.strip_prefix("fry").is_some() {
+            style.rotation_y = None;
+        } else if tag
+            .strip_prefix("frz")
+            .or_else(|| tag.strip_prefix("fr"))
+            .is_some()
+        {
+            style.rotation_z = None;
+        } else if tag.strip_prefix("fax").is_some() {
+            style.shear_x = None;
+        } else if tag.strip_prefix("fay").is_some() {
+            style.shear_y = None;
+        } else if tag.strip_prefix("fs").is_some() {
+            style.font_size = None;
+        } else if tag.strip_prefix("xbord").is_some() {
+            style.border_x = None;
+        } else if tag.strip_prefix("ybord").is_some() {
+            style.border_y = None;
+        } else if tag.strip_prefix("bord").is_some() {
+            style.border = None;
+            style.border_x = None;
+            style.border_y = None;
+        } else if tag.strip_prefix("xshad").is_some() {
+            style.shadow_x = None;
+        } else if tag.strip_prefix("yshad").is_some() {
+            style.shadow_y = None;
+        } else if tag.strip_prefix("shad").is_some() {
+            style.shadow = None;
+            style.shadow_x = None;
+            style.shadow_y = None;
+        } else if tag.strip_prefix("blur").is_some() {
+            style.blur = None;
+        } else if tag.strip_prefix("be").is_some() {
+            style.be = None;
+        }
+    }
+
+    current_transforms.retain(|transform| !transform.style.is_empty());
 }
 
 fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<ParsedSpanTransform> {
@@ -2377,6 +2469,24 @@ mod tests {
         assert_eq!(span.style.rotation_z, 15.0);
         assert_eq!(span.transforms.len(), 1);
         assert_eq!(span.transforms[0].style.rotation_z, Some(45.0));
+    }
+
+    #[test]
+    fn later_override_removes_same_field_from_active_transform() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\t(1000,3000,\\1c&H0000FF&\\frz45\\bord8)\\1c&H00FF00&\\frz15}Text",
+            &base_style,
+            &[],
+        );
+
+        let span = &parsed.lines[0].spans[0];
+        assert_eq!(span.style.primary_colour, 0x0000_ff00);
+        assert_eq!(span.style.rotation_z, 15.0);
+        assert_eq!(span.transforms.len(), 1);
+        assert_eq!(span.transforms[0].style.primary_colour, None);
+        assert_eq!(span.transforms[0].style.rotation_z, None);
+        assert_eq!(span.transforms[0].style.border, Some(8.0));
     }
 
     #[test]

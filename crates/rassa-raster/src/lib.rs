@@ -74,6 +74,8 @@ pub struct RasterCacheStats {
 struct GlyphCacheKey {
     family: String,
     style: Option<String>,
+    synthetic_bold: bool,
+    synthetic_italic: bool,
     face_index: Option<u32>,
     glyph_id: u32,
     size_26_6: i32,
@@ -148,7 +150,7 @@ impl Rasterizer {
                     ))
                 })?;
             request_real_dim_size(&mut face, self.options.size_26_6.max(64))?;
-            apply_synthetic_style_transform(&face, font.style.as_deref());
+            apply_synthetic_style_transform(&face, font.synthetic_italic);
             let stroker = library.new_stroker().map_err(|error| {
                 RassaError::new(format!("freetype stroker init failed: {error:?}"))
             })?;
@@ -171,7 +173,7 @@ impl Rasterizer {
                         ))
                     })?;
                 let slot = face.glyph();
-                maybe_embolden_slot(slot, font.style.as_deref());
+                maybe_embolden_slot(slot, font.synthetic_bold);
                 let advance = slot.advance();
                 let stroked = slot
                     .get_glyph()
@@ -245,15 +247,8 @@ fn glyph_cache() -> &'static Mutex<HashMap<GlyphCacheKey, RasterGlyph>> {
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-fn requested_style_contains(style: Option<&str>, needle: &str) -> bool {
-    style
-        .map(|style| style.to_ascii_lowercase().contains(needle))
-        .unwrap_or(false)
-}
-
-#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-fn apply_synthetic_style_transform(face: &freetype::Face, style: Option<&str>) {
-    if requested_style_contains(style, "italic") || requested_style_contains(style, "oblique") {
+fn apply_synthetic_style_transform(face: &freetype::Face, synthetic_italic: bool) {
+    if synthetic_italic {
         let mut matrix = Matrix {
             xx: 0x10000,
             xy: 0x05000,
@@ -266,8 +261,8 @@ fn apply_synthetic_style_transform(face: &freetype::Face, style: Option<&str>) {
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-fn maybe_embolden_slot(slot: &GlyphSlot, style: Option<&str>) {
-    if requested_style_contains(style, "bold") {
+fn maybe_embolden_slot(slot: &GlyphSlot, synthetic_bold: bool) {
+    if synthetic_bold {
         unsafe {
             ffi::FT_GlyphSlot_Embolden(slot.raw() as *const _ as *mut _);
         }
@@ -295,7 +290,7 @@ fn rasterize_freetype_glyphs(
             ))
         })?;
     request_real_dim_size(&mut face, options.size_26_6.max(64))?;
-    apply_synthetic_style_transform(&face, font.style.as_deref());
+    apply_synthetic_style_transform(&face, font.synthetic_italic);
 
     let mut rasterized = Vec::with_capacity(glyphs.len());
     let mut load_flags = load_flags_for_hinting(options.hinting);
@@ -304,6 +299,8 @@ fn rasterize_freetype_glyphs(
         let cache_key = GlyphCacheKey {
             family: font.family.clone(),
             style: font.style.clone(),
+            synthetic_bold: font.synthetic_bold,
+            synthetic_italic: font.synthetic_italic,
             face_index: font.face_index,
             glyph_id: glyph.glyph_id,
             size_26_6: options.size_26_6,
@@ -334,7 +331,7 @@ fn rasterize_freetype_glyphs(
                 ))
             })?;
         let slot = face.glyph();
-        maybe_embolden_slot(slot, font.style.as_deref());
+        maybe_embolden_slot(slot, font.synthetic_bold);
         let advance = slot.advance();
         let rendered = render_slot_to_gray_bitmap(slot, glyph.glyph_id)?;
         let rendered = RasterGlyph {
@@ -418,6 +415,8 @@ fn rasterize_system_glyphs(
         let cache_key = GlyphCacheKey {
             family: font.family.clone(),
             style: font.style.clone(),
+            synthetic_bold: font.synthetic_bold,
+            synthetic_italic: font.synthetic_italic,
             face_index: font.face_index,
             glyph_id: glyph.glyph_id,
             size_26_6: options.size_26_6,

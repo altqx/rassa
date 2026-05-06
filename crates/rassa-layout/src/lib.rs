@@ -534,6 +534,8 @@ fn split_text_by_font<P: FontProvider>(
                     path: resolved_path,
                     face_index,
                     style: style.clone(),
+                    synthetic_bold: base_font.synthetic_bold,
+                    synthetic_italic: base_font.synthetic_italic,
                     provider: base_font.provider,
                 })
                 .unwrap_or_else(|| base_font.clone())
@@ -556,6 +558,8 @@ fn same_font_match(left: &FontMatch, right: &FontMatch) -> bool {
         && left.path == right.path
         && left.face_index == right.face_index
         && left.style == right.style
+        && left.synthetic_bold == right.synthetic_bold
+        && left.synthetic_italic == right.synthetic_italic
 }
 
 fn font_style_name(style: &ParsedSpanStyle) -> Option<String> {
