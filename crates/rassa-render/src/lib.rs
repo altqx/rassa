@@ -367,11 +367,7 @@ impl RenderEngine {
                         effective_style.scale_y,
                     );
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
-                    let glyph_origin_x = run_origin_x
-                        - i32::from(
-                            (effective_style.scale_x - 1.0).abs() > f64::EPSILON
-                                || (effective_style.scale_y - 1.0).abs() > f64::EPSILON,
-                        );
+                    let glyph_origin_x = run_origin_x - i32::from(has_scaled_run);
                     let run_line_ascender = Some(line_ascender);
                     let effective_blur = effective_style.blur.max(effective_style.be);
                     let has_outline = effective_style.border > 0.0
@@ -3229,6 +3225,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(decoration_planes.len() >= 2);
+    }
+
+    #[test]
+    fn scaled_run_offsets_apply_to_unscaled_siblings_on_same_line() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 180\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,DejaVu Sans,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:03.00,Default,,0000,0000,0000,,{\\pos(160,90)\\3c&H00FF00&}Wide{\\fscx130\\fscy70}Mix").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let first_outline = planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Outline)
+            .expect("first outline plane");
+
+        assert_eq!(
+            first_outline.destination.x, 44,
+            "the unscaled Wide run must receive the same high-resolution x compensation as the later scaled Mix run"
+        );
     }
 
     #[test]
