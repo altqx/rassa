@@ -412,6 +412,7 @@ impl RenderEngine {
                     },
                 ) + if has_karaoke_run { 1 } else { 0 };
                 let mut line_pen_x = 0;
+                let mut line_has_transformed_borderstyle3_box = false;
                 for run in &line.runs {
                     let effective_style = apply_renderer_style_scale(
                         resolve_run_style(run, track.events.get(event.event_index), now_ms),
@@ -425,6 +426,66 @@ impl RenderEngine {
                     let run_outline_start = outline_planes.len();
                     let run_character_start = character_planes.len();
                     let run_transform = style_transform(&effective_style);
+                    let transformed_borderstyle3_box =
+                        style.border_style == 3 && !run_transform.is_identity();
+                    if transformed_borderstyle3_box {
+                        line_has_transformed_borderstyle3_box = true;
+                        let box_scale = renderer_font_scale(config) * style_scale(render_scale);
+                        let compensation = if track.scaled_border_and_shadow {
+                            1.0
+                        } else {
+                            border_shadow_compensation_scale(track, config)
+                        };
+                        let box_padding = (effective_style.border * box_scale / compensation)
+                            .round()
+                            .max(0.0) as i32;
+                        let box_visible_height = (effective_style.font_size
+                            * style_scale(render_scale_y))
+                        .round()
+                        .max(1.0) as i32
+                            + box_padding * 2;
+                        let box_visible_top = if let Some((_, y)) = effective_position {
+                            match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+                                ass::VALIGN_TOP => y,
+                                ass::VALIGN_CENTER => y - box_visible_height / 2,
+                                _ => y - box_visible_height,
+                            }
+                        } else {
+                            line_top
+                        };
+                        let run_box_width = (f64::from(run.width) * render_scale_x).round() as i32;
+                        let box_vertical_pixel =
+                            style_scale(render_scale_y).round().max(1.0) as i32;
+                        let rect = Rect {
+                            x_min: run_origin_x - box_padding,
+                            y_min: box_visible_top - 1 - box_vertical_pixel,
+                            x_max: run_origin_x + run_box_width + box_padding,
+                            y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
+                        };
+                        if let Some(box_plane) = opaque_box_plane_from_rects(
+                            &[rect],
+                            effective_style.outline_colour,
+                            ass::ImageType::Outline,
+                            Point { x: 0, y: 0 },
+                        ) {
+                            outline_planes.push(box_plane);
+                        }
+                        let box_shadow =
+                            (effective_style.shadow * box_scale / compensation).round() as i32;
+                        if box_shadow > 0 {
+                            if let Some(shadow_plane) = opaque_box_plane_from_rects(
+                                &[rect],
+                                effective_style.back_colour,
+                                ass::ImageType::Shadow,
+                                Point {
+                                    x: box_shadow,
+                                    y: box_shadow,
+                                },
+                            ) {
+                                shadow_planes.push(shadow_plane);
+                            }
+                        }
+                    }
                     if let Some(drawing) = &run.drawing {
                         let positioned_drawing = effective_position.is_some();
                         let drawing_baseline_y =
@@ -690,7 +751,7 @@ impl RenderEngine {
                     );
                     line_pen_x += run_advance;
                 }
-                if style.border_style == 3 {
+                if style.border_style == 3 && !line_has_transformed_borderstyle3_box {
                     let box_scale = renderer_font_scale(config) * style_scale(render_scale);
                     let compensation = if track.scaled_border_and_shadow {
                         1.0
@@ -3699,24 +3760,26 @@ mod tests {
         max_y - min_y
     }
 
-    fn character_bounds(planes: &[ImagePlane]) -> Option<Rect> {
-        let mut character_planes = planes
-            .iter()
-            .filter(|plane| plane.kind == ass::ImageType::Character);
-        let first = character_planes.next()?;
+    fn kind_bounds(planes: &[ImagePlane], kind: ass::ImageType) -> Option<Rect> {
+        let mut matching_planes = planes.iter().filter(|plane| plane.kind == kind);
+        let first = matching_planes.next()?;
         let mut bounds = Rect {
             x_min: first.destination.x,
             y_min: first.destination.y,
             x_max: first.destination.x + first.size.width,
             y_max: first.destination.y + first.size.height,
         };
-        for plane in character_planes {
+        for plane in matching_planes {
             bounds.x_min = bounds.x_min.min(plane.destination.x);
             bounds.y_min = bounds.y_min.min(plane.destination.y);
             bounds.x_max = bounds.x_max.max(plane.destination.x + plane.size.width);
             bounds.y_max = bounds.y_max.max(plane.destination.y + plane.size.height);
         }
         Some(bounds)
+    }
+
+    fn character_bounds(planes: &[ImagePlane]) -> Option<Rect> {
+        kind_bounds(planes, ass::ImageType::Character)
     }
 
     fn visible_bounds(planes: &[ImagePlane]) -> Option<Rect> {
@@ -3785,6 +3848,22 @@ mod tests {
         let provider = FontconfigProvider::new();
         let planes = engine.render_frame_with_provider(&track, &provider, 500);
         visible_bounds(&planes)
+    }
+
+    #[test]
+    fn borderstyle3_opaque_box_follows_text_transform() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,Arial,42,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,3,4,0,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:05.00,Box,,0,0,0,,{\\pos(320,180)\\frz-18\\fax0.25}TRANSFORM BOX\n";
+        let track = parse_script_text(script).expect("borderstyle transform script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let box_bounds = kind_bounds(&planes, ass::ImageType::Outline)
+            .expect("BorderStyle=3 should emit an opaque box outline plane");
+
+        assert!(
+            box_bounds.height() > 90,
+            "opaque box must be transformed with the rotated/sheared text, got bounds {box_bounds:?}"
+        );
     }
 
     #[test]
