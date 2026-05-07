@@ -314,8 +314,7 @@ impl RenderEngine {
 
         let render_scale_x = output_scale_x(track, config);
         let render_scale_y = output_scale_y(track, config);
-        let render_scale =
-            ((style_scale(render_scale_x) + style_scale(render_scale_y)) / 2.0).max(1.0);
+        let render_scale = (style_scale(render_scale_x) + style_scale(render_scale_y)) / 2.0;
 
         for event in &prepared.active_events {
             let Some(style) = track.styles.get(event.style_index) else {
@@ -3848,6 +3847,51 @@ mod tests {
         let provider = FontconfigProvider::new();
         let planes = engine.render_frame_with_provider(&track, &provider, 500);
         visible_bounds(&planes)
+    }
+
+    fn render_text_bounds_with_config(script: &str, config: &RendererConfig) -> Option<Rect> {
+        let track = parse_script_text(script).expect("text alignment probe script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider_and_config(&track, &provider, 500, config);
+        visible_bounds(&planes)
+    }
+
+    #[test]
+    fn downscaled_positioned_text_scales_font_and_anchor_like_libass() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an5\\pos(320,180)}POS\n";
+        let config = RendererConfig {
+            frame: Size {
+                width: 320,
+                height: 180,
+            },
+            storage: Size {
+                width: 320,
+                height: 180,
+            },
+            pixel_aspect: 1.0,
+            shaping: ass::ShapingLevel::Complex,
+            ..Default::default()
+        };
+        let actual = render_text_bounds_with_config(script, &config)
+            .expect("positioned text should render in downscaled frame");
+        let expected = Rect {
+            x_min: 141,
+            y_min: 83,
+            x_max: 179,
+            y_max: 97,
+        };
+
+        assert!(
+            (actual.x_min - expected.x_min).abs() <= 2
+                && (actual.y_min - expected.y_min).abs() <= 1,
+            "downscaled \\pos anchor should stay in libass position: actual={actual:?} expected={expected:?}"
+        );
+        assert!(
+            (actual.width() - expected.width()).abs() <= 2
+                && (actual.height() - expected.height()).abs() <= 2,
+            "downscaled \\pos text must scale glyph dimensions like libass: actual={actual:?} expected={expected:?}"
+        );
     }
 
     #[test]
