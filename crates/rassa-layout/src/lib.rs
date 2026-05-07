@@ -94,6 +94,7 @@ impl LayoutEngine {
         let font = provider.resolve(&FontQuery {
             family: style.font_name.clone(),
             style: None,
+            weight: font_query_weight(style.font_weight),
         });
         let explicit_lines = parsed_text
             .lines
@@ -174,6 +175,7 @@ fn layout_line_from_text<P: FontProvider>(
         let font = provider.resolve(&FontQuery {
             family: span.style.font_name.clone(),
             style: font_style_name(&span.style),
+            weight: font_query_weight(span.style.font_weight),
         });
         if let Some(drawing) = &span.drawing {
             let width = drawing
@@ -199,12 +201,14 @@ fn layout_line_from_text<P: FontProvider>(
             provider,
             &span.style.font_name,
             font_style_name(&span.style),
+            span.style.font_weight,
         );
         for (chunk_text, chunk_font) in shaped_chunks {
             let shaped = shaper.shape_text(
                 provider,
                 &ShapeRequest::new(&chunk_text, &chunk_font.family)
                     .with_style(chunk_font.style.clone().unwrap_or_default())
+                    .with_optional_weight(font_query_weight(span.style.font_weight))
                     .with_language(language)
                     .with_font_size(span.style.font_size as f32)
                     .with_mode(shaping_mode),
@@ -510,10 +514,12 @@ fn split_text_by_font<P: FontProvider>(
     provider: &P,
     family: &str,
     style: Option<String>,
+    weight: i32,
 ) -> Vec<(String, FontMatch)> {
     let base_font = provider.resolve(&FontQuery {
         family: family.to_string(),
         style: style.clone(),
+        weight: font_query_weight(weight),
     });
     let mut chunks: Vec<(String, FontMatch)> = Vec::new();
 
@@ -560,6 +566,10 @@ fn same_font_match(left: &FontMatch, right: &FontMatch) -> bool {
         && left.style == right.style
         && left.synthetic_bold == right.synthetic_bold
         && left.synthetic_italic == right.synthetic_italic
+}
+
+fn font_query_weight(weight: i32) -> Option<i32> {
+    (weight != 400).then_some(weight)
 }
 
 fn font_style_name(style: &ParsedSpanStyle) -> Option<String> {

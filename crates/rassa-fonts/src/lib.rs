@@ -25,6 +25,7 @@ pub struct FontAttachment {
 pub struct FontQuery {
     pub family: String,
     pub style: Option<String>,
+    pub weight: Option<i32>,
 }
 
 impl FontQuery {
@@ -32,11 +33,17 @@ impl FontQuery {
         Self {
             family: family.into(),
             style: None,
+            weight: None,
         }
     }
 
     pub fn with_style(mut self, style: impl Into<String>) -> Self {
         self.style = Some(style.into());
+        self
+    }
+
+    pub fn with_weight(mut self, weight: i32) -> Self {
+        self.weight = Some(weight);
         self
     }
 }
@@ -138,14 +145,19 @@ impl CrossfontProvider {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn find_font(&self, family: String, style: Option<String>) -> Option<FontMatch> {
-        resolve_system_font(&family, style.as_deref()).map(
+    fn find_font(
+        &self,
+        family: String,
+        style: Option<String>,
+        weight: Option<i32>,
+    ) -> Option<FontMatch> {
+        resolve_system_font(&family, style.as_deref(), weight).map(
             |(resolved_family, resolved_path, face_index)| {
                 let resolved_style = resolved_path
                     .as_deref()
                     .and_then(|path| load_face_metadata(path).and_then(|(_, style)| style));
                 let (synthetic_bold, synthetic_italic) =
-                    synthetic_style_flags(style.as_deref(), resolved_style.as_deref());
+                    synthetic_style_flags(style.as_deref(), weight, resolved_style.as_deref());
 
                 FontMatch {
                     family: resolved_family,
@@ -161,19 +173,27 @@ impl CrossfontProvider {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn find_font(&self, _family: String, _style: Option<String>) -> Option<FontMatch> {
+    fn find_font(
+        &self,
+        _family: String,
+        _style: Option<String>,
+        _weight: Option<i32>,
+    ) -> Option<FontMatch> {
         None
     }
 }
 
 impl FontProvider for CrossfontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
-        if let Some(font) = self.find_font(query.family.clone(), query.style.clone()) {
+        if let Some(font) = self.find_font(query.family.clone(), query.style.clone(), query.weight)
+        {
             return font;
         }
 
         if let Some(fallback_family) = &self.fallback_family {
-            if let Some(font) = self.find_font(fallback_family.clone(), query.style.clone()) {
+            if let Some(font) =
+                self.find_font(fallback_family.clone(), query.style.clone(), query.weight)
+            {
                 return font;
             }
         }
@@ -190,12 +210,13 @@ impl FontProvider for CrossfontProvider {
 fn resolve_system_font(
     family: &str,
     style: Option<&str>,
+    weight: Option<i32>,
 ) -> Option<(String, Option<PathBuf>, Option<u32>)> {
     let mut database = Database::new();
     database.load_system_fonts();
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some((path, face_index)) = fontconfig_match_path(family, style, None) {
+    if let Some((path, face_index)) = fontconfig_match_path(family, style, weight, None) {
         let resolved_family = load_face_metadata(&path)
             .map(|(family, _)| family)
             .unwrap_or_else(|| family.to_owned());
@@ -205,7 +226,8 @@ fn resolve_system_font(
     let requested_style = style.map(normalize_font_key);
     let wants_bold = requested_style
         .as_deref()
-        .is_some_and(|style| style.contains("bold"));
+        .is_some_and(|style| style.contains("bold"))
+        || weight.is_some_and(bold_weight_is_active);
     let fontdb_style = requested_style
         .as_deref()
         .map(|style| {
@@ -229,11 +251,11 @@ fn resolve_system_font(
 
     let query = Query {
         families: &[family_query],
-        weight: if wants_bold {
+        weight: weight.map(fontdb_weight).unwrap_or(if wants_bold {
             Weight::BOLD
         } else {
             Weight::NORMAL
-        },
+        }),
         stretch: Stretch::Normal,
         style: fontdb_style,
     };
@@ -277,7 +299,7 @@ pub fn resolve_system_font_for_char(
     style: Option<&str>,
     character: char,
 ) -> Option<(String, Option<PathBuf>, Option<u32>)> {
-    let (path, face_index) = fontconfig_match_path(family, style, Some(character))?;
+    let (path, face_index) = fontconfig_match_path(family, style, None, Some(character))?;
     if !font_file_supports_char(&path, character) {
         return None;
     }
@@ -365,9 +387,10 @@ fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
 fn fontconfig_match_path(
     family: &str,
     style: Option<&str>,
+    weight: Option<i32>,
     character: Option<char>,
 ) -> Option<(PathBuf, Option<u32>)> {
-    let pattern = fontconfig_pattern(family, style, character);
+    let pattern = fontconfig_pattern(family, style, weight, character);
     let output = std::process::Command::new("fc-match")
         .args(["-f", "%{file}\n%{index}", &pattern])
         .output()
@@ -386,7 +409,12 @@ fn fontconfig_match_path(
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn fontconfig_pattern(family: &str, style: Option<&str>, character: Option<char>) -> String {
+fn fontconfig_pattern(
+    family: &str,
+    style: Option<&str>,
+    weight: Option<i32>,
+    character: Option<char>,
+) -> String {
     let mut pattern = family.to_owned();
     if let Some(style) = style.filter(|value| !value.trim().is_empty()) {
         let normalized = normalize_font_key(style);
@@ -404,6 +432,10 @@ fn fontconfig_pattern(family: &str, style: Option<&str>, character: Option<char>
             pattern.push_str(style.trim());
         }
     }
+    if let Some(weight) = weight {
+        pattern.push_str(":weight=");
+        pattern.push_str(&normalize_weight(weight).to_string());
+    }
     if let Some(character) = character {
         pattern.push_str(":charset=");
         pattern.push_str(&format!("{:x}", character as u32));
@@ -414,11 +446,20 @@ fn fontconfig_pattern(family: &str, style: Option<&str>, character: Option<char>
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn fontconfig_pattern_requests_weight_and_slant_for_bold_italic() {
-    let pattern = fontconfig_pattern("DejaVu Sans", Some("Bold Italic"), None);
+    let pattern = fontconfig_pattern("DejaVu Sans", Some("Bold Italic"), None, None);
 
     assert!(pattern.contains(":weight=bold"));
     assert!(pattern.contains(":slant=italic"));
     assert!(!pattern.contains(":style=Bold Italic"));
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn fontconfig_pattern_preserves_numeric_weight() {
+    let pattern = fontconfig_pattern("DejaVu Sans", None, Some(500), None);
+
+    assert!(pattern.contains(":weight=500"));
+    assert!(!pattern.contains(":weight=bold"));
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -475,7 +516,7 @@ impl FontProvider for AttachedFontProvider {
 
         if let Some(font) = exact.or(fallback) {
             let (synthetic_bold, synthetic_italic) =
-                synthetic_style_flags(query.style.as_deref(), font.style.as_deref());
+                synthetic_style_flags(query.style.as_deref(), query.weight, font.style.as_deref());
             return FontMatch {
                 family: font.family.clone(),
                 path: Some(font.path.clone()),
@@ -557,14 +598,32 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
     }
 }
 
-fn synthetic_style_flags(requested: Option<&str>, resolved: Option<&str>) -> (bool, bool) {
+fn synthetic_style_flags(
+    requested: Option<&str>,
+    requested_weight: Option<i32>,
+    resolved: Option<&str>,
+) -> (bool, bool) {
     let requested = requested.map(normalize_font_key).unwrap_or_default();
     let resolved = resolved.map(normalize_font_key).unwrap_or_default();
     (
-        requested.contains("bold") && !resolved.contains("bold"),
+        (requested.contains("bold") || requested_weight.is_some_and(bold_weight_is_active))
+            && !resolved.contains("bold"),
         (requested.contains("italic") || requested.contains("oblique"))
             && !(resolved.contains("italic") || resolved.contains("oblique")),
     )
+}
+
+fn normalize_weight(weight: i32) -> i32 {
+    weight.clamp(1, 1000)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fontdb_weight(weight: i32) -> Weight {
+    Weight(normalize_weight(weight) as u16)
+}
+
+fn bold_weight_is_active(weight: i32) -> bool {
+    weight == 1 || !(0..700).contains(&weight)
 }
 
 impl AttachedFontRecord {

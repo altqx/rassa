@@ -47,6 +47,7 @@ pub struct ShapeRequest {
     pub text: String,
     pub family: String,
     pub style: Option<String>,
+    pub weight: Option<i32>,
     pub language: Option<String>,
     pub mode: ShapingMode,
     pub font_size: Option<f32>,
@@ -58,6 +59,7 @@ impl ShapeRequest {
             text: text.into(),
             family: family.into(),
             style: None,
+            weight: None,
             language: None,
             mode: ShapingMode::Simple,
             font_size: None,
@@ -66,6 +68,16 @@ impl ShapeRequest {
 
     pub fn with_style(mut self, style: impl Into<String>) -> Self {
         self.style = Some(style.into());
+        self
+    }
+
+    pub fn with_weight(mut self, weight: i32) -> Self {
+        self.weight = Some(weight);
+        self
+    }
+
+    pub fn with_optional_weight(mut self, weight: Option<i32>) -> Self {
+        self.weight = weight;
         self
     }
 
@@ -176,6 +188,7 @@ impl ShapeEngine {
         let font = provider.resolve(&FontQuery {
             family: request.family.clone(),
             style: request.style.clone(),
+            weight: request.weight,
         });
         let direction = analysis.bidi_analysis.direction;
 

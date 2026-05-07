@@ -19,6 +19,7 @@ pub struct ParsedStyle {
     pub outline_colour: u32,
     pub back_colour: u32,
     pub bold: bool,
+    pub font_weight: i32,
     pub italic: bool,
     pub underline: bool,
     pub strike_out: bool,
@@ -50,6 +51,7 @@ impl Default for ParsedStyle {
             outline_colour: 0x0000_0000,
             back_colour: 0x0000_0000,
             bold: false,
+            font_weight: 400,
             italic: false,
             underline: false,
             strike_out: false,
@@ -103,6 +105,7 @@ pub struct ParsedSpanStyle {
     pub shear_x: f64,
     pub shear_y: f64,
     pub bold: bool,
+    pub font_weight: i32,
     pub italic: bool,
     pub primary_colour: u32,
     pub secondary_colour: u32,
@@ -202,6 +205,7 @@ impl Default for ParsedSpanStyle {
             shear_x: 0.0,
             shear_y: 0.0,
             bold: false,
+            font_weight: 400,
             italic: false,
             primary_colour: ParsedStyle::default().primary_colour,
             secondary_colour: ParsedStyle::default().secondary_colour,
@@ -237,6 +241,7 @@ impl ParsedSpanStyle {
             shear_x: 0.0,
             shear_y: 0.0,
             bold: style.bold,
+            font_weight: style.font_weight,
             italic: style.italic,
             primary_colour: style.primary_colour,
             secondary_colour: style.secondary_colour,
@@ -275,13 +280,17 @@ pub struct ParsedDialogueText {
     pub lines: Vec<ParsedTextLine>,
     pub alignment: Option<i32>,
     pub position: Option<(i32, i32)>,
+    pub position_exact: Option<(f64, f64)>,
     pub movement: Option<ParsedMovement>,
+    pub movement_exact: Option<ParsedMovementExact>,
     pub fade: Option<ParsedFade>,
     pub clip_rect: Option<Rect>,
+    pub clip_rect_exact: Option<ParsedRectF64>,
     pub vector_clip: Option<ParsedVectorClip>,
     pub inverse_clip: bool,
     pub wrap_style: Option<i32>,
     pub origin: Option<(i32, i32)>,
+    pub origin_exact: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -290,6 +299,22 @@ pub struct ParsedMovement {
     pub end: (i32, i32),
     pub t1_ms: i32,
     pub t2_ms: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ParsedMovementExact {
+    pub start: (f64, f64),
+    pub end: (f64, f64),
+    pub t1_ms: i32,
+    pub t2_ms: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ParsedRectF64 {
+    pub x_min: f64,
+    pub y_min: f64,
+    pub x_max: f64,
+    pub y_max: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -795,7 +820,10 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
             "backcolour" | "backcolor" => {
                 style.back_colour = parse_color(raw_value, style.back_colour)
             }
-            "bold" => style.bold = parse_bold(raw_value, style.bold),
+            "bold" => {
+                style.font_weight = parse_bold_weight(raw_value, style.font_weight);
+                style.bold = bold_weight_is_active(style.font_weight);
+            }
             "italic" => style.italic = parse_bool(raw_value, style.italic),
             "underline" => style.underline = parse_bool(raw_value, style.underline),
             "strikeout" => style.strike_out = parse_bool(raw_value, style.strike_out),
@@ -914,11 +942,32 @@ fn parse_bool(value: &str, fallback: bool) -> bool {
     }
 }
 
-fn parse_bold(value: &str, fallback: bool) -> bool {
+fn parse_bold_weight(value: &str, fallback: i32) -> i32 {
     match value.trim().parse::<i32>() {
-        Ok(parsed) => parsed == 1 || !(0..700).contains(&parsed),
-        Err(_) => parse_bool(value, fallback),
+        Ok(0) => 400,
+        Ok(1) => 700,
+        Ok(parsed) => parsed,
+        Err(_) => {
+            if parse_bool(value, bold_weight_is_active(fallback)) {
+                700
+            } else {
+                400
+            }
+        }
     }
+}
+
+fn parse_override_bold_weight(value: &str, fallback: i32) -> i32 {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        700
+    } else {
+        parse_bold_weight(trimmed, fallback)
+    }
+}
+
+fn bold_weight_is_active(weight: i32) -> bool {
+    weight == 1 || !(0..700).contains(&weight)
 }
 
 fn parse_i32(value: &str, fallback: i32) -> i32 {
@@ -1079,16 +1128,28 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix("iclip") {
             if let Some(rect) = parse_rect_clip(rest) {
                 parsed.clip_rect = Some(rect);
+                parsed.clip_rect_exact = parse_rect_clip_exact(rest);
+                parsed.vector_clip = None;
+                parsed.inverse_clip = true;
+            } else if let Some(rect) = parse_rect_clip_exact(rest) {
+                parsed.clip_rect = None;
+                parsed.clip_rect_exact = Some(rect);
                 parsed.vector_clip = None;
                 parsed.inverse_clip = true;
             } else if let Some(vector) = parse_vector_clip(rest) {
                 parsed.clip_rect = None;
+                parsed.clip_rect_exact = None;
                 parsed.vector_clip = Some(vector);
                 parsed.inverse_clip = true;
             }
         } else if let Some(rest) = tag.strip_prefix("move") {
-            if parsed.position.is_none() && parsed.movement.is_none() {
+            if parsed.position.is_none()
+                && parsed.position_exact.is_none()
+                && parsed.movement.is_none()
+                && parsed.movement_exact.is_none()
+            {
                 parsed.movement = parse_move(rest);
+                parsed.movement_exact = parse_move_exact(rest);
             }
         } else if let Some(rest) = tag.strip_prefix("fade") {
             parsed.fade = parse_fade(rest);
@@ -1097,10 +1158,17 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix("clip") {
             if let Some(rect) = parse_rect_clip(rest) {
                 parsed.clip_rect = Some(rect);
+                parsed.clip_rect_exact = parse_rect_clip_exact(rest);
+                parsed.vector_clip = None;
+                parsed.inverse_clip = false;
+            } else if let Some(rect) = parse_rect_clip_exact(rest) {
+                parsed.clip_rect = None;
+                parsed.clip_rect_exact = Some(rect);
                 parsed.vector_clip = None;
                 parsed.inverse_clip = false;
             } else if let Some(vector) = parse_vector_clip(rest) {
                 parsed.clip_rect = None;
+                parsed.clip_rect_exact = None;
                 parsed.vector_clip = Some(vector);
                 parsed.inverse_clip = false;
             }
@@ -1160,7 +1228,8 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix('s') {
             current_style.strike_out = parse_override_bool(rest, current_style.strike_out);
         } else if let Some(rest) = tag.strip_prefix('b') {
-            current_style.bold = parse_override_bold(rest, current_style.bold);
+            current_style.font_weight = parse_override_bold_weight(rest, current_style.font_weight);
+            current_style.bold = bold_weight_is_active(current_style.font_weight);
         } else if let Some(rest) = tag.strip_prefix('i') {
             current_style.italic = parse_override_bool(rest, current_style.italic);
         } else if let Some(rest) = tag.strip_prefix("an") {
@@ -1179,11 +1248,15 @@ fn apply_override_block(
             }
         } else if let Some(rest) = tag.strip_prefix("org") {
             parsed.origin = parse_pos(rest);
+            parsed.origin_exact = parse_pos_exact(rest);
         } else if let Some(rest) = tag.strip_prefix("pos") {
-            if parsed.position.is_none() && parsed.movement.is_none() {
-                if let Some(position) = parse_pos(rest) {
-                    parsed.position = Some(position);
-                }
+            if parsed.position.is_none()
+                && parsed.position_exact.is_none()
+                && parsed.movement.is_none()
+                && parsed.movement_exact.is_none()
+            {
+                parsed.position = parse_pos(rest);
+                parsed.position_exact = parse_pos_exact(rest);
             }
         } else if let Some(rest) = tag.strip_prefix("pbo") {
             current_style.pbo = parse_f64(rest, current_style.pbo);
@@ -1544,15 +1617,6 @@ fn parse_override_bool(value: &str, fallback: bool) -> bool {
     }
 }
 
-fn parse_override_bold(value: &str, fallback: bool) -> bool {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        true
-    } else {
-        parse_bold(trimmed, fallback)
-    }
-}
-
 fn alignment_from_an(value: i32) -> Option<i32> {
     Some(match value {
         1 => ass::VALIGN_SUB | ass::HALIGN_LEFT,
@@ -1594,6 +1658,18 @@ fn parse_pos(value: &str) -> Option<(i32, i32)> {
     Some((x, y))
 }
 
+fn parse_pos_exact(value: &str) -> Option<(f64, f64)> {
+    let trimmed = value.trim();
+    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let mut parts = inside.split(',').map(str::trim);
+    let x = parts.next()?.parse::<f64>().ok()?;
+    let y = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() || !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some((x, y))
+}
+
 fn parse_rect_clip(value: &str) -> Option<Rect> {
     let trimmed = value.trim();
     let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
@@ -1606,6 +1682,28 @@ fn parse_rect_clip(value: &str) -> Option<Rect> {
     let x_max = parts[2].parse::<i32>().ok()?;
     let y_max = parts[3].parse::<i32>().ok()?;
     Some(Rect {
+        x_min,
+        y_min,
+        x_max,
+        y_max,
+    })
+}
+
+fn parse_rect_clip_exact(value: &str) -> Option<ParsedRectF64> {
+    let trimmed = value.trim();
+    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return None;
+    }
+    let x_min = parts[0].parse::<f64>().ok()?;
+    let y_min = parts[1].parse::<f64>().ok()?;
+    let x_max = parts[2].parse::<f64>().ok()?;
+    let y_max = parts[3].parse::<f64>().ok()?;
+    if !x_min.is_finite() || !y_min.is_finite() || !x_max.is_finite() || !y_max.is_finite() {
+        return None;
+    }
+    Some(ParsedRectF64 {
         x_min,
         y_min,
         x_max,
@@ -1943,6 +2041,48 @@ fn parse_move(value: &str) -> Option<ParsedMovement> {
     })
 }
 
+fn parse_move_exact(value: &str) -> Option<ParsedMovementExact> {
+    let trimmed = value.trim();
+    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
+    let (x1, y1, x2, y2, t1_ms, t2_ms) = match parts.as_slice() {
+        [x1, y1, x2, y2] => (
+            x1.parse::<f64>().ok()?,
+            y1.parse::<f64>().ok()?,
+            x2.parse::<f64>().ok()?,
+            y2.parse::<f64>().ok()?,
+            0,
+            0,
+        ),
+        [x1, y1, x2, y2, t1, t2] => {
+            let mut t1_ms = t1.parse::<i32>().ok()?;
+            let mut t2_ms = t2.parse::<i32>().ok()?;
+            if t1_ms > t2_ms {
+                std::mem::swap(&mut t1_ms, &mut t2_ms);
+            }
+            (
+                x1.parse::<f64>().ok()?,
+                y1.parse::<f64>().ok()?,
+                x2.parse::<f64>().ok()?,
+                y2.parse::<f64>().ok()?,
+                t1_ms,
+                t2_ms,
+            )
+        }
+        _ => return None,
+    };
+    if !x1.is_finite() || !y1.is_finite() || !x2.is_finite() || !y2.is_finite() {
+        return None;
+    }
+
+    Some(ParsedMovementExact {
+        start: (x1, y1),
+        end: (x2, y2),
+        t1_ms,
+        t2_ms,
+    })
+}
+
 fn parse_fad(value: &str) -> Option<ParsedFade> {
     let trimmed = value.trim();
     let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
@@ -2149,19 +2289,26 @@ mod tests {
     }
 
     #[test]
-    fn numeric_bold_matches_libass_weight_thresholds() {
+    fn numeric_bold_preserves_weight_and_matches_libass_thresholds() {
         let style = ParsedStyle::default();
-        for (tag, expected) in [
-            ("0", false),
-            ("1", true),
-            ("100", false),
-            ("400", false),
-            ("700", true),
+        for (tag, expected_bold, expected_weight) in [
+            ("0", false, 400),
+            ("1", true, 700),
+            ("100", false, 100),
+            ("400", false, 400),
+            ("500", false, 500),
+            ("700", true, 700),
+            ("900", true, 900),
         ] {
             let parsed = parse_dialogue_text(&format!("{{\\b{tag}}}bold"), &style, &[]);
+            let span_style = &parsed.lines[0].spans[0].style;
             assert_eq!(
-                parsed.lines[0].spans[0].style.bold, expected,
+                span_style.bold, expected_bold,
                 "unexpected bold state for \\b{tag}"
+            );
+            assert_eq!(
+                span_style.font_weight, expected_weight,
+                "unexpected preserved font weight for \\b{tag}"
             );
         }
     }
@@ -2210,6 +2357,15 @@ mod tests {
                 y_max: 40
             })
         );
+        assert_eq!(
+            parsed.clip_rect_exact,
+            Some(ParsedRectF64 {
+                x_min: 10.0,
+                y_min: 20.0,
+                x_max: 30.0,
+                y_max: 40.0,
+            })
+        );
         assert!(!parsed.inverse_clip);
         assert_eq!(
             inverse.clip_rect,
@@ -2220,7 +2376,54 @@ mod tests {
                 y_max: 4
             })
         );
+        assert_eq!(
+            inverse.clip_rect_exact,
+            Some(ParsedRectF64 {
+                x_min: 1.0,
+                y_min: 2.0,
+                x_max: 3.0,
+                y_max: 4.0,
+            })
+        );
         assert!(inverse.inverse_clip);
+    }
+
+    #[test]
+    fn decimal_position_origin_move_and_clip_preserve_exact_coordinates() {
+        let base_style = ParsedStyle::default();
+        let positioned =
+            parse_dialogue_text("{\\pos(10.25,20.75)\\org(4.5,8.125)}Pos", &base_style, &[]);
+        let moved = parse_dialogue_text(
+            "{\\move(1.5,2.25,30.75,40.125,900,100)}Move",
+            &base_style,
+            &[],
+        );
+        let clipped = parse_dialogue_text("{\\clip(1.5,2.5,30.25,40.75)}Clip", &base_style, &[]);
+
+        assert_eq!(positioned.position_exact, Some((10.25, 20.75)));
+        assert_eq!(positioned.origin_exact, Some((4.5, 8.125)));
+        assert_eq!(positioned.position, None);
+        assert_eq!(positioned.origin, None);
+        assert_eq!(
+            moved.movement_exact,
+            Some(ParsedMovementExact {
+                start: (1.5, 2.25),
+                end: (30.75, 40.125),
+                t1_ms: 100,
+                t2_ms: 900,
+            })
+        );
+        assert_eq!(moved.movement, None);
+        assert_eq!(
+            clipped.clip_rect_exact,
+            Some(ParsedRectF64 {
+                x_min: 1.5,
+                y_min: 2.5,
+                x_max: 30.25,
+                y_max: 40.75,
+            })
+        );
+        assert_eq!(clipped.clip_rect, None);
     }
 
     #[test]

@@ -290,6 +290,7 @@ impl OwnedStyleOverride {
                 outline_colour: style.OutlineColour,
                 back_colour: style.BackColour,
                 bold: ffi_bold_is_active(style.Bold),
+                font_weight: ffi_bold_weight(style.Bold),
                 italic: style.Italic != 0,
                 underline: style.Underline != 0,
                 strike_out: style.StrikeOut != 0,
@@ -1295,6 +1296,14 @@ fn ffi_bold_is_active(value: c_int) -> bool {
     value == 1 || !(0..700).contains(&value)
 }
 
+fn ffi_bold_weight(value: c_int) -> i32 {
+    match value {
+        0 => 400,
+        1 => 700,
+        other => other,
+    }
+}
+
 fn parse_override_bold(value: &str, default: bool) -> bool {
     if value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("true") {
         true
@@ -1728,6 +1737,7 @@ unsafe fn parsed_style_from_ffi(style: &ASS_Style) -> ParsedStyle {
         outline_colour: style.OutlineColour,
         back_colour: style.BackColour,
         bold: ffi_bold_is_active(style.Bold),
+        font_weight: ffi_bold_weight(style.Bold),
         italic: style.Italic != 0,
         underline: style.Underline != 0,
         strike_out: style.StrikeOut != 0,

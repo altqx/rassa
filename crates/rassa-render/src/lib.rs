@@ -589,14 +589,14 @@ impl RenderEngine {
                     now_ms,
                 );
             }
-            if let Some(effect_offset) = effect_translation(
+            event_planes = apply_effect_to_planes(
+                event_planes,
                 track.events.get(event.event_index),
+                track,
                 now_ms,
                 render_scale_x,
                 render_scale_y,
-            ) {
-                event_planes = translate_planes(event_planes, effect_offset);
-            }
+            );
             let mut render_offset = output_offset(config);
             if style_scale(render_scale_y) > 1.0 {
                 render_offset.y += render_scale_y.round() as i32;
@@ -638,58 +638,114 @@ fn apply_fade_to_planes(
         .collect()
 }
 
-fn effect_translation(
+fn apply_effect_to_planes(
+    planes: Vec<ImagePlane>,
     source_event: Option<&ParsedEvent>,
+    track: &ParsedTrack,
     now_ms: i64,
     scale_x: f64,
     scale_y: f64,
-) -> Option<Point> {
-    let event = source_event?;
-    let effect = event.effect.trim();
-    if effect.is_empty() {
-        return None;
+) -> Vec<ImagePlane> {
+    let Some(event) = source_event else {
+        return planes;
+    };
+    if planes.is_empty() || event.effect.is_empty() {
+        return planes;
     }
-
-    let parts: Vec<_> = effect.split(';').map(str::trim).collect();
+    let Some(bounds) = planes_bounds(&planes) else {
+        return planes;
+    };
+    let effect = event.effect.as_str();
+    let values = effect_values(effect);
     let elapsed = (now_ms - event.start).max(0) as f64;
-    let effect_name = parts[0].to_ascii_lowercase();
-
-    if effect_name == "banner" {
-        let delay = parts
-            .get(1)
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .max(1.0);
-        let left_to_right = parts
-            .get(2)
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(0)
-            != 0;
-        let direction = if left_to_right { 1.0 } else { -1.0 };
-        return Some(Point {
-            x: (direction * elapsed / delay * style_scale(scale_x)).round() as i32,
-            y: 0,
-        });
-    }
-
-    if effect_name == "scroll up" || effect_name == "scroll down" {
-        let delay = parts
-            .get(3)
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .max(1.0);
-        let direction = if effect_name == "scroll up" {
-            -1.0
-        } else {
-            1.0
+    if effect.starts_with("Banner;") {
+        let Some(delay) = values.first().copied() else {
+            return planes;
         };
-        return Some(Point {
-            x: 0,
-            y: (direction * elapsed / delay * style_scale(scale_y)).round() as i32,
-        });
+        let scale_x = style_scale(scale_x);
+        let delay = scaled_effect_delay(delay, scale_x);
+        let shift = elapsed / delay;
+        let left_to_right = values.get(1).copied().unwrap_or(0) != 0;
+        let target_left = if left_to_right {
+            (shift * scale_x).round() as i32 - (bounds.x_max - bounds.x_min)
+        } else {
+            (f64::from(track.play_res_x) * scale_x - shift * scale_x).round() as i32
+        };
+        return translate_planes(
+            planes,
+            Point {
+                x: target_left - bounds.x_min,
+                y: 0,
+            },
+        );
     }
 
-    None
+    let scroll_up = effect.starts_with("Scroll up;");
+    let scroll_down = effect.starts_with("Scroll down;");
+    if scroll_up || scroll_down {
+        if values.len() < 3 {
+            return planes;
+        }
+        let scale_y = style_scale(scale_y);
+        let delay = scaled_effect_delay(values[2], scale_y);
+        let shift = elapsed / delay;
+        let y0 = values[0].min(values[1]);
+        let y1 = values[0].max(values[1]);
+        let clip_y0 = (f64::from(y0) * scale_y).round() as i32;
+        let clip_y1 = (f64::from(y1) * scale_y).round() as i32;
+        let target_offset = if scroll_up {
+            let target_top = (f64::from(y1) * scale_y - shift * scale_y).round() as i32;
+            target_top - bounds.y_min
+        } else {
+            let target_bottom = (f64::from(y0) * scale_y + shift * scale_y).round() as i32;
+            target_bottom - bounds.y_max
+        };
+        let translated = translate_planes(
+            planes,
+            Point {
+                x: 0,
+                y: target_offset,
+            },
+        );
+        return apply_event_clip(
+            translated,
+            Rect {
+                x_min: i32::MIN / 4,
+                y_min: clip_y0,
+                x_max: i32::MAX / 4,
+                y_max: clip_y1,
+            },
+            false,
+        );
+    }
+
+    planes
+}
+
+fn effect_values(effect: &str) -> Vec<i32> {
+    effect.split(';').skip(1).take(4).map(atoi_prefix).collect()
+}
+
+fn atoi_prefix(value: &str) -> i32 {
+    let trimmed = value.trim_start();
+    let mut end = 0;
+    for (idx, ch) in trimmed.char_indices() {
+        if idx == 0 && (ch == '+' || ch == '-') {
+            end = ch.len_utf8();
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    trimmed[..end].parse::<i32>().unwrap_or(0)
+}
+
+fn scaled_effect_delay(delay: i32, scale: f64) -> f64 {
+    let unscaled = (f64::from(delay) / scale).max(1.0).trunc();
+    (unscaled * scale).max(f64::EPSILON)
 }
 
 fn resolve_run_fill_color(
@@ -3912,7 +3968,11 @@ mod tests {
 
         assert!(
             late.x_min < early.x_min,
-            "banner should move left over time"
+            "right-to-left banner should move left over time"
+        );
+        assert!(
+            (194..=198).contains(&early.x_min),
+            "libass positions a right-to-left banner by PlayResX - elapsed/delay, got {early:?}"
         );
     }
 
