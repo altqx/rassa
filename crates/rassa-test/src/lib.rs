@@ -918,6 +918,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "focused libass pixel guard for vector drawing combined with inline transforms, \\org, shear and clip"]
+    fn upstream_compare_vector_transform_edge_cases_match_libass() {
+        let script = include_str!("../fixtures/libass/compare/edge/vector_transform.ass");
+        assert_pixel_perfect_compare_fixture(
+            script,
+            500,
+            include_bytes!("../fixtures/libass/compare/edge/vector_transform-500.png"),
+        );
+    }
+
+    #[test]
     #[ignore = "broad upstream-generated pixel corpus; run explicitly for renderer parity work"]
     fn upstream_generated_broad_corpus_pixel_diff_report() {
         let corpus_dir = workspace_root().join("crates/rassa-test/fixtures/libass/compare/broad");

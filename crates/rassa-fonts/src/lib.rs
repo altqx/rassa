@@ -121,6 +121,24 @@ impl FontProvider for NullFontProvider {
 
 pub struct CrossfontProvider {
     fallback_family: Option<String>,
+    resolve_cache: Mutex<HashMap<FontResolveKey, FontMatch>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FontResolveKey {
+    family: String,
+    style: Option<String>,
+    weight: Option<i32>,
+}
+
+impl From<&FontQuery> for FontResolveKey {
+    fn from(query: &FontQuery) -> Self {
+        Self {
+            family: query.family.clone(),
+            style: query.style.clone(),
+            weight: query.weight,
+        }
+    }
 }
 
 pub type FontconfigProvider = CrossfontProvider;
@@ -135,13 +153,23 @@ impl CrossfontProvider {
     pub fn new() -> Self {
         Self {
             fallback_family: None,
+            resolve_cache: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_fallback_family(fallback_family: impl Into<String>) -> Self {
         Self {
             fallback_family: Some(fallback_family.into()),
+            resolve_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn resolve_cache_len_for_tests(&self) -> usize {
+        self.resolve_cache
+            .lock()
+            .expect("font resolve cache mutex poisoned")
+            .len()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -185,24 +213,43 @@ impl CrossfontProvider {
 
 impl FontProvider for CrossfontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
-        if let Some(font) = self.find_font(query.family.clone(), query.style.clone(), query.weight)
+        let cache_key = FontResolveKey::from(query);
+        if let Some(cached) = self
+            .resolve_cache
+            .lock()
+            .expect("font resolve cache mutex poisoned")
+            .get(&cache_key)
+            .cloned()
         {
-            return font;
+            return cached;
         }
 
-        if let Some(fallback_family) = &self.fallback_family {
-            if let Some(font) =
-                self.find_font(fallback_family.clone(), query.style.clone(), query.weight)
-            {
-                return font;
-            }
-        }
+        let resolved = if let Some(font) =
+            self.find_font(query.family.clone(), query.style.clone(), query.weight)
+        {
+            font
+        } else if let Some(fallback_family) = &self.fallback_family {
+            self.find_font(fallback_family.clone(), query.style.clone(), query.weight)
+                .unwrap_or_else(|| {
+                    FontMatch::unresolved(
+                        query.family.clone(),
+                        query.style.clone(),
+                        FontProviderKind::Fontconfig,
+                    )
+                })
+        } else {
+            FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::Fontconfig,
+            )
+        };
 
-        FontMatch::unresolved(
-            query.family.clone(),
-            query.style.clone(),
-            FontProviderKind::Fontconfig,
-        )
+        self.resolve_cache
+            .lock()
+            .expect("font resolve cache mutex poisoned")
+            .insert(cache_key, resolved.clone());
+        resolved
     }
 }
 
@@ -739,6 +786,21 @@ mod tests {
         assert_eq!(result.provider, FontProviderKind::Fontconfig);
         assert!(result.path.is_some());
         assert!(result.path.as_ref().is_some_and(|path| path.exists()));
+    }
+
+    #[test]
+    fn fontconfig_provider_caches_identical_resolve_queries() {
+        let provider = FontconfigProvider::new();
+        let query = FontQuery::new("sans");
+
+        assert_eq!(provider.resolve_cache_len_for_tests(), 0);
+        let first = provider.resolve(&query);
+        let cached_entries = provider.resolve_cache_len_for_tests();
+        let second = provider.resolve(&query);
+
+        assert!(cached_entries >= 1);
+        assert_eq!(provider.resolve_cache_len_for_tests(), cached_entries);
+        assert_eq!(second, first);
     }
 
     #[test]
