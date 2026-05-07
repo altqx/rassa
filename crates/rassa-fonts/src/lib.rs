@@ -1,9 +1,16 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
+
+static FONT_CHAR_SUPPORT_CACHE: OnceLock<Mutex<HashMap<(PathBuf, char), bool>>> = OnceLock::new();
+
+fn font_char_support_cache() -> &'static Mutex<HashMap<(PathBuf, char), bool>> {
+    FONT_CHAR_SUPPORT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 use fontdb::{Database, Family, Query, Source, Stretch, Style as FontdbStyle, Weight};
@@ -299,6 +306,25 @@ pub fn font_match_supports_text(font: &FontMatch, text: &str) -> bool {
 }
 
 pub fn font_file_supports_char(path: &Path, character: char) -> bool {
+    let cache_key = (path.to_path_buf(), character);
+    if let Some(supports_char) = font_char_support_cache()
+        .lock()
+        .expect("font char support cache mutex poisoned")
+        .get(&cache_key)
+        .copied()
+    {
+        return supports_char;
+    }
+
+    let supports_char = font_file_supports_char_uncached(path, character);
+    font_char_support_cache()
+        .lock()
+        .expect("font char support cache mutex poisoned")
+        .insert(cache_key, supports_char);
+    supports_char
+}
+
+fn font_file_supports_char_uncached(path: &Path, character: char) -> bool {
     let Ok(data) = fs::read(path) else {
         return false;
     };

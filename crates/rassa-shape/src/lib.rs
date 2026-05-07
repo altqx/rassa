@@ -1,4 +1,34 @@
-use std::{fs, str::FromStr};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::{Arc, Mutex, OnceLock},
+};
+
+static FONT_BYTES_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>> = OnceLock::new();
+
+fn font_bytes_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Vec<u8>>>> {
+    FONT_BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+    if let Some(bytes) = font_bytes_cache()
+        .lock()
+        .expect("font bytes cache mutex poisoned")
+        .get(path)
+        .cloned()
+    {
+        return Some(bytes);
+    }
+
+    let bytes = Arc::new(fs::read(path).ok()?);
+    font_bytes_cache()
+        .lock()
+        .expect("font bytes cache mutex poisoned")
+        .insert(path.to_path_buf(), bytes.clone());
+    Some(bytes)
+}
 
 use harfrust::{Direction, FontRef, Language, ShaperData, UnicodeBuffer};
 use rassa_core::RassaResult;
@@ -190,7 +220,7 @@ impl ShapeEngine {
         font_size: Option<f32>,
     ) -> Option<Vec<GlyphInfo>> {
         let font_path = font.path.as_ref()?;
-        let bytes = fs::read(font_path).ok()?;
+        let bytes = cached_font_bytes(font_path)?;
         let font_ref = FontRef::from_index(bytes.as_slice(), font.face_index.unwrap_or(0)).ok()?;
         let shaper_data = ShaperData::new(&font_ref);
         let shaper = shaper_data.shaper(&font_ref).build();
