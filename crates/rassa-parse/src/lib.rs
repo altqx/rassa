@@ -90,6 +90,7 @@ pub struct ParsedEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedSpanStyle {
     pub font_name: String,
+    pub encoding: i32,
     pub font_size: f64,
     pub scale_x: f64,
     pub scale_y: f64,
@@ -188,6 +189,7 @@ impl Default for ParsedSpanStyle {
     fn default() -> Self {
         Self {
             font_name: ParsedStyle::default().font_name,
+            encoding: ParsedStyle::default().encoding,
             font_size: ParsedStyle::default().font_size,
             scale_x: ParsedStyle::default().scale_x,
             scale_y: ParsedStyle::default().scale_y,
@@ -222,6 +224,7 @@ impl ParsedSpanStyle {
     fn from_style(style: &ParsedStyle) -> Self {
         Self {
             font_name: style.font_name.clone(),
+            encoding: style.encoding,
             font_size: style.font_size,
             scale_x: style.scale_x,
             scale_y: style.scale_y,
@@ -1006,6 +1009,8 @@ fn apply_override_block(
             if !family.is_empty() {
                 current_style.font_name = family.to_string();
             }
+        } else if let Some(rest) = tag.strip_prefix("fe") {
+            current_style.encoding = parse_i32(rest, current_style.encoding);
         } else if let Some(rest) = tag.strip_prefix("kt") {
             flush_span(
                 buffer,
@@ -2130,6 +2135,35 @@ mod tests {
         assert_eq!(parsed.lines[0].spans[0].style.spacing, 3.0);
         assert_eq!(parsed.lines[0].spans[1].style.font_name, "DejaVu Sans");
         assert_eq!(parsed.lines[1].text, "again");
+    }
+
+    #[test]
+    fn fe_override_updates_span_encoding() {
+        let base_style = ParsedStyle {
+            encoding: 1,
+            ..ParsedStyle::default()
+        };
+        let parsed = parse_dialogue_text("{\\fe128}encoded", &base_style, &[]);
+
+        assert_eq!(parsed.lines[0].spans[0].style.encoding, 128);
+    }
+
+    #[test]
+    fn numeric_bold_matches_libass_weight_thresholds() {
+        let style = ParsedStyle::default();
+        for (tag, expected) in [
+            ("0", false),
+            ("1", true),
+            ("100", false),
+            ("400", false),
+            ("700", true),
+        ] {
+            let parsed = parse_dialogue_text(&format!("{{\\b{tag}}}bold"), &style, &[]);
+            assert_eq!(
+                parsed.lines[0].spans[0].style.bold, expected,
+                "unexpected bold state for \\b{tag}"
+            );
+        }
     }
 
     #[test]

@@ -291,6 +291,7 @@ impl RenderEngine {
                             ),
                             effective_style.scale_x,
                             effective_style.scale_y,
+                            effective_style.pbo,
                         ) {
                             if effective_style.border > 0.0 {
                                 let mut outline_glyph = plane_to_raster_glyph(&plane);
@@ -588,6 +589,14 @@ impl RenderEngine {
                     now_ms,
                 );
             }
+            if let Some(effect_offset) = effect_translation(
+                track.events.get(event.event_index),
+                now_ms,
+                render_scale_x,
+                render_scale_y,
+            ) {
+                event_planes = translate_planes(event_planes, effect_offset);
+            }
             let mut render_offset = output_offset(config);
             if style_scale(render_scale_y) > 1.0 {
                 render_offset.y += render_scale_y.round() as i32;
@@ -627,6 +636,60 @@ fn apply_fade_to_planes(
             plane
         })
         .collect()
+}
+
+fn effect_translation(
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    scale_x: f64,
+    scale_y: f64,
+) -> Option<Point> {
+    let event = source_event?;
+    let effect = event.effect.trim();
+    if effect.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<_> = effect.split(';').map(str::trim).collect();
+    let elapsed = (now_ms - event.start).max(0) as f64;
+    let effect_name = parts[0].to_ascii_lowercase();
+
+    if effect_name == "banner" {
+        let delay = parts
+            .get(1)
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(1.0);
+        let left_to_right = parts
+            .get(2)
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0)
+            != 0;
+        let direction = if left_to_right { 1.0 } else { -1.0 };
+        return Some(Point {
+            x: (direction * elapsed / delay * style_scale(scale_x)).round() as i32,
+            y: 0,
+        });
+    }
+
+    if effect_name == "scroll up" || effect_name == "scroll down" {
+        let delay = parts
+            .get(3)
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(1.0);
+        let direction = if effect_name == "scroll up" {
+            -1.0
+        } else {
+            1.0
+        };
+        return Some(Point {
+            x: 0,
+            y: (direction * elapsed / delay * style_scale(scale_y)).round() as i32,
+        });
+    }
+
+    None
 }
 
 fn resolve_run_fill_color(
@@ -2656,6 +2719,7 @@ fn image_plane_from_drawing(
     color: u32,
     scale_x: f64,
     scale_y: f64,
+    baseline_offset: f64,
 ) -> Option<ImagePlane> {
     let polygons = scaled_drawing_polygons(drawing, scale_x, scale_y);
     let bounds = drawing_bounds(&polygons)?;
@@ -2689,7 +2753,7 @@ fn image_plane_from_drawing(
         color: rgba_color_from_ass(color),
         destination: Point {
             x: origin_x + bounds.x_min,
-            y: line_top + bounds.y_min,
+            y: line_top + bounds.y_min - baseline_offset.round() as i32,
         },
         kind: ass::ImageType::Character,
         bitmap,
@@ -3799,6 +3863,84 @@ mod tests {
         assert!(scaled_plane.size.width > baseline_plane.size.width);
         assert!(scaled_plane.size.height < baseline_plane.size.height);
         assert_eq!(scaled_plane.destination, Point { x: 10, y: 10 });
+    }
+
+    #[test]
+    fn render_frame_applies_drawing_baseline_offset() {
+        let baseline = parse_script_text("[Script Info]\nPlayResX: 160\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,40)}X{\\p1}m 0 0 l 10 0 10 10 0 10{\\p0}X").expect("script should parse");
+        let shifted = parse_script_text("[Script Info]\nPlayResX: 160\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,40)}X{\\pbo12\\p1}m 0 0 l 10 0 10 10 0 10{\\p0}X").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let baseline_planes = engine.render_frame_with_provider(&baseline, &provider, 500);
+        let shifted_planes = engine.render_frame_with_provider(&shifted, &provider, 500);
+        let baseline_drawing = baseline_planes
+            .iter()
+            .find(|plane| {
+                plane.kind == ass::ImageType::Character
+                    && plane.size.width == 11
+                    && plane.size.height == 11
+            })
+            .expect("baseline drawing plane");
+        let shifted_drawing = shifted_planes
+            .iter()
+            .find(|plane| {
+                plane.kind == ass::ImageType::Character
+                    && plane.size.width == 11
+                    && plane.size.height == 11
+            })
+            .expect("shifted drawing plane");
+
+        assert_eq!(
+            shifted_drawing.destination.x,
+            baseline_drawing.destination.x
+        );
+        assert_eq!(
+            shifted_drawing.destination.y,
+            baseline_drawing.destination.y - 12
+        );
+    }
+
+    #[test]
+    fn render_frame_applies_banner_effect_motion() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,Banner;25;0;0,Banner").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let early = character_bounds(&engine.render_frame_with_provider(&track, &provider, 100))
+            .expect("early banner bounds");
+        let late = character_bounds(&engine.render_frame_with_provider(&track, &provider, 1500))
+            .expect("late banner bounds");
+
+        assert!(
+            late.x_min < early.x_min,
+            "banner should move left over time"
+        );
+    }
+
+    #[test]
+    fn render_frame_applies_scroll_effect_motion() {
+        let up = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,Scroll up;20;100;25;0,Scroll").expect("script should parse");
+        let down = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,Scroll down;20;100;25;0,Scroll").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let up_early = character_bounds(&engine.render_frame_with_provider(&up, &provider, 100))
+            .expect("early scroll-up bounds");
+        let up_late = character_bounds(&engine.render_frame_with_provider(&up, &provider, 1500))
+            .expect("late scroll-up bounds");
+        let down_early =
+            character_bounds(&engine.render_frame_with_provider(&down, &provider, 100))
+                .expect("early scroll-down bounds");
+        let down_late =
+            character_bounds(&engine.render_frame_with_provider(&down, &provider, 1500))
+                .expect("late scroll-down bounds");
+
+        assert!(
+            up_late.y_min < up_early.y_min,
+            "scroll up should move upward"
+        );
+        assert!(
+            down_late.y_min > down_early.y_min,
+            "scroll down should move downward"
+        );
     }
 
     #[test]

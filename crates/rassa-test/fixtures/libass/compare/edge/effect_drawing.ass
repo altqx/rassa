@@ -1,0 +1,17 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 200
+PlayResY: 120
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,sans,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,Banner;25;0;0,{\p1}m 0 0 l 18 0 18 10 0 10{\p0}
+Dialogue: 1,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,Scroll up;20;100;25;0,{\p1}m 0 0 l 16 0 16 8 0 8{\p0}
+Dialogue: 2,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,Scroll down;20;100;25;0,{\p1}m 0 0 l 14 0 14 6 0 6{\p0}
+Dialogue: 3,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\an7\pos(20,60)\p1\pbo12}m 0 0 l 18 0 18 8 0 8{\p0}

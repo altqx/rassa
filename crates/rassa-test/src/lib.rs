@@ -902,6 +902,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "focused libass pixel guard for ASS Effect Banner/Scroll and drawing \\pbo edge cases"]
+    fn upstream_compare_effect_and_drawing_edge_cases_match_libass() {
+        let script = include_str!("../fixtures/libass/compare/edge/effect_drawing.ass");
+        assert_pixel_perfect_compare_fixture(
+            script,
+            500,
+            include_bytes!("../fixtures/libass/compare/edge/effect_drawing-500.png"),
+        );
+        assert_pixel_perfect_compare_fixture(
+            script,
+            1500,
+            include_bytes!("../fixtures/libass/compare/edge/effect_drawing-1500.png"),
+        );
+    }
+
+    #[test]
     #[ignore = "broad upstream-generated pixel corpus; run explicitly for renderer parity work"]
     fn upstream_generated_broad_corpus_pixel_diff_report() {
         let corpus_dir = workspace_root().join("crates/rassa-test/fixtures/libass/compare/broad");
