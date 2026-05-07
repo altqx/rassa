@@ -292,6 +292,51 @@ mod tests {
         )
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct PlaneBitmapStats {
+        lit_pixels: usize,
+        alpha_sum: u64,
+        partial_pixels: usize,
+        inner_bbox: Option<(usize, usize, usize, usize)>,
+    }
+
+    fn plane_bitmap_stats(plane: &rassa_core::ImagePlane) -> PlaneBitmapStats {
+        let width = plane.size.width.max(0) as usize;
+        let height = plane.size.height.max(0) as usize;
+        let stride = plane.stride.max(0) as usize;
+        let mut lit_pixels = 0_usize;
+        let mut alpha_sum = 0_u64;
+        let mut partial_pixels = 0_usize;
+        let mut min_x = usize::MAX;
+        let mut min_y = usize::MAX;
+        let mut max_x = 0_usize;
+        let mut max_y = 0_usize;
+
+        for y in 0..height {
+            for x in 0..width {
+                let value = plane.bitmap[y * stride + x];
+                if value > 0 {
+                    lit_pixels += 1;
+                    alpha_sum += u64::from(value);
+                    if value < 255 {
+                        partial_pixels += 1;
+                    }
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+
+        PlaneBitmapStats {
+            lit_pixels,
+            alpha_sum,
+            partial_pixels,
+            inner_bbox: (lit_pixels > 0).then_some((min_x, min_y, max_x, max_y)),
+        }
+    }
+
     fn upstream_compare_raw_url(name: &str) -> String {
         assert!(
             name.bytes()
@@ -763,6 +808,61 @@ mod tests {
             summary
                 .iter()
                 .all(|plane| plane.width >= 0 && plane.height >= 0)
+        );
+    }
+
+    #[test]
+    #[ignore = "focused libass fill-raster source coverage parity guard"]
+    fn upstream_compare_sub2_no_blur_source_plane_matches_libass_edge_coverage() {
+        let script =
+            include_str!("../fixtures/libass/compare/test/sub2.ass").replace("{\\blur1}", "");
+        let track = parse_fixture(&script);
+        let provider = compare_fixture_font_provider();
+        let planes = render_track_planes_with_config(
+            &track,
+            &provider,
+            153000,
+            &RendererConfig {
+                frame: Size {
+                    width: 2560,
+                    height: 1440,
+                },
+                storage: Size {
+                    width: 320,
+                    height: 180,
+                },
+                ..RendererConfig::default()
+            },
+        );
+        let character_planes = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            character_planes.len(),
+            1,
+            "no-blur sub2 fixture should produce one fill source plane; planes={:?}",
+            summarize_planes(&planes)
+        );
+        let plane = character_planes[0];
+        let stats = plane_bitmap_stats(plane);
+
+        assert_eq!(plane.destination.x, 329);
+        assert_eq!(plane.destination.y, 519);
+        assert_eq!(plane.size.width, 1966);
+        assert_eq!(plane.size.height, 564);
+        assert_eq!(
+            plane.stride, plane.size.width,
+            "rassa stores compact owned plane rows; libass probe stride is 1984"
+        );
+        assert_eq!(
+            stats,
+            PlaneBitmapStats {
+                lit_pixels: 261_814,
+                alpha_sum: 65_024_894,
+                partial_pixels: 13_548,
+                inner_bbox: Some((0, 1, 1951, 551)),
+            }
         );
     }
 

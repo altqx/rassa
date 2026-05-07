@@ -231,10 +231,12 @@ impl RenderEngine {
                     (run.style.scale_x - 1.0).abs() > f64::EPSILON
                         || (run.style.scale_y - 1.0).abs() > f64::EPSILON
                 });
+                let has_karaoke_run = line.runs.iter().any(|run| run.karaoke.is_some());
                 let text_line_top = if effective_position.is_some() {
                     let border_style_3_y_adjust = if style.border_style == 3 { 3 } else { 0 };
                     line_top + positioned_text_y_correction(line, config, render_scale_y)
                         - border_style_3_y_adjust
+                        + if has_karaoke_run { 2 } else { 0 }
                         + if has_scaled_run { 2 } else { 0 }
                 } else {
                     line_top + if has_scaled_run { 2 } else { 0 }
@@ -254,7 +256,6 @@ impl RenderEngine {
                 } else {
                     origin_x
                 };
-                let has_karaoke_run = line.runs.iter().any(|run| run.karaoke.is_some());
                 let line_ascender = line_raster_ascender(
                     line,
                     track.events.get(event.event_index),
@@ -370,7 +371,8 @@ impl RenderEngine {
                     let glyph_origin_x = run_origin_x - i32::from(has_scaled_run);
                     let run_line_ascender = Some(line_ascender);
                     let effective_blur = effective_style.blur.max(effective_style.be);
-                    let has_outline = effective_style.border > 0.0
+                    let has_outline = style.border_style != 3
+                        && effective_style.border > 0.0
                         && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms);
                     let has_shadow = effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON;
@@ -3317,6 +3319,11 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
 
+        assert_eq!(
+            outline_planes.len(),
+            1,
+            "BorderStyle=3 should emit only the opaque box outline plane, not a separate stroked glyph outline"
+        );
         let _character = visible_bounds(&character_planes).expect("character bounds");
         let outline = outline_planes
             .iter()
