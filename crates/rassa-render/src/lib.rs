@@ -47,7 +47,97 @@ fn layout_line_height_for_line(
         return drawing_only_line_height(line, scale_y);
     }
 
+    text_layout_line_height_for_line(line, config, scale_y)
+}
+
+fn positioned_layout_line_height_for_line(
+    line: &rassa_layout::LayoutLine,
+    config: &RendererConfig,
+    scale_y: f64,
+) -> i32 {
+    if line.runs.iter().all(|run| run.drawing.is_some()) {
+        return drawing_only_line_height(line, scale_y);
+    }
+
     layout_line_height(config, scale_y).max(font_metric_height_for_line(line, scale_y))
+}
+
+fn text_layout_line_height_for_line(
+    line: &rassa_layout::LayoutLine,
+    config: &RendererConfig,
+    scale_y: f64,
+) -> i32 {
+    let scale_y = style_scale(scale_y);
+    let max_font_size = line
+        .runs
+        .iter()
+        .filter(|run| run.drawing.is_none())
+        .map(|run| run.style.font_size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .fold(0.0_f64, f64::max);
+    let extra_spacing = if config.line_spacing.is_finite() {
+        (config.line_spacing * scale_y).round() as i32
+    } else {
+        0
+    };
+    ((max_font_size * scale_y).round() as i32 + extra_spacing).max(1)
+}
+
+fn rendered_text_alignment_width(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    render_scale: RenderScale,
+) -> i32 {
+    if line.runs.iter().all(|run| run.drawing.is_some()) {
+        return (f64::from(line.width) * style_scale(render_scale.x)).round() as i32;
+    }
+
+    let mut width = 0_i32;
+    let mut leading_ink_offset = i32::MAX;
+    for run in &line.runs {
+        if run.drawing.is_some() {
+            width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
+            continue;
+        }
+        if run.glyphs.is_empty() {
+            continue;
+        }
+        let effective_style = apply_renderer_style_scale(
+            resolve_run_style(run, source_event, now_ms),
+            track,
+            config,
+            render_scale.uniform,
+        );
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
+            hinting: config.hinting,
+        });
+        let glyph_infos = scale_glyph_infos(&run.glyphs, render_scale.x, render_scale.y);
+        let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
+            width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
+            continue;
+        };
+        let raster_glyphs = scale_raster_glyphs(
+            raster_glyphs,
+            effective_style.scale_x,
+            effective_style.scale_y,
+        );
+        let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
+        for glyph in &raster_glyphs {
+            if glyph.width > 0 && glyph.height > 0 && glyph.bitmap.iter().any(|value| *value > 0) {
+                leading_ink_offset = leading_ink_offset.min(width + glyph.left);
+            }
+            width += glyph.advance_x;
+        }
+    }
+
+    if leading_ink_offset != i32::MAX && leading_ink_offset > 0 {
+        width += leading_ink_offset * 2;
+    }
+    width.max(1)
 }
 
 fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) -> i32 {
@@ -80,12 +170,25 @@ fn drawing_only_line_height(line: &rassa_layout::LayoutLine, render_scale_y: f64
         .max(1)
 }
 
+fn unpositioned_text_y_correction(
+    line: &rassa_layout::LayoutLine,
+    config: &RendererConfig,
+    scale_y: f64,
+) -> i32 {
+    if line.runs.iter().all(|run| run.drawing.is_some()) {
+        return 0;
+    }
+    let layout_height = text_layout_line_height_for_line(line, config, scale_y);
+    let metric_height = font_metric_height_for_line(line, scale_y).max(1);
+    (layout_height - metric_height).max(0) / 3
+}
+
 fn positioned_text_y_correction(
     line: &rassa_layout::LayoutLine,
     config: &RendererConfig,
     scale_y: f64,
 ) -> i32 {
-    let layout_height = layout_line_height_for_line(line, config, scale_y);
+    let layout_height = positioned_layout_line_height_for_line(line, config, scale_y);
     let metric_height = font_metric_height_for_line(line, scale_y).max(1);
     ((layout_height - metric_height).max(0) * 4) / 9
 }
@@ -262,9 +365,26 @@ impl RenderEngine {
                         + if has_karaoke_run { 2 } else { 0 }
                         + if has_scaled_run { 2 } else { 0 }
                 } else {
-                    line_top + if has_scaled_run { 2 } else { 0 }
+                    line_top
+                        + unpositioned_text_y_correction(line, config, render_scale_y)
+                        + if has_scaled_run { 2 } else { 0 }
                 };
-                let scaled_line_width = (f64::from(line.width) * render_scale_x).round() as i32;
+                let scaled_line_width = if effective_position.is_some() {
+                    (f64::from(line.width) * render_scale_x).round() as i32
+                } else {
+                    rendered_text_alignment_width(
+                        line,
+                        track.events.get(event.event_index),
+                        now_ms,
+                        track,
+                        config,
+                        RenderScale {
+                            x: render_scale_x,
+                            y: render_scale_y,
+                            uniform: render_scale,
+                        },
+                    )
+                };
                 let origin_x = compute_horizontal_origin(
                     track,
                     event,
@@ -2426,7 +2546,7 @@ fn compute_vertical_layout(
     if let Some((_, y)) = position {
         let line_heights = lines
             .iter()
-            .map(|line| layout_line_height_for_line(line, config, scale_y))
+            .map(|line| positioned_layout_line_height_for_line(line, config, scale_y))
             .collect::<Vec<_>>();
         let total_height: i32 = line_heights.iter().sum();
         let mut current_y = match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
@@ -3653,6 +3773,20 @@ mod tests {
         visible_bounds(&planes).expect("drawing probe should produce visible pixels")
     }
 
+    fn text_alignment_script(alignment: i32, event_margins: &str) -> String {
+        format!(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,32,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,{alignment},30,50,15,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,{event_margins},,Margin\n"
+        )
+    }
+
+    fn render_text_bounds(script: &str) -> Option<Rect> {
+        let track = parse_script_text(script).expect("text alignment probe script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        visible_bounds(&planes)
+    }
+
     #[test]
     fn positioned_drawing_an_anchors_match_libass_for_all_alignments() {
         // Expected boxes were probed from libass/ffmpeg for a 40x20 vector drawing at \pos(x,y):
@@ -3861,6 +3995,101 @@ mod tests {
                 render_drawing_bounds(&script),
                 expected,
                 "\\an{alignment} moved drawing anchor should match libass at the event midpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn margin_positioned_text_uses_style_and_event_margins_like_libass() {
+        let cases = [
+            (
+                1,
+                "0,0,0",
+                Rect {
+                    x_min: 32,
+                    y_min: 138,
+                    x_max: 116,
+                    y_max: 165,
+                },
+            ),
+            (
+                2,
+                "0,0,0",
+                Rect {
+                    x_min: 108,
+                    y_min: 138,
+                    x_max: 192,
+                    y_max: 165,
+                },
+            ),
+            (
+                3,
+                "0,0,0",
+                Rect {
+                    x_min: 184,
+                    y_min: 138,
+                    x_max: 269,
+                    y_max: 165,
+                },
+            ),
+            (
+                5,
+                "0,0,0",
+                Rect {
+                    x_min: 108,
+                    y_min: 79,
+                    x_max: 192,
+                    y_max: 106,
+                },
+            ),
+            (
+                7,
+                "0,0,0",
+                Rect {
+                    x_min: 32,
+                    y_min: 20,
+                    x_max: 116,
+                    y_max: 47,
+                },
+            ),
+            (
+                8,
+                "0,0,0",
+                Rect {
+                    x_min: 108,
+                    y_min: 20,
+                    x_max: 192,
+                    y_max: 47,
+                },
+            ),
+            (
+                9,
+                "7,9,11",
+                Rect {
+                    x_min: 225,
+                    y_min: 16,
+                    x_max: 310,
+                    y_max: 43,
+                },
+            ),
+        ];
+
+        for (alignment, event_margins, expected) in cases {
+            let script = text_alignment_script(alignment, event_margins);
+            let Some(actual) = render_text_bounds(&script) else {
+                return;
+            };
+            // Text rasterization can have a few pixels of coverage-width drift from libass even
+            // with the same Fontconfig face. This regression guards the placement bug: the
+            // effective style/event margin anchor must no longer be shifted left or sunk.
+            assert!(
+                (actual.x_min - expected.x_min).abs() <= 1,
+                "text style/event margins and \\an{alignment} x placement should match libass within raster rounding: actual={actual:?} expected={expected:?}"
+            );
+            assert_eq!(
+                (actual.y_min, actual.y_max),
+                (expected.y_min, expected.y_max),
+                "text style/event margins and \\an{alignment} vertical placement should match libass"
             );
         }
     }
