@@ -43,10 +43,18 @@ fn layout_line_height_for_line(
     config: &RendererConfig,
     scale_y: f64,
 ) -> i32 {
+    if line.runs.iter().all(|run| run.drawing.is_some()) {
+        return drawing_only_line_height(line, scale_y);
+    }
+
     layout_line_height(config, scale_y).max(font_metric_height_for_line(line, scale_y))
 }
 
 fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) -> i32 {
+    if line.runs.iter().all(|run| run.drawing.is_some()) {
+        return drawing_only_line_height(line, scale_y);
+    }
+
     let scale_y = style_scale(scale_y);
     let max_font_size = line
         .runs
@@ -55,6 +63,21 @@ fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) ->
         .filter(|size| size.is_finite() && *size > 0.0)
         .fold(0.0_f64, f64::max);
     (max_font_size * scale_y * 0.52).round() as i32
+}
+
+fn drawing_only_line_height(line: &rassa_layout::LayoutLine, render_scale_y: f64) -> i32 {
+    let render_scale_y = style_scale(render_scale_y);
+    line.runs
+        .iter()
+        .filter_map(|run| {
+            let drawing = run.drawing.as_ref()?;
+            let bounds = drawing.bounds()?;
+            let drawing_height = (bounds.height() - 1).max(0) as f64;
+            Some((drawing_height * style_scale(run.style.scale_y) * render_scale_y).round() as i32)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(1)
 }
 
 fn positioned_text_y_correction(
@@ -284,12 +307,16 @@ impl RenderEngine {
                     let run_transform = style_transform(&effective_style);
                     if let Some(drawing) = &run.drawing {
                         let positioned_drawing = effective_position.is_some();
-                        let drawing_baseline_y = if positioned_drawing {
-                            line_top - style_scale(render_scale_y).round() as i32
-                        } else {
-                            line_top + drawing_baseline_ascender(&effective_style, render_scale_y)
-                                - style_scale(render_scale_y).round() as i32
-                        };
+                        let drawing_baseline_y =
+                            if line.runs.iter().all(|run| run.drawing.is_some()) {
+                                line_top
+                            } else if positioned_drawing {
+                                line_top - style_scale(render_scale_y).round() as i32
+                            } else {
+                                line_top
+                                    + drawing_baseline_ascender(&effective_style, render_scale_y)
+                                    - style_scale(render_scale_y).round() as i32
+                            };
                         if let Some(plane) = image_plane_from_drawing(
                             drawing,
                             DrawingPlaneParams {
@@ -309,8 +336,6 @@ impl RenderEngine {
                                     uniform: render_scale,
                                 },
                                 baseline_offset: effective_style.pbo,
-                                positioned_drawing: positioned_drawing
-                                    && run_transform.is_identity(),
                             },
                         ) {
                             if effective_style.border > 0.0 {
@@ -2321,7 +2346,7 @@ fn compute_horizontal_origin(
     match event.alignment & 0x3 {
         ass::HALIGN_LEFT => margin_l,
         ass::HALIGN_RIGHT => (frame_width - margin_r - line_width).max(0),
-        _ => ((frame_width - line_width) / 2).max(0),
+        _ => ((margin_l + frame_width - margin_r - line_width) / 2).max(0),
     }
 }
 
@@ -3150,7 +3175,6 @@ struct DrawingPlaneParams {
     scale_y: f64,
     render_scale: RenderScale,
     baseline_offset: f64,
-    positioned_drawing: bool,
 }
 
 fn image_plane_from_drawing(
@@ -3189,48 +3213,15 @@ fn image_plane_from_drawing(
         }
     }
 
-    let drawing_height = (height - 1).max(0);
     let pbo_pixels = (params.baseline_offset * params.render_scale.y).round() as i32;
-    let vertical_offset = (pbo_pixels - drawing_height).max(0);
-    let horizontal_overhang = if params.positioned_drawing {
-        style_scale(params.render_scale.x).round().max(0.0) as i32
-    } else {
-        0
-    };
-    let (bitmap, width, x_adjust) = if horizontal_overhang > 0 {
-        let expanded_width = width + horizontal_overhang * 2 - 1;
-        let mut expanded = vec![0_u8; expanded_width as usize * height as usize];
-        for row in 0..height as usize {
-            let row_start = row * stride;
-            let row_bitmap = &bitmap[row_start..row_start + width as usize];
-            let first_lit = row_bitmap.iter().position(|value| *value > 0);
-            let last_lit = row_bitmap.iter().rposition(|value| *value > 0);
-            for column in 0..expanded_width as usize {
-                let original_column = column as i32 - horizontal_overhang;
-                let value = match (first_lit, last_lit) {
-                    (Some(first_lit), Some(_last_lit)) if original_column < first_lit as i32 => {
-                        bitmap[row_start + first_lit]
-                    }
-                    (Some(first_lit), Some(last_lit)) if original_column <= last_lit as i32 => {
-                        bitmap[row_start + original_column.max(first_lit as i32) as usize]
-                    }
-                    (Some(_), Some(last_lit)) => bitmap[row_start + last_lit],
-                    _ => 0,
-                };
-                expanded[row * expanded_width as usize + column] = value;
-            }
-        }
-        (expanded, expanded_width, -horizontal_overhang)
-    } else {
-        (bitmap, width, 0)
-    };
+    let vertical_offset = pbo_pixels.max(0);
 
     any_visible.then_some(ImagePlane {
         size: Size { width, height },
         stride: width,
         color: rgba_color_from_ass(params.color),
         destination: Point {
-            x: params.origin_x + bounds.x_min + x_adjust,
+            x: params.origin_x + bounds.x_min,
             y: params.line_top + bounds.y_min + vertical_offset,
         },
         kind: ass::ImageType::Character,
@@ -3642,6 +3633,346 @@ mod tests {
             }
         }
         bounds
+    }
+
+    fn drawing_alignment_script(
+        alignment: i32,
+        override_tags: &str,
+        event_margins: &str,
+    ) -> String {
+        format!(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,32,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,{alignment},30,50,15,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,{event_margins},,{{{override_tags}\\p1}}m 0 0 l 40 0 40 20 0 20\n"
+        )
+    }
+
+    fn render_drawing_bounds(script: &str) -> Rect {
+        let track = parse_script_text(script).expect("alignment probe script should parse");
+        let engine = RenderEngine::new();
+        let provider = NullFontProvider;
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        visible_bounds(&planes).expect("drawing probe should produce visible pixels")
+    }
+
+    #[test]
+    fn positioned_drawing_an_anchors_match_libass_for_all_alignments() {
+        // Expected boxes were probed from libass/ffmpeg for a 40x20 vector drawing at \pos(x,y):
+        // bottom align => y - 20, middle align => y - 10, top align => y.
+        let cases = [
+            (
+                1,
+                "\\an1\\pos(60,60)",
+                Rect {
+                    x_min: 60,
+                    y_min: 40,
+                    x_max: 100,
+                    y_max: 60,
+                },
+            ),
+            (
+                2,
+                "\\an2\\pos(160,60)",
+                Rect {
+                    x_min: 140,
+                    y_min: 40,
+                    x_max: 180,
+                    y_max: 60,
+                },
+            ),
+            (
+                3,
+                "\\an3\\pos(260,60)",
+                Rect {
+                    x_min: 220,
+                    y_min: 40,
+                    x_max: 260,
+                    y_max: 60,
+                },
+            ),
+            (
+                4,
+                "\\an4\\pos(60,100)",
+                Rect {
+                    x_min: 60,
+                    y_min: 90,
+                    x_max: 100,
+                    y_max: 110,
+                },
+            ),
+            (
+                5,
+                "\\an5\\pos(160,100)",
+                Rect {
+                    x_min: 140,
+                    y_min: 90,
+                    x_max: 180,
+                    y_max: 110,
+                },
+            ),
+            (
+                6,
+                "\\an6\\pos(260,100)",
+                Rect {
+                    x_min: 220,
+                    y_min: 90,
+                    x_max: 260,
+                    y_max: 110,
+                },
+            ),
+            (
+                7,
+                "\\an7\\pos(60,140)",
+                Rect {
+                    x_min: 60,
+                    y_min: 140,
+                    x_max: 100,
+                    y_max: 160,
+                },
+            ),
+            (
+                8,
+                "\\an8\\pos(160,140)",
+                Rect {
+                    x_min: 140,
+                    y_min: 140,
+                    x_max: 180,
+                    y_max: 160,
+                },
+            ),
+            (
+                9,
+                "\\an9\\pos(260,140)",
+                Rect {
+                    x_min: 220,
+                    y_min: 140,
+                    x_max: 260,
+                    y_max: 160,
+                },
+            ),
+        ];
+
+        for (alignment, override_tags, expected) in cases {
+            let script = drawing_alignment_script(alignment, override_tags, "0,0,0");
+            assert_eq!(
+                render_drawing_bounds(&script),
+                expected,
+                "\\an{alignment} positioned drawing anchor should match libass"
+            );
+        }
+    }
+
+    #[test]
+    fn moved_drawing_an_anchors_match_libass_for_all_alignments_at_midpoint() {
+        let cases = [
+            (
+                1,
+                "\\an1\\move(40,60,80,60)",
+                Rect {
+                    x_min: 60,
+                    y_min: 40,
+                    x_max: 100,
+                    y_max: 60,
+                },
+            ),
+            (
+                2,
+                "\\an2\\move(140,60,180,60)",
+                Rect {
+                    x_min: 140,
+                    y_min: 40,
+                    x_max: 180,
+                    y_max: 60,
+                },
+            ),
+            (
+                3,
+                "\\an3\\move(240,60,280,60)",
+                Rect {
+                    x_min: 220,
+                    y_min: 40,
+                    x_max: 260,
+                    y_max: 60,
+                },
+            ),
+            (
+                4,
+                "\\an4\\move(40,100,80,100)",
+                Rect {
+                    x_min: 60,
+                    y_min: 90,
+                    x_max: 100,
+                    y_max: 110,
+                },
+            ),
+            (
+                5,
+                "\\an5\\move(140,100,180,100)",
+                Rect {
+                    x_min: 140,
+                    y_min: 90,
+                    x_max: 180,
+                    y_max: 110,
+                },
+            ),
+            (
+                6,
+                "\\an6\\move(240,100,280,100)",
+                Rect {
+                    x_min: 220,
+                    y_min: 90,
+                    x_max: 260,
+                    y_max: 110,
+                },
+            ),
+            (
+                7,
+                "\\an7\\move(40,140,80,140)",
+                Rect {
+                    x_min: 60,
+                    y_min: 140,
+                    x_max: 100,
+                    y_max: 160,
+                },
+            ),
+            (
+                8,
+                "\\an8\\move(140,140,180,140)",
+                Rect {
+                    x_min: 140,
+                    y_min: 140,
+                    x_max: 180,
+                    y_max: 160,
+                },
+            ),
+            (
+                9,
+                "\\an9\\move(240,140,280,140)",
+                Rect {
+                    x_min: 220,
+                    y_min: 140,
+                    x_max: 260,
+                    y_max: 160,
+                },
+            ),
+        ];
+
+        for (alignment, override_tags, expected) in cases {
+            let script = drawing_alignment_script(alignment, override_tags, "0,0,0");
+            assert_eq!(
+                render_drawing_bounds(&script),
+                expected,
+                "\\an{alignment} moved drawing anchor should match libass at the event midpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn margin_positioned_drawing_uses_style_and_event_margins_like_libass() {
+        // Expected boxes were probed from libass/ffmpeg for a 40x20 vector drawing with
+        // style margins L=30/R=50/V=15. Event margins of 0 should fall back to style margins.
+        let cases = [
+            (
+                1,
+                Rect {
+                    x_min: 30,
+                    y_min: 145,
+                    x_max: 70,
+                    y_max: 165,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x_min: 130,
+                    y_min: 145,
+                    x_max: 170,
+                    y_max: 165,
+                },
+            ),
+            (
+                3,
+                Rect {
+                    x_min: 230,
+                    y_min: 145,
+                    x_max: 270,
+                    y_max: 165,
+                },
+            ),
+            (
+                4,
+                Rect {
+                    x_min: 30,
+                    y_min: 80,
+                    x_max: 70,
+                    y_max: 100,
+                },
+            ),
+            (
+                5,
+                Rect {
+                    x_min: 130,
+                    y_min: 80,
+                    x_max: 170,
+                    y_max: 100,
+                },
+            ),
+            (
+                6,
+                Rect {
+                    x_min: 230,
+                    y_min: 80,
+                    x_max: 270,
+                    y_max: 100,
+                },
+            ),
+            (
+                7,
+                Rect {
+                    x_min: 30,
+                    y_min: 15,
+                    x_max: 70,
+                    y_max: 35,
+                },
+            ),
+            (
+                8,
+                Rect {
+                    x_min: 130,
+                    y_min: 15,
+                    x_max: 170,
+                    y_max: 35,
+                },
+            ),
+            (
+                9,
+                Rect {
+                    x_min: 230,
+                    y_min: 15,
+                    x_max: 270,
+                    y_max: 35,
+                },
+            ),
+        ];
+
+        for (alignment, expected) in cases {
+            let script = drawing_alignment_script(alignment, "", "0,0,0");
+            assert_eq!(
+                render_drawing_bounds(&script),
+                expected,
+                "style margins and \\an{alignment} should match libass when no explicit position exists"
+            );
+        }
+
+        let script = drawing_alignment_script(7, "", "7,9,11");
+        assert_eq!(
+            render_drawing_bounds(&script),
+            Rect {
+                x_min: 7,
+                y_min: 11,
+                x_max: 47,
+                y_max: 31
+            },
+            "non-zero event margins should override style margins for top-left alignment"
+        );
     }
 
     #[test]
@@ -4348,7 +4679,7 @@ mod tests {
 
         assert!(scaled_plane.size.width > baseline_plane.size.width);
         assert!(scaled_plane.size.height < baseline_plane.size.height);
-        assert_eq!(scaled_plane.destination, Point { x: 9, y: 9 });
+        assert_eq!(scaled_plane.destination, Point { x: 10, y: 10 });
     }
 
     #[test]
@@ -5056,8 +5387,8 @@ mod tests {
             .iter()
             .find(|plane| plane.kind == ass::ImageType::Character)
             .expect("drawing plane");
-        assert_eq!(plane.destination.x, 9);
-        assert_eq!(plane.destination.y, 9);
+        assert_eq!(plane.destination.x, 10);
+        assert_eq!(plane.destination.y, 10);
         assert!(plane.bitmap.contains(&255));
     }
 

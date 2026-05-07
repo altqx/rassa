@@ -180,7 +180,9 @@ fn layout_line_from_text<P: FontProvider>(
         if let Some(drawing) = &span.drawing {
             let width = drawing
                 .bounds()
-                .map(|bounds| bounds.width() as f32 * span.style.scale_x.max(0.0) as f32)
+                .map(|bounds| {
+                    (bounds.width() - 1).max(0) as f32 * span.style.scale_x.max(0.0) as f32
+                })
                 .unwrap_or_default();
             runs.push(LayoutGlyphRun {
                 text: span.text.clone(),
@@ -1007,7 +1009,7 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
 
         assert_eq!(layout.lines[0].runs.len(), 1);
         assert!(layout.lines[0].runs[0].drawing.is_some());
-        assert_eq!(layout.lines[0].runs[0].width, 9.0);
+        assert_eq!(layout.lines[0].runs[0].width, 8.0);
     }
 
     #[test]
