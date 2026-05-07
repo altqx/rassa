@@ -292,20 +292,26 @@ impl RenderEngine {
                         };
                         if let Some(plane) = image_plane_from_drawing(
                             drawing,
-                            run_origin_x,
-                            drawing_baseline_y,
-                            resolve_run_fill_color(
-                                run,
-                                &effective_style,
-                                track.events.get(event.event_index),
-                                now_ms,
-                            ),
-                            effective_style.scale_x,
-                            effective_style.scale_y,
-                            render_scale_x,
-                            render_scale_y,
-                            effective_style.pbo,
-                            positioned_drawing && run_transform.is_identity(),
+                            DrawingPlaneParams {
+                                origin_x: run_origin_x,
+                                line_top: drawing_baseline_y,
+                                color: resolve_run_fill_color(
+                                    run,
+                                    &effective_style,
+                                    track.events.get(event.event_index),
+                                    now_ms,
+                                ),
+                                scale_x: effective_style.scale_x,
+                                scale_y: effective_style.scale_y,
+                                render_scale: RenderScale {
+                                    x: render_scale_x,
+                                    y: render_scale_y,
+                                    uniform: render_scale,
+                                },
+                                baseline_offset: effective_style.pbo,
+                                positioned_drawing: positioned_drawing
+                                    && run_transform.is_identity(),
+                            },
                         ) {
                             if effective_style.border > 0.0 {
                                 let mut outline_glyph = plane_to_raster_glyph(&plane);
@@ -367,14 +373,21 @@ impl RenderEngine {
                             &mut shadow_planes,
                             &mut outline_planes,
                             &mut character_planes,
-                            run_shadow_start,
-                            run_outline_start,
-                            run_character_start,
-                            run_transform,
-                            event,
-                            effective_position,
-                            render_scale_x,
-                            render_scale_y,
+                            PlaneStarts {
+                                shadow: run_shadow_start,
+                                outline: run_outline_start,
+                                character: run_character_start,
+                            },
+                            RunTransformContext {
+                                transform: run_transform,
+                                event,
+                                effective_position,
+                                render_scale: RenderScale {
+                                    x: render_scale_x,
+                                    y: render_scale_y,
+                                    uniform: render_scale,
+                                },
+                            },
                         );
                         let drawing_advance = (f64::from(run.width)
                             * style_scale(effective_style.scale_x)
@@ -514,14 +527,21 @@ impl RenderEngine {
                         &mut shadow_planes,
                         &mut outline_planes,
                         &mut character_planes,
-                        run_shadow_start,
-                        run_outline_start,
-                        run_character_start,
-                        run_transform,
-                        event,
-                        effective_position,
-                        render_scale_x,
-                        render_scale_y,
+                        PlaneStarts {
+                            shadow: run_shadow_start,
+                            outline: run_outline_start,
+                            character: run_character_start,
+                        },
+                        RunTransformContext {
+                            transform: run_transform,
+                            event,
+                            effective_position,
+                            render_scale: RenderScale {
+                                x: render_scale_x,
+                                y: render_scale_y,
+                                uniform: render_scale,
+                            },
+                        },
                     );
                     line_pen_x += run_advance;
                 }
@@ -1172,7 +1192,7 @@ fn style_scale(value: f64) -> f64 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct RenderScale {
     x: f64,
     y: f64,
@@ -1409,43 +1429,61 @@ fn style_transform(style: &ParsedSpanStyle) -> EventTransform {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlaneStarts {
+    shadow: usize,
+    outline: usize,
+    character: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunTransformContext<'a> {
+    transform: EventTransform,
+    event: &'a LayoutEvent,
+    effective_position: Option<(i32, i32)>,
+    render_scale: RenderScale,
+}
+
 fn apply_run_transform_to_recent_planes(
     shadow_planes: &mut Vec<ImagePlane>,
     outline_planes: &mut Vec<ImagePlane>,
     character_planes: &mut Vec<ImagePlane>,
-    shadow_start: usize,
-    outline_start: usize,
-    character_start: usize,
-    transform: EventTransform,
-    event: &LayoutEvent,
-    effective_position: Option<(i32, i32)>,
-    scale_x: f64,
-    scale_y: f64,
+    starts: PlaneStarts,
+    context: RunTransformContext<'_>,
 ) {
-    if transform.is_identity() {
+    if context.transform.is_identity() {
         return;
     }
     let mut recent_planes = Vec::new();
-    recent_planes.extend(shadow_planes[shadow_start..].iter().cloned());
-    recent_planes.extend(outline_planes[outline_start..].iter().cloned());
-    recent_planes.extend(character_planes[character_start..].iter().cloned());
+    recent_planes.extend(shadow_planes[starts.shadow..].iter().cloned());
+    recent_planes.extend(outline_planes[starts.outline..].iter().cloned());
+    recent_planes.extend(character_planes[starts.character..].iter().cloned());
     if recent_planes.is_empty() {
         return;
     }
-    let origin =
-        event_transform_origin(event, &recent_planes, effective_position, scale_x, scale_y);
+    let origin = event_transform_origin(
+        context.event,
+        &recent_planes,
+        context.effective_position,
+        context.render_scale.x,
+        context.render_scale.y,
+    );
     let shear_base = planes_bounds(&recent_planes)
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
         .unwrap_or(origin);
     let transform_slice = |planes: &mut Vec<ImagePlane>, start: usize| {
         let tail = planes.split_off(start);
         planes.extend(transform_event_planes(
-            tail, transform, origin, shear_base, scale_y,
+            tail,
+            context.transform,
+            origin,
+            shear_base,
+            context.render_scale.y,
         ));
     };
-    transform_slice(shadow_planes, shadow_start);
-    transform_slice(outline_planes, outline_start);
-    transform_slice(character_planes, character_start);
+    transform_slice(shadow_planes, starts.shadow);
+    transform_slice(outline_planes, starts.outline);
+    transform_slice(character_planes, starts.character);
 }
 
 fn event_transform_origin(
@@ -3103,20 +3141,29 @@ fn drawing_baseline_ascender(style: &ParsedSpanStyle, _render_scale_y: f64) -> i
     (style.font_size.max(1.0) * scale_y * 0.75).round() as i32
 }
 
-fn image_plane_from_drawing(
-    drawing: &ParsedDrawing,
+#[derive(Clone, Copy, Debug)]
+struct DrawingPlaneParams {
     origin_x: i32,
     line_top: i32,
     color: u32,
     scale_x: f64,
     scale_y: f64,
-    render_scale_x: f64,
-    render_scale_y: f64,
+    render_scale: RenderScale,
     baseline_offset: f64,
     positioned_drawing: bool,
+}
+
+fn image_plane_from_drawing(
+    drawing: &ParsedDrawing,
+    params: DrawingPlaneParams,
 ) -> Option<ImagePlane> {
-    let polygons =
-        scaled_drawing_polygons(drawing, scale_x, scale_y, render_scale_x, render_scale_y);
+    let polygons = scaled_drawing_polygons(
+        drawing,
+        params.scale_x,
+        params.scale_y,
+        params.render_scale.x,
+        params.render_scale.y,
+    );
     let bounds = drawing_bounds(&polygons)?;
     let width = bounds.width();
     let height = bounds.height();
@@ -3143,10 +3190,10 @@ fn image_plane_from_drawing(
     }
 
     let drawing_height = (height - 1).max(0);
-    let pbo_pixels = (baseline_offset * render_scale_y).round() as i32;
+    let pbo_pixels = (params.baseline_offset * params.render_scale.y).round() as i32;
     let vertical_offset = (pbo_pixels - drawing_height).max(0);
-    let horizontal_overhang = if positioned_drawing {
-        style_scale(render_scale_x).round().max(0.0) as i32
+    let horizontal_overhang = if params.positioned_drawing {
+        style_scale(params.render_scale.x).round().max(0.0) as i32
     } else {
         0
     };
@@ -3181,10 +3228,10 @@ fn image_plane_from_drawing(
     any_visible.then_some(ImagePlane {
         size: Size { width, height },
         stride: width,
-        color: rgba_color_from_ass(color),
+        color: rgba_color_from_ass(params.color),
         destination: Point {
-            x: origin_x + bounds.x_min + x_adjust,
-            y: line_top + bounds.y_min + vertical_offset,
+            x: params.origin_x + bounds.x_min + x_adjust,
+            y: params.line_top + bounds.y_min + vertical_offset,
         },
         kind: ass::ImageType::Character,
         bitmap,
