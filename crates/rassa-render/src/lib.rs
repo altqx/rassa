@@ -974,6 +974,12 @@ impl RenderEngine {
                     clip_rect
                 };
                 event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
+                if !event.inverse_clip && libass_pads_transformed_text_rect_clip(event) {
+                    event_planes = event_planes
+                        .into_iter()
+                        .map(pad_libass_transformed_text_rect_clip_plane)
+                        .collect();
+                }
             } else if let Some(vector_clip) = &event.vector_clip {
                 event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
             }
@@ -4127,6 +4133,45 @@ fn apply_event_clip(planes: Vec<ImagePlane>, clip_rect: Rect, inverse: bool) -> 
     clipped
 }
 
+fn libass_pads_transformed_text_rect_clip(event: &LayoutEvent) -> bool {
+    event.clip_rect.is_some()
+        && event.lines.len() == 1
+        && event.lines.iter().any(|line| {
+            line.runs.iter().any(|run| {
+                run.drawing.is_none()
+                    && run.text.chars().count() <= 1
+                    && (event.origin.is_some()
+                        || event.origin_exact.is_some()
+                        || event.movement.is_some()
+                        || event.movement_exact.is_some()
+                        || run.style.rotation_z.abs() > f64::EPSILON
+                        || run.style.rotation_x.abs() > f64::EPSILON
+                        || run.style.rotation_y.abs() > f64::EPSILON
+                        || !run.transforms.is_empty())
+            })
+        })
+}
+
+fn pad_libass_transformed_text_rect_clip_plane(plane: ImagePlane) -> ImagePlane {
+    if plane.kind != ass::ImageType::Character || plane.size.width > 24 {
+        return plane;
+    }
+    // libass keeps the small transformed glyph allocation around thin rectangular
+    // clip slices instead of tightening the ASS_Image to our glyph bitmap width.
+    // This shows up heavily in karaoke FX where a moving horizontal clip scans a
+    // one-character transformed text plane. Its clipped plane bottom is exclusive
+    // at the libass scanline boundary, while our exact-rect ceil retains one extra
+    // transparent row.
+    let plane = if plane.size.height > 1 {
+        let mut rect = plane_rect(&plane);
+        rect.y_max -= 1;
+        crop_plane_to_rect(plane, rect).unwrap_or_else(|| unreachable!())
+    } else {
+        plane
+    };
+    pad_plane_transparent(plane, 8, 0, 4, 0)
+}
+
 fn apply_vector_clip(
     planes: Vec<ImagePlane>,
     clip: &ParsedVectorClip,
@@ -4752,6 +4797,27 @@ mod tests {
                 && (actual.x_max - expected.x_max).abs() <= 3
                 && (actual.y_max - expected.y_max).abs() <= 3,
             "rotated positioned text should keep libass-like transparent \\frz plane: actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn decimal_clipped_transformed_single_char_keeps_libass_like_plane() {
+        if !baseline_fontconfig_matches_dejavu_fallback("OFL Sorts Mill Goudy TT") {
+            return;
+        }
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 8,0:00:00.00,0:00:01.00,ED2,,0,0,0,fx,{\\move(727.1,73,727.1,65)\\org(637.1,-25)\\t(53.571428571429,107.14285714286,\\frz4)\\t(107.14285714286,160.71428571429,\\frz-4)\\t(160.71428571429,214.28571428571,\\frz4\\t(214.28571428571,267.85714285714,\\frz-4\\t(267.85714285714,321.42857142857,\\frz4\\t(321.42857142857,375,\\frz-4\\t(375,428.57142857143,\\frz4\\t(857.14285714286,482.14285714286,\\frz-4\\t(482.14285714286,535.71428571429,\\frz4\\t(535.71428571429,589.28571428571,\\frz-4\\t(589.28571428571,642.85714285714,\\frz4\\t(642.85714285714,696.42857142857,\\frz-4\\t(696.42857142857,750,\\frz0)))))))))))\\b0\\bord0\\blur0.2\\shad0\\an5\\fs80\\t(0,750,\\fs70\\frz0)\\clip(659.3,63.6,1260.8,77.4)\\c&H9DD9FC&}I\n";
+        let actual = render_text_plane_bounds(script)
+            .expect("02.ass-style decimal clipped transformed glyph should emit a plane");
+
+        assert_eq!(
+            actual,
+            Rect {
+                x_min: 715,
+                y_min: 63,
+                x_max: 739,
+                y_max: 77,
+            },
+            "decimal rectangular clip over transformed one-char text should keep libass-like ASS_Image plane geometry"
         );
     }
 

@@ -4,8 +4,8 @@ use rassa_fonts::{
 };
 use rassa_parse::{
     ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedMovementExact,
-    ParsedSpanStyle, ParsedSpanTransform, ParsedStyle, ParsedTrack, ParsedVectorClip,
-    parse_dialogue_text_with_wrap_style,
+    ParsedRectF64, ParsedSpanStyle, ParsedSpanTransform, ParsedStyle, ParsedTrack,
+    ParsedVectorClip, parse_dialogue_text_with_wrap_style,
 };
 use rassa_shape::{GlyphInfo, ShapeEngine, ShapeRequest, ShapingMode};
 use rassa_unibreak::{LineBreakOpportunity, classify_line_breaks};
@@ -147,7 +147,9 @@ impl LayoutEngine {
             movement: parsed_text.movement,
             movement_exact: parsed_text.movement_exact,
             fade: parsed_text.fade,
-            clip_rect: parsed_text.clip_rect,
+            clip_rect: parsed_text
+                .clip_rect
+                .or_else(|| parsed_text.clip_rect_exact.map(rect_from_exact_clip)),
             vector_clip: parsed_text.vector_clip,
             inverse_clip: parsed_text.inverse_clip,
             wrap_style: parsed_text.wrap_style,
@@ -164,6 +166,15 @@ impl LayoutEngine {
         provider: &P,
     ) -> RassaResult<LayoutEvent> {
         self.layout_track_event_with_mode(track, event_index, provider, ShapingMode::Complex)
+    }
+}
+
+fn rect_from_exact_clip(rect: ParsedRectF64) -> Rect {
+    Rect {
+        x_min: rect.x_min.floor() as i32,
+        y_min: rect.y_min.floor() as i32,
+        x_max: rect.x_max.ceil() as i32,
+        y_max: rect.y_max.ceil() as i32,
     }
 }
 
@@ -940,6 +951,31 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
         );
         assert!(layout.vector_clip.is_none());
         assert!(layout.inverse_clip);
+    }
+
+    #[test]
+    fn layout_carries_decimal_rectangular_clip_metadata() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\clip(659.3,35,1260.8,48.433333333333)}Clip",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert_eq!(
+            layout.clip_rect,
+            Some(Rect {
+                x_min: 659,
+                y_min: 35,
+                x_max: 1261,
+                y_max: 49
+            }),
+            "decimal rectangular clips must survive layout as a screen-space rect for renderer clipping"
+        );
+        assert!(layout.vector_clip.is_none());
+        assert!(!layout.inverse_clip);
     }
 
     #[test]
