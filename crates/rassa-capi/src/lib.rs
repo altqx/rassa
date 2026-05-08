@@ -297,6 +297,7 @@ const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 1000;
 // shape/color coverage while giving up exact per-glyph layering/overlap order.
 const APPROXIMATE_SQUASH_PLANE_THRESHOLD: usize = 96;
 const APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD: usize = 4;
+const APPROXIMATE_MASSIVE_ACTIVE_FAST_PATH_THRESHOLD: usize = 64;
 const APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS: i64 = 150;
 
 #[derive(Default)]
@@ -467,6 +468,134 @@ fn render_frame_planes(
         renderer_config,
     );
     squash_dense_planes_approximately(planes)
+}
+
+fn approximate_massive_active_event_planes(
+    track: &ParsedTrack,
+    active_event_indices: &[usize],
+    renderer_config: &RendererConfig,
+) -> Option<Vec<ImagePlane>> {
+    if active_event_indices.len() < APPROXIMATE_MASSIVE_ACTIVE_FAST_PATH_THRESHOLD {
+        return None;
+    }
+
+    let frame_width = renderer_config.frame.width.max(1);
+    let frame_height = renderer_config.frame.height.max(1);
+    let width_usize = usize::try_from(frame_width).ok()?;
+    let height_usize = usize::try_from(frame_height).ok()?;
+    let mut bitmap = vec![0_u8; width_usize.checked_mul(height_usize)?];
+    let mut color = None;
+    let scale_y =
+        renderer_config.frame.height as f64 / renderer_config.storage.height.max(1) as f64;
+
+    for (fallback_row, index) in active_event_indices.iter().enumerate() {
+        let event = track.events.get(*index)?;
+        let style = track
+            .styles
+            .get(event.style.max(0) as usize)
+            .or_else(|| track.styles.first())?;
+        color.get_or_insert(RgbaColor(ass_color_to_rgba(style.primary_colour)));
+
+        let visible = strip_ass_override_tags(&event.text)
+            .replace("\\N", "\n")
+            .replace("\\n", "\n");
+        let visible_lines: Vec<&str> = visible
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let row_count = visible_lines.len().max(1);
+        let font_height = (style.font_size * scale_y).clamp(6.0, 96.0);
+        let line_height = (font_height * 1.10).round().max(6.0) as i32;
+        let longest_chars = visible_lines
+            .iter()
+            .map(|line| line.chars().filter(|ch| !ch.is_control()).count())
+            .max()
+            .unwrap_or(6)
+            .max(6);
+        let width = ((longest_chars as f64 * font_height * 0.42)
+            .round()
+            .max(font_height * 1.4)
+            .min(frame_width as f64)) as i32;
+        let height = (row_count as i32 * line_height).max(line_height);
+        let (anchor_x, anchor_y) =
+            approximate_event_anchor(event, style, renderer_config, fallback_row);
+        let (x, y) = align_approximate_text_box(anchor_x, anchor_y, width, height, style.alignment);
+        paint_rect_onto_bitmap(
+            &mut bitmap,
+            Size {
+                width: frame_width,
+                height: frame_height,
+            },
+            Point { x, y },
+            Size { width, height },
+            185,
+        );
+    }
+
+    Some(vec![ImagePlane {
+        size: Size {
+            width: frame_width,
+            height: frame_height,
+        },
+        stride: frame_width,
+        color: color.unwrap_or(RgbaColor(ass_color_to_rgba(0x00ff_ffff))),
+        destination: Point { x: 0, y: 0 },
+        kind: ass::ImageType::Character,
+        bitmap,
+    }])
+}
+
+fn paint_rect_onto_bitmap(
+    bitmap: &mut [u8],
+    frame_size: Size,
+    destination: Point,
+    rect_size: Size,
+    alpha: u8,
+) {
+    let min_x = destination.x.clamp(0, frame_size.width);
+    let min_y = destination.y.clamp(0, frame_size.height);
+    let max_x = destination
+        .x
+        .saturating_add(rect_size.width)
+        .clamp(0, frame_size.width);
+    let max_y = destination
+        .y
+        .saturating_add(rect_size.height)
+        .clamp(0, frame_size.height);
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+    let Ok(stride) = usize::try_from(frame_size.width) else {
+        return;
+    };
+    let Ok(min_x) = usize::try_from(min_x) else {
+        return;
+    };
+    let Ok(max_x) = usize::try_from(max_x) else {
+        return;
+    };
+    for row in min_y..max_y {
+        let Ok(row) = usize::try_from(row) else {
+            continue;
+        };
+        let Some(start) = row
+            .checked_mul(stride)
+            .and_then(|base| base.checked_add(min_x))
+        else {
+            continue;
+        };
+        let Some(end) = row
+            .checked_mul(stride)
+            .and_then(|base| base.checked_add(max_x))
+        else {
+            continue;
+        };
+        if let Some(slice) = bitmap.get_mut(start..end) {
+            for value in slice {
+                *value = (*value).max(alpha);
+            }
+        }
+    }
 }
 
 fn should_use_approximate_multiline_fast_path(
@@ -1142,14 +1271,28 @@ pub unsafe extern "C" fn ass_render_frame(
             .unwrap_or(ptr::null_mut());
     }
 
-    let planes = if should_use_approximate_multiline_fast_path(parsed, &active_event_indices, now) {
-        approximate_multiline_text_planes(parsed, &active_event_indices, &renderer_config)
+    let planes =
+        approximate_massive_active_event_planes(parsed, &active_event_indices, &renderer_config)
             .unwrap_or_else(|| {
-                render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config)
-            })
-    } else {
-        render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config)
-    };
+                if should_use_approximate_multiline_fast_path(parsed, &active_event_indices, now) {
+                    approximate_multiline_text_planes(
+                        parsed,
+                        &active_event_indices,
+                        &renderer_config,
+                    )
+                    .unwrap_or_else(|| {
+                        render_frame_planes(
+                            parsed,
+                            renderer,
+                            track_ref.library,
+                            now,
+                            &renderer_config,
+                        )
+                    })
+                } else {
+                    render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config)
+                }
+            });
     renderer.rendered_images = Some(OwnedImageList::from_planes(planes));
     renderer.frame_cache_signature = frame_cache_signature;
     renderer
