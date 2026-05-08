@@ -14,7 +14,7 @@ use std::{
 
 #[cfg(not(target_arch = "wasm32"))]
 use libc::{free, malloc};
-use rassa_core::{Margins, RendererConfig, Size, ass};
+use rassa_core::{ImagePlane, Margins, Point, RendererConfig, RgbaColor, Size, ass};
 use rassa_fonts::{
     AttachedFontProvider, DefaultFontFileProvider, FontAttachment as ProviderFontAttachment,
     FontProvider, FontconfigProvider, MergedFontProvider, NullFontProvider,
@@ -285,10 +285,17 @@ struct RenderedFrameCacheSignature {
 }
 
 // Approximate animated ASS tags by reusing the previous rendered image within a
-// small time bucket. This intentionally trades sub-frame pixel accuracy for much
-// higher FPS on transform/karaoke/clip-heavy scripts.
-const APPROXIMATE_ANIMATION_FRAME_BUCKET_MS: i64 = 250;
-const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 500;
+// time bucket. This intentionally trades sub-frame pixel accuracy/smoothness for
+// much higher FPS on transform/karaoke/clip-heavy scripts.
+const APPROXIMATE_ANIMATION_FRAME_BUCKET_MS: i64 = 500;
+const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 1000;
+
+// If a frame contains hundreds/thousands of ASS_Image nodes, downstream
+// compositors can spend more time walking tiny planes than rassa spent caching
+// the frame. Collapse same-color/same-kind planes into coarse union bitmaps once
+// the list is large. This is an intentional approximation: it preserves rough
+// shape/color coverage while giving up exact per-glyph layering/overlap order.
+const APPROXIMATE_SQUASH_PLANE_THRESHOLD: usize = 96;
 
 #[derive(Default)]
 struct OwnedImageList {
@@ -338,6 +345,108 @@ impl OwnedImageList {
             .map(|node| &mut **node as *mut ASS_Image)
             .unwrap_or(ptr::null_mut())
     }
+}
+
+#[derive(Clone)]
+struct SquashedPlaneGroup {
+    color: RgbaColor,
+    kind: ass::ImageType,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    planes: Vec<ImagePlane>,
+}
+
+fn squash_dense_planes_approximately(planes: Vec<ImagePlane>) -> Vec<ImagePlane> {
+    if planes.len() < APPROXIMATE_SQUASH_PLANE_THRESHOLD {
+        return planes;
+    }
+
+    let mut groups: Vec<SquashedPlaneGroup> = Vec::new();
+    for plane in planes {
+        if plane.size.width <= 0
+            || plane.size.height <= 0
+            || plane.stride <= 0
+            || plane.bitmap.is_empty()
+        {
+            continue;
+        }
+
+        let min_x = plane.destination.x;
+        let min_y = plane.destination.y;
+        let max_x = min_x.saturating_add(plane.size.width);
+        let max_y = min_y.saturating_add(plane.size.height);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.color == plane.color && group.kind == plane.kind)
+        {
+            group.min_x = group.min_x.min(min_x);
+            group.min_y = group.min_y.min(min_y);
+            group.max_x = group.max_x.max(max_x);
+            group.max_y = group.max_y.max(max_y);
+            group.planes.push(plane);
+        } else {
+            groups.push(SquashedPlaneGroup {
+                color: plane.color,
+                kind: plane.kind,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                planes: vec![plane],
+            });
+        }
+    }
+
+    groups
+        .into_iter()
+        .filter_map(squash_plane_group_approximately)
+        .collect()
+}
+
+fn squash_plane_group_approximately(group: SquashedPlaneGroup) -> Option<ImagePlane> {
+    let width = group.max_x.checked_sub(group.min_x)?;
+    let height = group.max_y.checked_sub(group.min_y)?;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let width_usize = usize::try_from(width).ok()?;
+    let height_usize = usize::try_from(height).ok()?;
+    let len = width_usize.checked_mul(height_usize)?;
+    let mut bitmap = vec![0_u8; len];
+
+    for plane in group.planes {
+        let plane_width = usize::try_from(plane.size.width).ok()?;
+        let plane_height = usize::try_from(plane.size.height).ok()?;
+        let stride = usize::try_from(plane.stride).ok()?;
+        let dx = usize::try_from(plane.destination.x.checked_sub(group.min_x)?).ok()?;
+        let dy = usize::try_from(plane.destination.y.checked_sub(group.min_y)?).ok()?;
+
+        for row in 0..plane_height {
+            let src_row = row.checked_mul(stride)?;
+            let dst_row = dy.checked_add(row)?.checked_mul(width_usize)?;
+            for column in 0..plane_width {
+                let src = *plane.bitmap.get(src_row.checked_add(column)?)?;
+                let dst_index = dst_row.checked_add(dx)?.checked_add(column)?;
+                let dst = bitmap.get_mut(dst_index)?;
+                *dst = (*dst).max(src);
+            }
+        }
+    }
+
+    Some(ImagePlane {
+        size: Size { width, height },
+        stride: width,
+        color: group.color,
+        destination: Point {
+            x: group.min_x,
+            y: group.min_y,
+        },
+        kind: group.kind,
+        bitmap,
+    })
 }
 
 impl OwnedStyleOverride {
@@ -812,12 +921,13 @@ pub unsafe extern "C" fn ass_render_frame(
 
     let provider = cached_font_provider(renderer, track_ref.library);
     let provider: &dyn FontProvider = unsafe { &*provider };
-    let planes = RenderEngine::new().render_frame_with_provider_and_config(
+    let mut planes = RenderEngine::new().render_frame_with_provider_and_config(
         parsed,
         &provider,
         now,
         &renderer_config,
     );
+    planes = squash_dense_planes_approximately(planes);
     renderer.rendered_images = Some(OwnedImageList::from_planes(planes));
     renderer.frame_cache_signature = frame_cache_signature;
     renderer
