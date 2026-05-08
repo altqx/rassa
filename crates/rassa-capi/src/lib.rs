@@ -249,7 +249,7 @@ struct FontAttachment {
     data: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct OwnedStyleOverride {
     style: ParsedStyle,
 }
@@ -278,6 +278,8 @@ struct RenderedFrameCacheSignature {
     parsed_track: ParsedTrackCacheSignature,
     renderer_config: RendererConfig,
     font_provider: FontProviderCacheSignature,
+    selective_override_bits: c_int,
+    selective_override_style: Option<OwnedStyleOverride>,
     active_event_indices: Vec<usize>,
 }
 
@@ -776,16 +778,19 @@ pub unsafe extern "C" fn ass_render_frame(
     let track_generation = track_state_ref(track)
         .map(|state| state.cache_generation)
         .unwrap_or_default();
-    let frame_cache_signature = (!override_active
-        && active_events_are_static(parsed, &active_event_indices))
-    .then(|| RenderedFrameCacheSignature {
-        track: track as usize,
-        track_generation,
-        parsed_track: parsed_track_cache_signature(track_ref),
-        renderer_config: renderer_config.clone(),
-        font_provider: font_provider_signature,
-        active_event_indices: active_event_indices.clone(),
-    });
+    let frame_cache_signature =
+        active_events_are_static(parsed, &active_event_indices).then(|| {
+            RenderedFrameCacheSignature {
+                track: track as usize,
+                track_generation,
+                parsed_track: parsed_track_cache_signature(track_ref),
+                renderer_config: renderer_config.clone(),
+                font_provider: font_provider_signature,
+                selective_override_bits: renderer.selective_override_bits,
+                selective_override_style: renderer.selective_override_style.clone(),
+                active_event_indices: active_event_indices.clone(),
+            }
+        });
     if frame_cache_signature.is_some()
         && renderer.frame_cache_signature == frame_cache_signature
         && renderer.rendered_images.is_some()
