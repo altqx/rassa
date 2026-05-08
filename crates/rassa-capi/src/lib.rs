@@ -296,9 +296,7 @@ const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 1000;
 // the list is large. This is an intentional approximation: it preserves rough
 // shape/color coverage while giving up exact per-glyph layering/overlap order.
 const APPROXIMATE_SQUASH_PLANE_THRESHOLD: usize = 96;
-const APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD: usize = 4;
 const APPROXIMATE_MASSIVE_ACTIVE_FAST_PATH_THRESHOLD: usize = 64;
-const APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS: i64 = 150;
 
 #[derive(Default)]
 struct OwnedImageList {
@@ -599,38 +597,15 @@ fn paint_rect_onto_bitmap(
 }
 
 fn should_use_approximate_multiline_fast_path(
-    track: &ParsedTrack,
-    active_event_indices: &[usize],
-    now: i64,
+    _track: &ParsedTrack,
+    _active_event_indices: &[usize],
+    _now: i64,
 ) -> bool {
-    active_event_indices.len() >= APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD
-        || active_events_have_adjacent_line_change(track, active_event_indices, now)
-}
-
-fn active_events_have_adjacent_line_change(
-    track: &ParsedTrack,
-    active_event_indices: &[usize],
-    now: i64,
-) -> bool {
-    active_event_indices.iter().any(|index| {
-        let Some(event) = track.events.get(*index) else {
-            return false;
-        };
-        let near_own_boundary = (now - event.start).abs()
-            <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS
-            || (now - (event.start + event.duration)).abs()
-                <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS;
-        if !near_own_boundary {
-            return false;
-        }
-        let event_end = event.start + event.duration;
-        track.events.iter().enumerate().any(|(other_index, other)| {
-            other_index != *index
-                && ((other.start - event_end).abs() <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS
-                    || ((other.start + other.duration) - event.start).abs()
-                        <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS)
-        })
-    })
+    // The old normal-subtitle text-box fast path returned large solid planes,
+    // which downstream compositors display as white/color rectangles. Keep
+    // normal text on the real glyph path; only the explicit massive-active path
+    // above may approximate with coarse boxes.
+    false
 }
 
 fn approximate_multiline_text_planes(

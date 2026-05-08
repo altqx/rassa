@@ -190,9 +190,9 @@ mod tests {
         (min_y != i32::MAX).then_some(min_y)
     }
 
-    fn image_signatures(
-        mut image: *mut rassa_capi::ASS_Image,
-    ) -> Vec<(u32, i32, i32, i32, i32, Vec<u8>)> {
+    type ImageSignature = (u32, i32, i32, i32, i32, Vec<u8>);
+
+    fn image_signatures(mut image: *mut rassa_capi::ASS_Image) -> Vec<ImageSignature> {
         let mut signatures = Vec::new();
         unsafe {
             while !image.is_null() {
@@ -219,6 +219,16 @@ mod tests {
             }
         }
         signatures
+    }
+
+    fn has_large_solid_bitmap(signatures: &[ImageSignature]) -> bool {
+        signatures.iter().any(|(_, _, _, width, height, bitmap)| {
+            *width >= 20
+                && *height >= 10
+                && !bitmap.is_empty()
+                && bitmap.iter().all(|value| *value == bitmap[0])
+                && bitmap[0] > 0
+        })
     }
 
     fn png_dimensions(bytes: &[u8]) -> Option<(i32, i32)> {
@@ -1126,6 +1136,35 @@ mod tests {
             assert_eq!(first_change, 2);
             assert_eq!(second_change, 0);
             assert!(third_change >= 1);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_normal_multiline_renders_glyph_masks_not_solid_boxes() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,First normal line\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Second normal line\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Third normal line\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Fourth normal line";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let signatures = image_signatures(images);
+
+            assert!(!signatures.is_empty());
+            assert!(
+                !has_large_solid_bitmap(&signatures),
+                "normal C API renders must not replace glyphs with large filled rectangles"
+            );
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
