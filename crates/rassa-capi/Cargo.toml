@@ -11,10 +11,10 @@ keywords.workspace = true
 
 [dependencies]
 libc.workspace = true
-rassa-core = { path = "../rassa-core", version = "0.5.0" }
-rassa-fonts = { path = "../rassa-fonts", version = "0.5.0" }
-rassa-parse = { path = "../rassa-parse", version = "0.5.0" }
-rassa-render = { path = "../rassa-render", version = "0.5.0" }
+rassa-core = { path = "../rassa-core", version = "0.5.1" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.5.1" }
+rassa-parse = { path = "../rassa-parse", version = "0.5.1" }
+rassa-render = { path = "../rassa-render", version = "0.5.1" }
 
 [lib]
 name = "rassa_capi"
