@@ -297,6 +297,7 @@ const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 1000;
 // shape/color coverage while giving up exact per-glyph layering/overlap order.
 const APPROXIMATE_SQUASH_PLANE_THRESHOLD: usize = 96;
 const APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD: usize = 4;
+const APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS: i64 = 150;
 
 #[derive(Default)]
 struct OwnedImageList {
@@ -466,6 +467,41 @@ fn render_frame_planes(
         renderer_config,
     );
     squash_dense_planes_approximately(planes)
+}
+
+fn should_use_approximate_multiline_fast_path(
+    track: &ParsedTrack,
+    active_event_indices: &[usize],
+    now: i64,
+) -> bool {
+    active_event_indices.len() >= APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD
+        || active_events_have_adjacent_line_change(track, active_event_indices, now)
+}
+
+fn active_events_have_adjacent_line_change(
+    track: &ParsedTrack,
+    active_event_indices: &[usize],
+    now: i64,
+) -> bool {
+    active_event_indices.iter().any(|index| {
+        let Some(event) = track.events.get(*index) else {
+            return false;
+        };
+        let near_own_boundary = (now - event.start).abs()
+            <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS
+            || (now - (event.start + event.duration)).abs()
+                <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS;
+        if !near_own_boundary {
+            return false;
+        }
+        let event_end = event.start + event.duration;
+        track.events.iter().enumerate().any(|(other_index, other)| {
+            other_index != *index
+                && ((other.start - event_end).abs() <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS
+                    || ((other.start + other.duration) - event.start).abs()
+                        <= APPROXIMATE_ADJACENT_LINE_CHANGE_WINDOW_MS)
+        })
+    })
 }
 
 fn approximate_multiline_text_planes(
@@ -1106,7 +1142,7 @@ pub unsafe extern "C" fn ass_render_frame(
             .unwrap_or(ptr::null_mut());
     }
 
-    let planes = if active_event_indices.len() >= APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD {
+    let planes = if should_use_approximate_multiline_fast_path(parsed, &active_event_indices, now) {
         approximate_multiline_text_planes(parsed, &active_event_indices, &renderer_config)
             .unwrap_or_else(|| {
                 render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config)
