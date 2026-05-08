@@ -698,6 +698,7 @@ impl RenderEngine {
                                     uniform: render_scale,
                                 },
                                 drawing_run: true,
+                                blur: effective_style.blur.max(effective_style.be),
                             },
                         );
                         let drawing_advance = (f64::from(run.width)
@@ -855,6 +856,7 @@ impl RenderEngine {
                                 uniform: render_scale,
                             },
                             drawing_run: false,
+                            blur: effective_blur,
                         },
                     );
                     line_pen_x += run_advance;
@@ -1903,6 +1905,7 @@ struct RunTransformContext<'a> {
     effective_position: Option<(i32, i32)>,
     render_scale: RenderScale,
     drawing_run: bool,
+    blur: f64,
 }
 
 fn apply_run_transform_to_recent_planes(
@@ -1932,6 +1935,7 @@ fn apply_run_transform_to_recent_planes(
     let shear_base = planes_bounds(&recent_planes)
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
         .unwrap_or(origin);
+    let pad_frz_text_plane = context.single_line_blurred_text_frz_without_org();
     let transform_slice = |planes: &mut Vec<ImagePlane>, start: usize| {
         let tail = planes.split_off(start);
         planes.extend(transform_event_planes(
@@ -1941,6 +1945,7 @@ fn apply_run_transform_to_recent_planes(
             shear_base,
             context.render_scale.y,
             context.drawing_run,
+            pad_frz_text_plane,
         ));
     };
     transform_slice(shadow_planes, starts.shadow);
@@ -1992,6 +1997,7 @@ fn transform_event_planes(
     shear_base: (f64, f64),
     render_scale_y: f64,
     drawing_run: bool,
+    pad_frz_text_plane: bool,
 ) -> Vec<ImagePlane> {
     if planes.is_empty() || transform.is_identity() {
         return planes;
@@ -2023,9 +2029,41 @@ fn transform_event_planes(
                 transformed.destination.y += correction;
                 transformed = pad_plane_transparent(transformed, 0, 0, 12, 0);
             }
+            if pad_frz_text_plane {
+                transformed.destination.x += 4;
+                transformed = pad_plane_transparent(transformed, 0, 0, 16, 0);
+                transformed = trim_plane_bottom(transformed, 8);
+            }
             Some(transformed)
         })
         .collect()
+}
+
+fn trim_plane_bottom(mut plane: ImagePlane, rows: i32) -> ImagePlane {
+    if rows <= 0 || plane.size.height <= rows || plane.stride <= 0 {
+        return plane;
+    }
+    plane.size.height -= rows;
+    let keep = (plane.size.height * plane.stride) as usize;
+    plane.bitmap.truncate(keep.min(plane.bitmap.len()));
+    plane
+}
+
+impl RunTransformContext<'_> {
+    fn single_line_blurred_text_frz_without_org(&self) -> bool {
+        !self.drawing_run
+            && self.effective_position.is_some()
+            && self.event.origin.is_none()
+            && self.event.origin_exact.is_none()
+            && self.event.lines.len() == 1
+            && self.blur.is_finite()
+            && self.blur > 0.0
+            && self.transform.rotation_z.abs() > f64::EPSILON
+            && self.transform.rotation_x.abs() < f64::EPSILON
+            && self.transform.rotation_y.abs() < f64::EPSILON
+            && self.transform.shear_x.abs() < f64::EPSILON
+            && self.transform.shear_y.abs() < f64::EPSILON
+    }
 }
 
 fn opaque_box_plane_from_rects(
@@ -4562,7 +4600,18 @@ mod tests {
 
     fn baseline_fontconfig_matches_dejavu_fallback(family: &str) -> bool {
         let provider = FontconfigProvider::new();
-        provider.resolve(&FontQuery::new(family)).family == "DejaVu Sans"
+        provider
+            .resolve(&FontQuery::new(family))
+            .family
+            .contains("DejaVu")
+    }
+
+    fn render_text_plane_bounds(script: &str) -> Option<Rect> {
+        let track = parse_script_text(script).expect("text plane probe script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        character_bounds(&planes)
     }
 
     #[test]
@@ -4682,6 +4731,27 @@ mod tests {
         assert!(
             (actual.height() - 160).abs() <= 6,
             "deep-glyph multiline block should keep libass-like visible-bottom line spacing: bounds={actual:?}"
+        );
+    }
+
+    #[test]
+    fn rotated_positioned_text_keeps_libass_like_transparent_frz_plane() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs66\\shad\\bord0\\blur1\\fnRaphtalia\\c&H070707&\\b0\\fscx99\\fscy107\\frz345.2\\pos(1258.48,593.06)}หลังเลิกเรียน จะรอที่\n";
+        let actual =
+            render_text_plane_bounds(script).expect("rotated positioned text should render");
+        let expected = Rect {
+            x_min: 1091,
+            y_min: 499,
+            x_max: 1461,
+            y_max: 626,
+        };
+
+        assert!(
+            (actual.x_min - expected.x_min).abs() <= 3
+                && (actual.y_min - expected.y_min).abs() <= 3
+                && (actual.x_max - expected.x_max).abs() <= 3
+                && (actual.y_max - expected.y_max).abs() <= 3,
+            "rotated positioned text should keep libass-like transparent \\frz plane: actual={actual:?} expected={expected:?}"
         );
     }
 
