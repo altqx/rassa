@@ -227,6 +227,51 @@ fn expand_rect(rect: Rect, amount: i32) -> Rect {
     }
 }
 
+fn visible_bounds_for_planes(planes: &[ImagePlane]) -> Option<Rect> {
+    let mut bounds: Option<Rect> = None;
+    for plane in planes {
+        let stride = plane.stride.max(0) as usize;
+        if stride == 0 {
+            continue;
+        }
+        for y in 0..plane.size.height.max(0) as usize {
+            for x in 0..plane.size.width.max(0) as usize {
+                if plane.bitmap[y * stride + x] == 0 {
+                    continue;
+                }
+                let px = plane.destination.x + x as i32;
+                let py = plane.destination.y + y as i32;
+                match &mut bounds {
+                    Some(rect) => {
+                        rect.x_min = rect.x_min.min(px);
+                        rect.y_min = rect.y_min.min(py);
+                        rect.x_max = rect.x_max.max(px + 1);
+                        rect.y_max = rect.y_max.max(py + 1);
+                    }
+                    None => {
+                        bounds = Some(Rect {
+                            x_min: px,
+                            y_min: py,
+                            x_max: px + 1,
+                            y_max: py + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    bounds
+}
+
+fn translate_planes_y(planes: &mut [ImagePlane], delta_y: i32) {
+    if delta_y == 0 {
+        return;
+    }
+    for plane in planes {
+        plane.destination.y += delta_y;
+    }
+}
+
 impl RenderEngine {
     pub fn new() -> Self {
         Self::default()
@@ -355,7 +400,17 @@ impl RenderEngine {
                     render_scale_y,
                 )
             });
-            for (line, line_top) in event.lines.iter().zip(vertical_layout.iter().copied()) {
+            for (line_index, (line, line_top)) in event
+                .lines
+                .iter()
+                .zip(vertical_layout.iter().copied())
+                .enumerate()
+            {
+                let line_plane_starts = PlaneStarts {
+                    shadow: shadow_planes.len(),
+                    outline: outline_planes.len(),
+                    character: character_planes.len(),
+                };
                 let has_scaled_run = line.runs.iter().any(|run| {
                     (run.style.scale_x - 1.0).abs() > f64::EPSILON
                         || (run.style.scale_y - 1.0).abs() > f64::EPSILON
@@ -792,6 +847,20 @@ impl RenderEngine {
                         y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
                     });
                 }
+                align_positioned_text_line_bottom(
+                    &mut shadow_planes,
+                    &mut outline_planes,
+                    &mut character_planes,
+                    line_plane_starts,
+                    PositionedLineBottomContext {
+                        event,
+                        line,
+                        line_index,
+                        line_count: event.lines.len(),
+                        effective_position,
+                        render_scale_y,
+                    },
+                );
             }
 
             if style.border_style == 3 {
@@ -1639,6 +1708,65 @@ struct PlaneStarts {
     shadow: usize,
     outline: usize,
     character: usize,
+}
+
+struct PositionedLineBottomContext<'a> {
+    event: &'a LayoutEvent,
+    line: &'a rassa_layout::LayoutLine,
+    line_index: usize,
+    line_count: usize,
+    effective_position: Option<(i32, i32)>,
+    render_scale_y: f64,
+}
+
+fn align_positioned_text_line_bottom(
+    shadow_planes: &mut [ImagePlane],
+    outline_planes: &mut [ImagePlane],
+    character_planes: &mut [ImagePlane],
+    starts: PlaneStarts,
+    context: PositionedLineBottomContext<'_>,
+) {
+    let Some((_, anchor_y)) = context.effective_position else {
+        return;
+    };
+    if (context.event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER)) != ass::VALIGN_SUB {
+        return;
+    }
+    if context.line.runs.iter().all(|run| run.drawing.is_some()) {
+        return;
+    }
+    if context
+        .line
+        .runs
+        .iter()
+        .any(|run| !style_transform(&run.style).is_identity())
+    {
+        return;
+    }
+
+    let Some(visible) = visible_bounds_for_planes(&character_planes[starts.character..]) else {
+        return;
+    };
+    let scale_y = style_scale(context.render_scale_y);
+    let max_font_size = context
+        .event
+        .lines
+        .iter()
+        .map(max_text_font_size)
+        .fold(0.0_f64, f64::max)
+        * scale_y;
+    if !(max_font_size.is_finite() && max_font_size > 0.0) {
+        return;
+    }
+    let descender_gap = (max_font_size * 0.24).round() as i32;
+    let line_step = max_font_size.round() as i32;
+    let remaining_lines = context.line_count.saturating_sub(1 + context.line_index) as i32;
+    let target_bottom = anchor_y - descender_gap - line_step * remaining_lines;
+    let delta_y = target_bottom - visible.y_max;
+
+    translate_planes_y(&mut shadow_planes[starts.shadow..], delta_y);
+    translate_planes_y(&mut outline_planes[starts.outline..], delta_y);
+    translate_planes_y(&mut character_planes[starts.character..], delta_y);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4028,6 +4156,26 @@ mod tests {
         assert!(
             (actual.height() - 158).abs() <= 8,
             "multiline positioned text should keep libass-like line gap: bounds={actual:?}"
+        );
+    }
+
+    #[test]
+    fn positioned_multiline_text_aligns_deep_glyph_bottoms_like_libass() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs100\\bord0\\blur1\\fnRaphtalia\\b1\\pos(928,992)}ห้ามท่านหนี\\Nจากคำขอนี้เป็นอันขาด\n";
+        let actual =
+            render_text_bounds(script).expect("baseline multiline positioned text should render");
+
+        assert!(
+            (actual.y_min - 808).abs() <= 4,
+            "top of deep-glyph multiline block should match libass baseline line 1270: bounds={actual:?}"
+        );
+        assert!(
+            (actual.y_max - 968).abs() <= 4,
+            "bottom-aligned \\pos should keep deep Thai glyphs above the libass descender gap: bounds={actual:?}"
+        );
+        assert!(
+            (actual.height() - 160).abs() <= 6,
+            "deep-glyph multiline block should keep libass-like visible-bottom line spacing: bounds={actual:?}"
         );
     }
 
