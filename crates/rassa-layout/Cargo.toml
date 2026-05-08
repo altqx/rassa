@@ -10,13 +10,13 @@ readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core", version = "0.4.0" }
-rassa-fonts = { path = "../rassa-fonts", version = "0.4.0" }
-rassa-parse = { path = "../rassa-parse", version = "0.4.0" }
-rassa-raster = { path = "../rassa-raster", version = "0.4.0" }
-rassa-shape = { path = "../rassa-shape", version = "0.4.0" }
-rassa-unibreak = { path = "../rassa-unibreak", version = "0.4.0" }
-rassa-unicode = { path = "../rassa-unicode", version = "0.4.0" }
+rassa-core = { path = "../rassa-core", version = "0.5.0" }
+rassa-fonts = { path = "../rassa-fonts", version = "0.5.0" }
+rassa-parse = { path = "../rassa-parse", version = "0.5.0" }
+rassa-raster = { path = "../rassa-raster", version = "0.5.0" }
+rassa-shape = { path = "../rassa-shape", version = "0.5.0" }
+rassa-unibreak = { path = "../rassa-unibreak", version = "0.5.0" }
+rassa-unicode = { path = "../rassa-unicode", version = "0.5.0" }
 
 [lib]
 path = "src/lib.rs"

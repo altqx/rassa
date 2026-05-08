@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use fontdue::Font;
+use rassa_shape::virtual_font_bytes;
 
 use crate::crossfont::{
     BitmapBuffer, Error, FontDesc, FontKey, GlyphIdKey, GlyphKey, Metrics, ProportionalMetrics,
@@ -48,6 +49,9 @@ impl Rasterize for WebRasterizer {
     }
 
     fn load_font_path(&mut self, path: &Path, size: Size) -> Result<FontKey, Error> {
+        if let Some(bytes) = virtual_font_bytes(path) {
+            return self.load_font_bytes(bytes.as_slice(), size);
+        }
         let bytes = std::fs::read(path).map_err(|error| Error::PlatformError(error.to_string()))?;
         self.load_font_bytes(&bytes, size)
     }

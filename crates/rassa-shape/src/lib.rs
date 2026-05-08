@@ -12,13 +12,30 @@ fn font_bytes_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Vec<u8>>>> {
     FONT_BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
-    if let Some(bytes) = font_bytes_cache()
+/// Register a virtual font file in memory.
+///
+/// This is primarily used by wasm/browser hosts that do not have a real
+/// filesystem/fontconfig database. Callers can return the same virtual `path`
+/// from their `FontProvider`; shaping and rasterization will then load bytes
+/// from this cache instead of `std::fs`.
+pub fn register_virtual_font_bytes(path: impl Into<PathBuf>, bytes: impl Into<Vec<u8>>) {
+    font_bytes_cache()
+        .lock()
+        .expect("font bytes cache mutex poisoned")
+        .insert(path.into(), Arc::new(bytes.into()));
+}
+
+/// Look up previously registered virtual font bytes.
+pub fn virtual_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+    font_bytes_cache()
         .lock()
         .expect("font bytes cache mutex poisoned")
         .get(path)
         .cloned()
-    {
+}
+
+fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+    if let Some(bytes) = virtual_font_bytes(path) {
         return Some(bytes);
     }
 
