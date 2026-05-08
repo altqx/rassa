@@ -1884,9 +1884,12 @@ struct SplineState {
 }
 
 fn parse_drawing_point(tokens: &[&str], index: usize, scale: i32) -> Option<(Point, usize)> {
-    let x = tokens.get(index)?.parse::<i32>().ok()?;
-    let y = tokens.get(index + 1)?.parse::<i32>().ok()?;
-    Some((scale_drawing_point(x, y, scale), index + 2))
+    let x = tokens.get(index)?.parse::<f64>().ok()?;
+    let y = tokens.get(index + 1)?.parse::<f64>().ok()?;
+    Some((
+        scale_drawing_point(x.round() as i32, y.round() as i32, scale),
+        index + 2,
+    ))
 }
 
 fn parse_drawing_point_optional(
@@ -2455,6 +2458,28 @@ mod tests {
             })
         );
         assert!(!parsed.inverse_clip);
+    }
+
+    #[test]
+    fn parses_decimal_vector_clip_points_like_libass() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\clip(m 581.33 606.67 l 562.67 525.33 625.33 517.33)}Clip",
+            &base_style,
+            &[],
+        );
+
+        assert_eq!(
+            parsed.vector_clip,
+            Some(ParsedVectorClip {
+                scale: 1,
+                polygons: vec![vec![
+                    Point { x: 581, y: 607 },
+                    Point { x: 563, y: 525 },
+                    Point { x: 625, y: 517 },
+                ]],
+            })
+        );
     }
 
     #[test]

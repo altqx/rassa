@@ -4,8 +4,8 @@ use rassa_core::{ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size, ass};
 use rassa_fonts::{FontProvider, FontconfigProvider};
 use rassa_layout::{LayoutEngine, LayoutEvent, LayoutGlyphRun};
 use rassa_parse::{
-    ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeMode, ParsedMovement, ParsedSpanStyle,
-    ParsedTrack, ParsedVectorClip,
+    ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeMode, ParsedMovement, ParsedMovementExact,
+    ParsedSpanStyle, ParsedTrack, ParsedVectorClip,
 };
 use rassa_raster::{RasterGlyph, RasterOptions, Rasterizer};
 use rassa_shape::{GlyphInfo, ShapingMode};
@@ -146,13 +146,17 @@ fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) ->
     }
 
     let scale_y = style_scale(scale_y);
-    let max_font_size = line
-        .runs
+    let max_font_size = max_text_font_size(line);
+    (max_font_size * scale_y * 0.52).round() as i32
+}
+
+fn max_text_font_size(line: &rassa_layout::LayoutLine) -> f64 {
+    line.runs
         .iter()
+        .filter(|run| run.drawing.is_none())
         .map(|run| run.style.font_size)
         .filter(|size| size.is_finite() && *size > 0.0)
-        .fold(0.0_f64, f64::max);
-    (max_font_size * scale_y * 0.52).round() as i32
+        .fold(0.0_f64, f64::max)
 }
 
 fn drawing_only_line_height(line: &rassa_layout::LayoutLine, render_scale_y: f64) -> i32 {
@@ -368,22 +372,18 @@ impl RenderEngine {
                         + unpositioned_text_y_correction(line, config, render_scale_y)
                         + if has_scaled_run { 2 } else { 0 }
                 };
-                let scaled_line_width = if effective_position.is_some() {
-                    (f64::from(line.width) * render_scale_x).round() as i32
-                } else {
-                    rendered_text_alignment_width(
-                        line,
-                        track.events.get(event.event_index),
-                        now_ms,
-                        track,
-                        config,
-                        RenderScale {
-                            x: render_scale_x,
-                            y: render_scale_y,
-                            uniform: render_scale,
-                        },
-                    )
-                };
+                let scaled_line_width = rendered_text_alignment_width(
+                    line,
+                    track.events.get(event.event_index),
+                    now_ms,
+                    track,
+                    config,
+                    RenderScale {
+                        x: render_scale_x,
+                        y: render_scale_y,
+                        uniform: render_scale,
+                    },
+                );
                 let origin_x = compute_horizontal_origin(
                     track,
                     event,
@@ -1698,6 +1698,12 @@ fn event_transform_origin(
     scale_x: f64,
     scale_y: f64,
 ) -> (f64, f64) {
+    if let Some((x, y)) = event.origin_exact {
+        return (
+            (x * scale_x).round(),
+            (y * scale_y).round() - f64::from(style_scale(scale_y).round() as i32),
+        );
+    }
     if let Some((x, y)) = event.origin {
         return (
             f64::from((f64::from(x) * scale_x).round() as i32),
@@ -2546,11 +2552,22 @@ fn resolve_event_position(
     event: &LayoutEvent,
     now_ms: i64,
 ) -> Option<(i32, i32)> {
-    event.position.or_else(|| {
-        event
-            .movement
-            .map(|movement| interpolate_move(movement, track.events.get(event.event_index), now_ms))
-    })
+    event
+        .position_exact
+        .map(round_exact_point)
+        .or(event.position)
+        .or_else(|| {
+            event
+                .movement_exact
+                .map(|movement| {
+                    interpolate_move_exact(movement, track.events.get(event.event_index), now_ms)
+                })
+                .or_else(|| {
+                    event.movement.map(|movement| {
+                        interpolate_move(movement, track.events.get(event.event_index), now_ms)
+                    })
+                })
+        })
 }
 
 fn event_layer(track: &ParsedTrack, event: &LayoutEvent) -> i32 {
@@ -2593,6 +2610,42 @@ fn interpolate_move(
     (x.round() as i32, y.round() as i32)
 }
 
+fn round_exact_point((x, y): (f64, f64)) -> (i32, i32) {
+    (x.round() as i32, y.round() as i32)
+}
+
+fn interpolate_move_exact(
+    movement: ParsedMovementExact,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> (i32, i32) {
+    let event_duration = source_event
+        .map(|event| event.duration)
+        .unwrap_or_default()
+        .max(0) as i32;
+    let event_elapsed = source_event
+        .map(|event| (now_ms - event.start).clamp(0, event.duration.max(0)) as i32)
+        .unwrap_or_default();
+
+    let (t1_ms, t2_ms) = if movement.t1_ms <= 0 && movement.t2_ms <= 0 {
+        (0, event_duration)
+    } else {
+        (movement.t1_ms.max(0), movement.t2_ms.max(movement.t1_ms))
+    };
+    let k = if event_elapsed <= t1_ms {
+        0.0
+    } else if event_elapsed >= t2_ms {
+        1.0
+    } else {
+        let delta = (t2_ms - t1_ms).max(1) as f64;
+        f64::from(event_elapsed - t1_ms) / delta
+    };
+
+    let x = (movement.end.0 - movement.start.0) * k + movement.start.0;
+    let y = (movement.end.1 - movement.start.1) * k + movement.start.1;
+    round_exact_point((x, y))
+}
+
 fn compute_vertical_layout(
     track: &ParsedTrack,
     lines: &[rassa_layout::LayoutLine],
@@ -2614,10 +2667,32 @@ fn compute_vertical_layout(
             ass::VALIGN_CENTER => y - total_height / 2,
             _ => y - total_height,
         };
+        let positioned_text_bottom_gap = if (alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER))
+            == ass::VALIGN_SUB
+            && lines
+                .iter()
+                .any(|line| line.runs.iter().any(|run| run.drawing.is_none()))
+        {
+            let max_font_size =
+                lines.iter().map(max_text_font_size).fold(0.0_f64, f64::max) * scale_y;
+            let descender_gap = (max_font_size * 0.26).round() as i32;
+            let multiline_gap = (max_font_size * 0.49).round() as i32;
+            Some((descender_gap, multiline_gap))
+        } else {
+            None
+        };
+        if let Some((descender_gap, multiline_gap)) = positioned_text_bottom_gap {
+            current_y -= descender_gap + multiline_gap * (lines.len().saturating_sub(1) as i32);
+        }
         let mut positions = Vec::with_capacity(lines.len());
-        for height in line_heights {
+        for (line_index, height) in line_heights.into_iter().enumerate() {
             positions.push(current_y);
             current_y += height;
+            if line_index + 1 < lines.len() {
+                if let Some((_, multiline_gap)) = positioned_text_bottom_gap {
+                    current_y += multiline_gap;
+                }
+            }
         }
         return positions;
     }
@@ -3868,6 +3943,28 @@ mod tests {
     }
 
     #[test]
+    fn decimal_positioned_drawing_uses_exact_coordinates() {
+        let decimal = drawing_alignment_script(7, "\\pos(100.6,50.6)", "0,0,0");
+        let integer = drawing_alignment_script(7, "\\pos(101,51)", "0,0,0");
+
+        assert_eq!(
+            render_drawing_bounds(&decimal),
+            render_drawing_bounds(&integer)
+        );
+    }
+
+    #[test]
+    fn decimal_move_interpolates_from_exact_coordinates() {
+        let decimal = drawing_alignment_script(7, "\\move(10.5,20.5,110.5,120.5,0,1000)", "0,0,0");
+        let integer = drawing_alignment_script(7, "\\move(61,71,61,71)", "0,0,0");
+
+        assert_eq!(
+            render_drawing_bounds(&decimal),
+            render_drawing_bounds(&integer)
+        );
+    }
+
+    #[test]
     fn downscaled_positioned_text_scales_font_and_anchor_like_libass() {
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an5\\pos(320,180)}POS\n";
         let config = RendererConfig {
@@ -3901,6 +3998,38 @@ mod tests {
             (actual.width() - expected.width()).abs() <= 2
                 && (actual.height() - expected.height()).abs() <= 2,
             "downscaled \\pos text must scale glyph dimensions like libass: actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn positioned_center_text_anchors_visible_ink_not_layout_advance() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs140\\bord0\\blur1\\fnAgaints\\pos(947.46,191.6)}ท่านคาชิวากิ อาซาฮิ\n";
+        let actual = render_text_bounds(script).expect("baseline positioned text should render");
+        let center_x = (actual.x_min + actual.x_max) / 2;
+
+        assert!(
+            (center_x - 947).abs() <= 8,
+            "\\pos center anchor must use visible rendered text width, not stale layout advance: bounds={actual:?} center_x={center_x}"
+        );
+        assert!(
+            (actual.y_min - 80).abs() <= 4,
+            "bottom-aligned \\pos text must reserve libass-like descender space below visible glyphs: bounds={actual:?}"
+        );
+    }
+
+    #[test]
+    fn positioned_multiline_text_uses_libass_like_line_gap_and_descender_space() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs100\\bord0\\blur1\\fnRaphtalia\\b1\\pos(944.4,752.8)}จงเตรียมตัว\\Nให้พร้อมสรรพก่อนมา\n";
+        let actual =
+            render_text_bounds(script).expect("baseline multiline positioned text should render");
+
+        assert!(
+            (actual.y_min - 570).abs() <= 6,
+            "multiline bottom-aligned \\pos text should use libass-like vertical block metrics: bounds={actual:?}"
+        );
+        assert!(
+            (actual.height() - 158).abs() <= 8,
+            "multiline positioned text should keep libass-like line gap: bounds={actual:?}"
         );
     }
 

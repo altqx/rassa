@@ -3,8 +3,8 @@ use rassa_fonts::{
     FontMatch, FontProvider, FontQuery, font_match_supports_text, resolve_system_font_for_char,
 };
 use rassa_parse::{
-    ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedSpanStyle,
-    ParsedSpanTransform, ParsedStyle, ParsedTrack, ParsedVectorClip,
+    ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedMovementExact,
+    ParsedSpanStyle, ParsedSpanTransform, ParsedStyle, ParsedTrack, ParsedVectorClip,
     parse_dialogue_text_with_wrap_style,
 };
 use rassa_shape::{GlyphInfo, ShapeEngine, ShapeRequest, ShapingMode};
@@ -49,13 +49,16 @@ pub struct LayoutEvent {
     pub margin_r: i32,
     pub margin_v: i32,
     pub position: Option<(i32, i32)>,
+    pub position_exact: Option<(f64, f64)>,
     pub movement: Option<ParsedMovement>,
+    pub movement_exact: Option<ParsedMovementExact>,
     pub fade: Option<ParsedFade>,
     pub clip_rect: Option<Rect>,
     pub vector_clip: Option<ParsedVectorClip>,
     pub inverse_clip: bool,
     pub wrap_style: Option<i32>,
     pub origin: Option<(i32, i32)>,
+    pub origin_exact: Option<(f64, f64)>,
     pub lines: Vec<LayoutLine>,
 }
 
@@ -136,13 +139,16 @@ impl LayoutEngine {
             margin_r: resolve_margin(event.margin_r, style.margin_r),
             margin_v: resolve_margin(event.margin_v, style.margin_v),
             position: parsed_text.position,
+            position_exact: parsed_text.position_exact,
             movement: parsed_text.movement,
+            movement_exact: parsed_text.movement_exact,
             fade: parsed_text.fade,
             clip_rect: parsed_text.clip_rect,
             vector_clip: parsed_text.vector_clip,
             inverse_clip: parsed_text.inverse_clip,
             wrap_style: parsed_text.wrap_style,
             origin: parsed_text.origin,
+            origin_exact: parsed_text.origin_exact,
             lines,
         })
     }
