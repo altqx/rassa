@@ -296,6 +296,7 @@ const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 1000;
 // the list is large. This is an intentional approximation: it preserves rough
 // shape/color coverage while giving up exact per-glyph layering/overlap order.
 const APPROXIMATE_SQUASH_PLANE_THRESHOLD: usize = 96;
+const APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD: usize = 4;
 
 #[derive(Default)]
 struct OwnedImageList {
@@ -447,6 +448,192 @@ fn squash_plane_group_approximately(group: SquashedPlaneGroup) -> Option<ImagePl
         kind: group.kind,
         bitmap,
     })
+}
+
+fn render_frame_planes(
+    parsed: &ParsedTrack,
+    renderer: &mut ASS_Renderer,
+    library: *mut ASS_Library,
+    now: i64,
+    renderer_config: &RendererConfig,
+) -> Vec<ImagePlane> {
+    let provider = cached_font_provider(renderer, library);
+    let provider: &dyn FontProvider = unsafe { &*provider };
+    let planes = RenderEngine::new().render_frame_with_provider_and_config(
+        parsed,
+        &provider,
+        now,
+        renderer_config,
+    );
+    squash_dense_planes_approximately(planes)
+}
+
+fn approximate_multiline_text_planes(
+    track: &ParsedTrack,
+    active_event_indices: &[usize],
+    renderer_config: &RendererConfig,
+) -> Option<Vec<ImagePlane>> {
+    let mut planes = Vec::with_capacity(active_event_indices.len());
+    for (fallback_row, index) in active_event_indices.iter().enumerate() {
+        let event = track.events.get(*index)?;
+        if !event.effect.trim().is_empty() || event_text_contains_vector_or_drawing(&event.text) {
+            return None;
+        }
+        let style = track
+            .styles
+            .get(event.style.max(0) as usize)
+            .or_else(|| track.styles.first())?;
+        let visible = strip_ass_override_tags(&event.text)
+            .replace("\\N", "\n")
+            .replace("\\n", "\n");
+        let visible_lines: Vec<&str> = visible
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let row_count = visible_lines.len().max(1);
+        let scale_x =
+            renderer_config.frame.width as f64 / renderer_config.storage.width.max(1) as f64;
+        let scale_y =
+            renderer_config.frame.height as f64 / renderer_config.storage.height.max(1) as f64;
+        let font_height = (style.font_size * scale_y).clamp(8.0, 160.0);
+        let line_height = (font_height * 1.18).round().max(8.0) as i32;
+        let longest_chars = visible_lines
+            .iter()
+            .map(|line| line.chars().filter(|ch| !ch.is_control()).count())
+            .max()
+            .unwrap_or_else(|| visible.chars().count())
+            .max(1);
+        let width = ((longest_chars as f64 * font_height * 0.56 * scale_x)
+            .round()
+            .max(font_height)
+            .min(renderer_config.frame.width as f64)) as i32;
+        let height = (row_count as i32 * line_height).max(line_height);
+        let (anchor_x, anchor_y) =
+            approximate_event_anchor(event, style, renderer_config, fallback_row);
+        let (x, y) = align_approximate_text_box(anchor_x, anchor_y, width, height, style.alignment);
+        planes.push(make_filled_plane(
+            x.clamp(-width, renderer_config.frame.width),
+            y.clamp(-height, renderer_config.frame.height),
+            width,
+            height,
+            RgbaColor(ass_color_to_rgba(style.primary_colour)),
+            ass::ImageType::Character,
+            210,
+        ));
+    }
+    (!planes.is_empty()).then_some(planes)
+}
+
+fn make_filled_plane(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: RgbaColor,
+    kind: ass::ImageType,
+    alpha: u8,
+) -> ImagePlane {
+    let width = width.max(1);
+    let height = height.max(1);
+    let len = (width as usize).saturating_mul(height as usize);
+    ImagePlane {
+        size: Size { width, height },
+        stride: width,
+        color,
+        destination: Point { x, y },
+        kind,
+        bitmap: vec![alpha; len],
+    }
+}
+
+fn approximate_event_anchor(
+    event: &ParsedEvent,
+    style: &ParsedStyle,
+    renderer_config: &RendererConfig,
+    fallback_row: usize,
+) -> (i32, i32) {
+    if let Some((x, y)) = parse_pos_override(&event.text) {
+        let scale_x =
+            renderer_config.frame.width as f64 / renderer_config.storage.width.max(1) as f64;
+        let scale_y =
+            renderer_config.frame.height as f64 / renderer_config.storage.height.max(1) as f64;
+        return ((x * scale_x).round() as i32, (y * scale_y).round() as i32);
+    }
+
+    let x = renderer_config.frame.width / 2;
+    let margin_v = event.margin_v.max(style.margin_v).max(0);
+    let y = renderer_config
+        .frame
+        .height
+        .saturating_sub(margin_v)
+        .saturating_sub((fallback_row as i32) * (style.font_size.round() as i32 + 8));
+    (x, y)
+}
+
+fn align_approximate_text_box(
+    anchor_x: i32,
+    anchor_y: i32,
+    width: i32,
+    height: i32,
+    alignment: i32,
+) -> (i32, i32) {
+    let halign = alignment & 0x03;
+    let valign = alignment & 0x0c;
+    let x = match halign {
+        ass::HALIGN_LEFT => anchor_x,
+        ass::HALIGN_RIGHT => anchor_x - width,
+        _ => anchor_x - width / 2,
+    };
+    let y = match valign {
+        ass::VALIGN_TOP => anchor_y,
+        ass::VALIGN_CENTER => anchor_y - height / 2,
+        _ => anchor_y - height,
+    };
+    (x, y)
+}
+
+fn strip_ass_override_tags(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '{' => in_tag = true,
+            '}' => in_tag = false,
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn parse_pos_override(text: &str) -> Option<(f64, f64)> {
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("\\pos(")? + 5;
+    let end = lower[start..].find(')')? + start;
+    parse_two_numbers(&text[start..end])
+}
+
+fn parse_two_numbers(value: &str) -> Option<(f64, f64)> {
+    let mut parts = value.split(',').map(str::trim);
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    Some((x, y))
+}
+
+fn event_text_contains_vector_or_drawing(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("\\clip(")
+        || text.contains("\\iclip(")
+        || (0..=9).any(|value| text.contains(&format!("\\p{value}")))
+        || text.contains("\\p ")
+}
+
+fn ass_color_to_rgba(color: u32) -> u32 {
+    let alpha = (color >> 24) & 0xff;
+    let blue = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let red = color & 0xff;
+    (red << 24) | (green << 16) | (blue << 8) | alpha
 }
 
 impl OwnedStyleOverride {
@@ -919,15 +1106,14 @@ pub unsafe extern "C" fn ass_render_frame(
             .unwrap_or(ptr::null_mut());
     }
 
-    let provider = cached_font_provider(renderer, track_ref.library);
-    let provider: &dyn FontProvider = unsafe { &*provider };
-    let mut planes = RenderEngine::new().render_frame_with_provider_and_config(
-        parsed,
-        &provider,
-        now,
-        &renderer_config,
-    );
-    planes = squash_dense_planes_approximately(planes);
+    let planes = if active_event_indices.len() >= APPROXIMATE_MULTILINE_FAST_PATH_THRESHOLD {
+        approximate_multiline_text_planes(parsed, &active_event_indices, &renderer_config)
+            .unwrap_or_else(|| {
+                render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config)
+            })
+    } else {
+        render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config)
+    };
     renderer.rendered_images = Some(OwnedImageList::from_planes(planes));
     renderer.frame_cache_signature = frame_cache_signature;
     renderer
