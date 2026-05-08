@@ -55,6 +55,7 @@ pub struct ASS_Renderer {
     selective_override_bits: c_int,
     selective_override_style: Option<OwnedStyleOverride>,
     cache_limits: (c_int, c_int),
+    font_provider_cache: Option<CachedFontProvider>,
     last_timestamp: Option<i64>,
     last_active_count: usize,
     rendered_images: Option<OwnedImageList>,
@@ -214,6 +215,30 @@ struct TrackState {
     check_readorder: bool,
     prune_delay: Option<i64>,
     rendered: bool,
+    parsed_cache_signature: Option<ParsedTrackCacheSignature>,
+    parsed_cache: Option<ParsedTrack>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedTrackCacheSignature {
+    n_styles: c_int,
+    styles: usize,
+    n_events: c_int,
+    events: usize,
+    style_format: usize,
+    event_format: usize,
+    track_type: c_int,
+    play_res_x: c_int,
+    play_res_y: c_int,
+    timer_bits: u64,
+    wrap_style: c_int,
+    scaled_border_and_shadow: c_int,
+    kerning: c_int,
+    language: usize,
+    ycbcr_matrix: c_int,
+    default_style: c_int,
+    layout_res_x: c_int,
+    layout_res_y: c_int,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -225,6 +250,23 @@ struct FontAttachment {
 #[derive(Clone, Debug, Default)]
 struct OwnedStyleOverride {
     style: ParsedStyle,
+}
+
+struct CachedFontProvider {
+    signature: FontProviderCacheSignature,
+    provider: Box<dyn FontProvider>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FontProviderCacheSignature {
+    library: usize,
+    library_fonts_len: usize,
+    library_fonts_data: Vec<(usize, usize)>,
+    default_font: Option<String>,
+    default_family: Option<String>,
+    default_provider: c_int,
+    fontconfig_config: Option<String>,
+    fontconfig_update: bool,
 }
 
 #[derive(Default)]
@@ -350,6 +392,7 @@ impl Default for ASS_Renderer {
             selective_override_bits: 0,
             selective_override_style: None,
             cache_limits: (0, 0),
+            font_provider_cache: None,
             last_timestamp: None,
             last_active_count: 0,
             rendered_images: None,
@@ -455,6 +498,7 @@ pub unsafe extern "C" fn ass_process_force_style(track: *mut ASS_Track) {
             }
         }
     }
+    invalidate_parsed_track_cache(track);
 }
 
 #[unsafe(no_mangle)]
@@ -701,14 +745,24 @@ pub unsafe extern "C" fn ass_render_frame(
         return ptr::null_mut();
     };
 
-    let mut parsed = parsed_track_from_ffi(track_ref);
-    apply_selective_style_overrides(&mut parsed, renderer);
-    let provider = build_font_provider(renderer, track_ref.library);
+    let cached = cached_parsed_track_from_ffi(track, track_ref);
+    let override_active = selective_style_overrides_active(renderer);
+    let parsed_with_overrides;
+    let parsed = if override_active {
+        let mut parsed = cached.clone();
+        apply_selective_style_overrides(&mut parsed, renderer);
+        parsed_with_overrides = parsed;
+        &parsed_with_overrides
+    } else {
+        cached
+    };
+    let provider = cached_font_provider(renderer, track_ref.library);
+    let provider: &dyn FontProvider = unsafe { &*provider };
     let planes = RenderEngine::new().render_frame_with_provider_and_config(
-        &parsed,
+        parsed,
         &provider,
         now,
-        &renderer_config(renderer, &parsed),
+        &renderer_config(renderer, parsed),
     );
     renderer.rendered_images = Some(OwnedImageList::from_planes(planes));
     renderer
@@ -1052,6 +1106,55 @@ pub unsafe extern "C" fn ass_clear_fonts(library: *mut ASS_Library) {
     if let Some(library) = library.as_mut() {
         library.fonts.clear();
     }
+}
+
+fn font_provider_cache_signature(
+    renderer: &ASS_Renderer,
+    library: *mut ASS_Library,
+) -> FontProviderCacheSignature {
+    let library_ref = unsafe { library.as_ref() };
+    let library_fonts_data = library_ref
+        .map(|library| {
+            library
+                .fonts
+                .iter()
+                .map(|font| (font.data.as_ptr() as usize, font.data.len()))
+                .collect()
+        })
+        .unwrap_or_default();
+    FontProviderCacheSignature {
+        library: library as usize,
+        library_fonts_len: library_ref.map(|library| library.fonts.len()).unwrap_or(0),
+        library_fonts_data,
+        default_font: renderer.default_font.clone(),
+        default_family: renderer.default_family.clone(),
+        default_provider: renderer.default_provider,
+        fontconfig_config: renderer.fontconfig_config.clone(),
+        fontconfig_update: renderer.fontconfig_update,
+    }
+}
+
+fn cached_font_provider(
+    renderer: &mut ASS_Renderer,
+    library: *mut ASS_Library,
+) -> *const dyn FontProvider {
+    let signature = font_provider_cache_signature(renderer, library);
+    if renderer
+        .font_provider_cache
+        .as_ref()
+        .is_none_or(|cache| cache.signature != signature)
+    {
+        let provider = build_font_provider(renderer, library);
+        renderer.font_provider_cache = Some(CachedFontProvider {
+            signature: signature.clone(),
+            provider,
+        });
+    }
+    &*renderer
+        .font_provider_cache
+        .as_ref()
+        .expect("font provider cached")
+        .provider
 }
 
 fn build_font_provider(
@@ -1518,6 +1621,7 @@ unsafe fn take_styles(track: &mut ASS_Track) -> Vec<ASS_Style> {
 }
 
 unsafe fn store_styles(track: &mut ASS_Track, mut styles: Vec<ASS_Style>) {
+    invalidate_parsed_track_cache_for_track(track);
     track.n_styles = styles.len() as c_int;
     track.max_styles = styles.capacity() as c_int;
     track.styles = if styles.capacity() == 0 {
@@ -1548,6 +1652,7 @@ unsafe fn take_events(track: &mut ASS_Track) -> Vec<ASS_Event> {
 }
 
 unsafe fn store_events(track: &mut ASS_Track, mut events: Vec<ASS_Event>) {
+    invalidate_parsed_track_cache_for_track(track);
     track.n_events = events.len() as c_int;
     track.max_events = events.capacity() as c_int;
     track.events = if events.capacity() == 0 {
@@ -1651,6 +1756,59 @@ unsafe fn string_from_ptr(value: *const c_char) -> String {
 unsafe fn track_state_mut(track: *mut ASS_Track) -> Option<&'static mut TrackState> {
     let track = track.as_mut()?;
     (!track.parser_priv.is_null()).then_some(&mut *(track.parser_priv as *mut TrackState))
+}
+
+unsafe fn invalidate_parsed_track_cache(track: *mut ASS_Track) {
+    if let Some(state) = track_state_mut(track) {
+        state.parsed_cache_signature = None;
+        state.parsed_cache = None;
+    }
+}
+
+unsafe fn invalidate_parsed_track_cache_for_track(track: &mut ASS_Track) {
+    if !track.parser_priv.is_null() {
+        let state = &mut *(track.parser_priv as *mut TrackState);
+        state.parsed_cache_signature = None;
+        state.parsed_cache = None;
+    }
+}
+
+fn parsed_track_cache_signature(track: &ASS_Track) -> ParsedTrackCacheSignature {
+    ParsedTrackCacheSignature {
+        n_styles: track.n_styles,
+        styles: track.styles as usize,
+        n_events: track.n_events,
+        events: track.events as usize,
+        style_format: track.style_format as usize,
+        event_format: track.event_format as usize,
+        track_type: track.track_type,
+        play_res_x: track.PlayResX,
+        play_res_y: track.PlayResY,
+        timer_bits: track.Timer.to_bits(),
+        wrap_style: track.WrapStyle,
+        scaled_border_and_shadow: track.ScaledBorderAndShadow,
+        kerning: track.Kerning,
+        language: track.Language as usize,
+        ycbcr_matrix: track.YCbCrMatrix,
+        default_style: track.default_style,
+        layout_res_x: track.LayoutResX,
+        layout_res_y: track.LayoutResY,
+    }
+}
+
+unsafe fn cached_parsed_track_from_ffi<'a>(
+    track: *mut ASS_Track,
+    track_ref: &ASS_Track,
+) -> &'a ParsedTrack {
+    let signature = parsed_track_cache_signature(track_ref);
+    let Some(state) = track_state_mut(track) else {
+        panic!("ASS_Track missing parser state");
+    };
+    if state.parsed_cache_signature != Some(signature) || state.parsed_cache.is_none() {
+        state.parsed_cache = Some(parsed_track_from_ffi(track_ref));
+        state.parsed_cache_signature = Some(signature);
+    }
+    state.parsed_cache.as_ref().expect("parsed track cached")
 }
 
 unsafe fn active_event_count(track: *mut ASS_Track, now: i64) -> usize {
@@ -1757,6 +1915,11 @@ unsafe fn parsed_style_from_ffi(style: &ASS_Style) -> ParsedStyle {
         blur: style.Blur,
         justify: style.Justify,
     }
+}
+
+fn selective_style_overrides_active(renderer: &ASS_Renderer) -> bool {
+    renderer.selective_override_style.is_some()
+        && renderer.selective_override_bits != ass::override_bits::DEFAULT
 }
 
 fn apply_selective_style_overrides(track: &mut ParsedTrack, renderer: &ASS_Renderer) {
