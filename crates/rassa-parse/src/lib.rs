@@ -1230,9 +1230,7 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix("be") {
             current_style.be = parse_f64(rest, current_style.be);
         } else if let Some(rest) = tag.strip_prefix('t') {
-            if let Some(transform) = parse_transform(rest, current_style) {
-                current_transforms.push(transform);
-            }
+            current_transforms.extend(parse_transforms(rest, current_style));
         } else if let Some(rest) = tag.strip_prefix('u') {
             current_style.underline = parse_override_bool(rest, current_style.underline);
         } else if let Some(rest) = tag.strip_prefix('s') {
@@ -1381,6 +1379,32 @@ fn suppress_transform_fields_for_override(
     }
 
     current_transforms.retain(|transform| !transform.style.is_empty());
+}
+
+fn parse_transforms(value: &str, current_style: &ParsedSpanStyle) -> Vec<ParsedSpanTransform> {
+    let Some(inside) = value
+        .trim()
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Vec::new();
+    };
+    let inside = inside.trim();
+    let Some(tag_start) = inside.find('\\') else {
+        return Vec::new();
+    };
+    let tags_part = &inside[tag_start..];
+    let mut transforms = Vec::new();
+    if let Some(transform) = parse_transform(value, current_style) {
+        transforms.push(transform);
+    }
+    for raw_tag in split_override_tags(tags_part) {
+        let tag = raw_tag.trim();
+        if let Some(rest) = tag.strip_prefix('t') {
+            transforms.extend(parse_transforms(rest, current_style));
+        }
+    }
+    transforms
 }
 
 fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<ParsedSpanTransform> {
@@ -2757,6 +2781,28 @@ mod tests {
         assert_eq!(span.style.rotation_z, 15.0);
         assert_eq!(span.transforms.len(), 1);
         assert_eq!(span.transforms[0].style.rotation_z, Some(45.0));
+    }
+
+    #[test]
+    fn parses_nested_transform_tags_in_libass_order() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\t(0,100,\\frz4\\t(100,200,\\frz-4\\t(200,300,\\frz4)))}Text",
+            &base_style,
+            &[],
+        );
+
+        let transforms = &parsed.lines[0].spans[0].transforms;
+        assert_eq!(transforms.len(), 3);
+        assert_eq!(transforms[0].start_ms, 0);
+        assert_eq!(transforms[0].end_ms, Some(100));
+        assert_eq!(transforms[0].style.rotation_z, Some(4.0));
+        assert_eq!(transforms[1].start_ms, 100);
+        assert_eq!(transforms[1].end_ms, Some(200));
+        assert_eq!(transforms[1].style.rotation_z, Some(-4.0));
+        assert_eq!(transforms[2].start_ms, 200);
+        assert_eq!(transforms[2].end_ms, Some(300));
+        assert_eq!(transforms[2].style.rotation_z, Some(4.0));
     }
 
     #[test]

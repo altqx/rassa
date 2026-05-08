@@ -1942,6 +1942,7 @@ fn apply_run_transform_to_recent_planes(
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
         .unwrap_or(origin);
     let pad_frz_text_plane = context.single_line_blurred_text_frz_without_org();
+    let pad_org_frz_text_plane = context.single_line_blurred_text_frz_with_org();
     let transform_slice = |planes: &mut Vec<ImagePlane>, start: usize| {
         let tail = planes.split_off(start);
         planes.extend(transform_event_planes(
@@ -1950,8 +1951,11 @@ fn apply_run_transform_to_recent_planes(
             origin,
             shear_base,
             context.render_scale.y,
-            context.drawing_run,
-            pad_frz_text_plane,
+            TransformPlaneOptions {
+                drawing_run: context.drawing_run,
+                pad_frz_text_plane,
+                pad_org_frz_text_plane,
+            },
         ));
     };
     transform_slice(shadow_planes, starts.shadow);
@@ -1996,14 +2000,19 @@ fn event_transform_origin(
         .unwrap_or((0.0, 0.0))
 }
 
+struct TransformPlaneOptions {
+    drawing_run: bool,
+    pad_frz_text_plane: bool,
+    pad_org_frz_text_plane: bool,
+}
+
 fn transform_event_planes(
     planes: Vec<ImagePlane>,
     transform: EventTransform,
     origin: (f64, f64),
     shear_base: (f64, f64),
     render_scale_y: f64,
-    drawing_run: bool,
-    pad_frz_text_plane: bool,
+    options: TransformPlaneOptions,
 ) -> Vec<ImagePlane> {
     if planes.is_empty() || transform.is_identity() {
         return planes;
@@ -2024,21 +2033,24 @@ fn transform_event_planes(
     planes
         .into_iter()
         .filter_map(|plane| {
-            let preserve_bottom_padding = drawing_run
+            let preserve_bottom_padding = options.drawing_run
                 || transform.rotation_x.abs() > f64::EPSILON
                 || transform.rotation_y.abs() > f64::EPSILON;
             let mut transformed = transform_plane(plane, matrix, preserve_bottom_padding)?;
-            if drawing_run && transform.shear_y.abs() > f64::EPSILON {
+            if options.drawing_run && transform.shear_y.abs() > f64::EPSILON {
                 let correction = (transform.shear_y.abs() * f64::from(transformed.size.height)
                     / 3.0)
                     .round() as i32;
                 transformed.destination.y += correction;
                 transformed = pad_plane_transparent(transformed, 0, 0, 12, 0);
             }
-            if pad_frz_text_plane {
+            if options.pad_frz_text_plane {
                 transformed.destination.x += 4;
                 transformed = pad_plane_transparent(transformed, 0, 0, 16, 0);
                 transformed = trim_plane_bottom(transformed, 8);
+            }
+            if options.pad_org_frz_text_plane {
+                transformed = pad_libass_org_frz_text_plane(transformed);
             }
             Some(transformed)
         })
@@ -2069,6 +2081,44 @@ impl RunTransformContext<'_> {
             && self.transform.rotation_y.abs() < f64::EPSILON
             && self.transform.shear_x.abs() < f64::EPSILON
             && self.transform.shear_y.abs() < f64::EPSILON
+    }
+
+    fn single_line_blurred_text_frz_with_org(&self) -> bool {
+        !self.drawing_run
+            && self.effective_position.is_some()
+            && (self.event.origin.is_some() || self.event.origin_exact.is_some())
+            && self.event.lines.len() == 1
+            && self.blur.is_finite()
+            && self.blur > 0.0
+            && self.transform.rotation_z.abs() > f64::EPSILON
+            && self.transform.rotation_x.abs() < f64::EPSILON
+            && self.transform.rotation_y.abs() < f64::EPSILON
+            && self.transform.shear_x.abs() < f64::EPSILON
+            && self.transform.shear_y.abs() < f64::EPSILON
+    }
+}
+
+fn pad_libass_org_frz_text_plane(mut plane: ImagePlane) -> ImagePlane {
+    match plane.kind {
+        ass::ImageType::Shadow => {
+            plane.destination.x += 4;
+            plane.destination.y += 9;
+            let pad_right = (56 - plane.size.width).max(0);
+            pad_plane_transparent(plane, 0, 0, pad_right, 0)
+        }
+        ass::ImageType::Outline => {
+            plane.destination.x += 3;
+            plane.destination.y += 9;
+            let pad_right = (56 - plane.size.width).max(0);
+            pad_plane_transparent(plane, 0, 0, pad_right, 0)
+        }
+        ass::ImageType::Character => {
+            plane.destination.x += 3;
+            plane.destination.y += 8;
+            let pad_right = (32 - plane.size.width).max(0);
+            let pad_bottom = (48 - plane.size.height).max(0);
+            pad_plane_transparent(plane, 0, 0, pad_right, pad_bottom)
+        }
     }
 }
 
@@ -4644,19 +4694,31 @@ mod tests {
     }
 
     fn baseline_fontconfig_matches_dejavu_fallback(family: &str) -> bool {
+        baseline_fontconfig_family_contains(family, "DejaVu")
+    }
+
+    fn baseline_fontconfig_family_contains(family: &str, expected: &str) -> bool {
         let provider = FontconfigProvider::new();
         provider
             .resolve(&FontQuery::new(family))
             .family
-            .contains("DejaVu")
+            .contains(expected)
     }
 
     fn render_text_plane_bounds(script: &str) -> Option<Rect> {
+        render_text_plane_bounds_at(script, 500)
+    }
+
+    fn render_text_plane_bounds_at(script: &str, now_ms: i64) -> Option<Rect> {
+        render_text_kind_bounds_at(script, now_ms, ass::ImageType::Character)
+    }
+
+    fn render_text_kind_bounds_at(script: &str, now_ms: i64, kind: ass::ImageType) -> Option<Rect> {
         let track = parse_script_text(script).expect("text plane probe script should parse");
         let engine = RenderEngine::new();
         let provider = FontconfigProvider::new();
-        let planes = engine.render_frame_with_provider(&track, &provider, 500);
-        character_bounds(&planes)
+        let planes = engine.render_frame_with_provider(&track, &provider, now_ms);
+        kind_bounds(&planes, kind)
     }
 
     #[test]
@@ -4818,6 +4880,58 @@ mod tests {
                 y_max: 77,
             },
             "decimal rectangular clip over transformed one-char text should keep libass-like ASS_Image plane geometry"
+        );
+    }
+
+    #[test]
+    fn transformed_move_origin_single_char_keeps_libass_like_plane_padding() {
+        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
+            return;
+        }
+        let script = r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2,Arial,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 7,0:00:00.00,0:00:01.00,ED2,,0,0,0,fx,{\move(808.8,73,808.8,65)\org(718.8,-25)\t(27.857142857143,55.714285714286,\frz4)\t(55.714285714286,83.571428571429,\frz-4)\t(83.571428571429,111.42857142857,\frz4\t(111.42857142857,139.28571428571,\frz-4\t(139.28571428571,167.14285714286,\frz4\t(167.14285714286,195,\frz-4\t(195,222.85714285714,\frz4\t(445.71428571429,250.71428571429,\frz-4\t(250.71428571429,278.57142857143,\frz4\t(278.57142857143,306.42857142857,\frz-4\t(306.42857142857,334.28571428571,\frz4\t(334.28571428571,362.14285714286,\frz-4\t(362.14285714286,390,\frz0)))))))))))\b0\bord3.5\blur1.5\fs80\an5\c&HFFFFFF&\3c&HFFFFFF&\t(0,390,\fs70\frz0)\1a&H70&}s
+"#;
+        assert_eq!(
+            render_text_kind_bounds_at(script, 195, ass::ImageType::Shadow),
+            Some(Rect {
+                x_min: 785,
+                y_min: 57,
+                x_max: 841,
+                y_max: 113,
+            }),
+            "shadow ASS_Image plane should match libass for the 02.ass move/origin transform fixture"
+        );
+        assert_eq!(
+            render_text_kind_bounds_at(script, 195, ass::ImageType::Outline),
+            Some(Rect {
+                x_min: 782,
+                y_min: 54,
+                x_max: 838,
+                y_max: 110,
+            }),
+            "outline ASS_Image plane should match libass for the 02.ass move/origin transform fixture"
+        );
+        assert_eq!(
+            render_text_kind_bounds_at(script, 195, ass::ImageType::Character),
+            Some(Rect {
+                x_min: 789,
+                y_min: 61,
+                x_max: 821,
+                y_max: 109,
+            }),
+            "character ASS_Image plane should match libass for the 02.ass move/origin transform fixture"
         );
     }
 
