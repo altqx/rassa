@@ -288,6 +288,7 @@ struct RenderedFrameCacheSignature {
 // small time bucket. This intentionally trades sub-frame pixel accuracy for much
 // higher FPS on transform/karaoke/clip-heavy scripts.
 const APPROXIMATE_ANIMATION_FRAME_BUCKET_MS: i64 = 250;
+const APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS: i64 = 500;
 
 #[derive(Default)]
 struct OwnedImageList {
@@ -1922,10 +1923,24 @@ fn frame_cache_time_bucket(
     }
 
     if active_events_are_static(track, active_event_indices) {
-        Some(0)
-    } else {
-        Some(now.div_euclid(APPROXIMATE_ANIMATION_FRAME_BUCKET_MS))
+        return Some(0);
     }
+
+    let bucket_ms = if active_events_have_heavy_animation(track, active_event_indices) {
+        APPROXIMATE_HEAVY_ANIMATION_FRAME_BUCKET_MS
+    } else {
+        APPROXIMATE_ANIMATION_FRAME_BUCKET_MS
+    };
+    Some(now.div_euclid(bucket_ms))
+}
+
+fn active_events_have_heavy_animation(track: &ParsedTrack, active_event_indices: &[usize]) -> bool {
+    active_event_indices.iter().any(|index| {
+        track
+            .events
+            .get(*index)
+            .is_some_and(|event| event_text_has_heavy_animation(&event.text))
+    })
 }
 
 fn active_events_are_static(track: &ParsedTrack, active_event_indices: &[usize]) -> bool {
@@ -1944,6 +1959,15 @@ fn event_text_is_static(text: &str) -> bool {
         || text.contains("\\t(")
         || text.contains("\\k")
         || text.contains("\\ko"))
+}
+
+fn event_text_has_heavy_animation(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("\\t(")
+        || text.contains("\\k")
+        || text.contains("\\ko")
+        || text.contains("\\clip")
+        || text.contains("\\iclip")
 }
 
 unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
