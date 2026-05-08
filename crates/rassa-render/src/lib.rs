@@ -4350,7 +4350,7 @@ fn is_event_active(event: &ParsedEvent, now_ms: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rassa_fonts::{FontconfigProvider, NullFontProvider};
+    use rassa_fonts::{FontProvider, FontQuery, FontconfigProvider, NullFontProvider};
     use rassa_parse::parse_script_text;
 
     fn config(
@@ -4560,6 +4560,11 @@ mod tests {
         visible_bounds(&planes)
     }
 
+    fn baseline_fontconfig_matches_dejavu_fallback(family: &str) -> bool {
+        let provider = FontconfigProvider::new();
+        provider.resolve(&FontQuery::new(family)).family == "DejaVu Sans"
+    }
+
     #[test]
     fn decimal_positioned_drawing_uses_exact_coordinates() {
         let decimal = drawing_alignment_script(7, "\\pos(100.6,50.6)", "0,0,0");
@@ -4621,6 +4626,9 @@ mod tests {
 
     #[test]
     fn positioned_center_text_anchors_visible_ink_not_layout_advance() {
+        if !baseline_fontconfig_matches_dejavu_fallback("Againts") {
+            return;
+        }
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs140\\bord0\\blur1\\fnAgaints\\pos(947.46,191.6)}ท่านคาชิวากิ อาซาฮิ\n";
         let actual = render_text_bounds(script).expect("baseline positioned text should render");
         let center_x = (actual.x_min + actual.x_max) / 2;
@@ -4637,6 +4645,9 @@ mod tests {
 
     #[test]
     fn positioned_multiline_text_uses_libass_like_line_gap_and_descender_space() {
+        if !baseline_fontconfig_matches_dejavu_fallback("Raphtalia") {
+            return;
+        }
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs100\\bord0\\blur1\\fnRaphtalia\\b1\\pos(944.4,752.8)}จงเตรียมตัว\\Nให้พร้อมสรรพก่อนมา\n";
         let actual =
             render_text_bounds(script).expect("baseline multiline positioned text should render");
@@ -4653,6 +4664,9 @@ mod tests {
 
     #[test]
     fn positioned_multiline_text_aligns_deep_glyph_bottoms_like_libass() {
+        if !baseline_fontconfig_matches_dejavu_fallback("Raphtalia") {
+            return;
+        }
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs100\\bord0\\blur1\\fnRaphtalia\\b1\\pos(928,992)}ห้ามท่านหนี\\Nจากคำขอนี้เป็นอันขาด\n";
         let actual =
             render_text_bounds(script).expect("baseline multiline positioned text should render");
