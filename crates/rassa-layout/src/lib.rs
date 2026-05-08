@@ -120,7 +120,11 @@ impl LayoutEngine {
             .clamp(0, 3);
         let alignment = parsed_text.alignment.unwrap_or(style.alignment);
         let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment);
-        let lines = wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?;
+        let lines = if explicit_lines.len() > 1 {
+            explicit_lines
+        } else {
+            wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?
+        };
 
         Ok(LayoutEvent {
             event_index,
@@ -224,13 +228,14 @@ fn layout_line_from_text<P: FontProvider>(
             for shaped_run in shaped.runs {
                 line_direction = shaped_run.direction;
                 let run_font = shaped_run.font.clone();
+                let glyphs = apply_vertical_font_advances(shaped_run.glyphs, &span.style);
                 runs.push(LayoutGlyphRun {
                     text: shaped_run.text,
                     direction: shaped_run.direction,
                     font_family: run_font.family.clone(),
                     font: run_font,
-                    width: text_run_width(&shaped_run.glyphs, &span.style),
-                    glyphs: shaped_run.glyphs,
+                    width: text_run_width(&glyphs, &span.style),
+                    glyphs,
                     style: span.style.clone(),
                     transforms: span.transforms.clone(),
                     karaoke: span.karaoke,
@@ -509,6 +514,26 @@ fn line_from_pieces(source: &LayoutLine, pieces: &[LayoutPiece]) -> LayoutLine {
     }
 }
 
+fn apply_vertical_font_advances(
+    mut glyphs: Vec<GlyphInfo>,
+    style: &ParsedSpanStyle,
+) -> Vec<GlyphInfo> {
+    if !style.font_name.starts_with('@') {
+        return glyphs;
+    }
+    let advance = style.font_size.max(0.0) as f32;
+    if advance <= 0.0 {
+        return glyphs;
+    }
+    for glyph in &mut glyphs {
+        if glyph.x_advance.abs() > f32::EPSILON || glyph.y_advance.abs() > f32::EPSILON {
+            glyph.x_advance = advance;
+            glyph.y_advance = 0.0;
+        }
+    }
+    glyphs
+}
+
 fn text_run_width(glyphs: &[GlyphInfo], style: &ParsedSpanStyle) -> f32 {
     let scale_x = style.scale_x.max(0.0) as f32;
     let spacing = if style.spacing.is_finite() {
@@ -731,6 +756,32 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
     }
 
     #[test]
+    fn explicit_hard_break_lines_are_not_auto_wrapped_again() {
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,Fontin Sans Rg,70,&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,1,3.5,1.5,2,140,140,45,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:06:06.20,0:06:11.56,Main,,0,0,0,,Eu sei que a Karin é fofa, mas quem seria tão\\N descaradamente indecente em plena luz do dia?!",
+        );
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("baseline dialogue layout should succeed");
+
+        assert_eq!(
+            layout.lines.len(),
+            2,
+            "explicit \\N from baseline line 122 is already a hard break; auto-wrap must not split it into extra visual lines"
+        );
+        assert_eq!(
+            layout.lines[0].text,
+            "Eu sei que a Karin é fofa, mas quem seria tão"
+        );
+        assert_eq!(
+            layout.lines[1].text,
+            " descaradamente indecente em plena luz do dia?!"
+        );
+    }
+
+    #[test]
     fn layout_q2_disables_automatic_wrapping() {
         let track = parse_track(
             "[Script Info]
@@ -804,6 +855,25 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
 
         assert!(layout.lines.len() > 1);
         assert!(layout.lines.iter().all(|line| line.width <= 2.0));
+    }
+
+    #[test]
+    fn vertical_font_names_use_font_size_advances_like_libass() {
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:09:48.86,0:09:51.61,Placas,,0,0,0,,{\\fs86\\fn@FOT-DNP Shuei4goStd M\\b1}โรงเรียน",
+        );
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("vertical-font baseline dialogue should layout");
+        let line = &layout.lines[0];
+
+        assert!(
+            line.width >= 86.0 * 7.0,
+            "@font text should advance by roughly one em per character like libass, got width {}",
+            line.width
+        );
     }
 
     #[test]

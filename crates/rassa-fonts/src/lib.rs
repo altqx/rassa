@@ -152,7 +152,7 @@ impl Default for CrossfontProvider {
 impl CrossfontProvider {
     pub fn new() -> Self {
         Self {
-            fallback_family: None,
+            fallback_family: Some("Arial".to_string()),
             resolve_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -267,7 +267,9 @@ fn resolve_system_font(
         let resolved_family = load_face_metadata(&path)
             .map(|(family, _)| family)
             .unwrap_or_else(|| family.to_owned());
-        return Some((resolved_family, Some(path), face_index));
+        if fontconfig_match_is_acceptable(family, &resolved_family) {
+            return Some((resolved_family, Some(path), face_index));
+        }
     }
 
     let requested_style = style.map(normalize_font_key);
@@ -428,6 +430,28 @@ fn windows_known_font_path(family: &str) -> Option<PathBuf> {
 #[cfg(all(not(windows), not(target_arch = "wasm32")))]
 fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
     None
+}
+
+fn fontconfig_match_is_acceptable(requested_family: &str, resolved_family: &str) -> bool {
+    let requested = normalize_font_key(requested_family);
+    let resolved = normalize_font_key(resolved_family);
+    if requested == resolved {
+        return true;
+    }
+    matches!(
+        requested.as_str(),
+        "arial"
+            | "helvetica"
+            | "timesnewroman"
+            | "times"
+            | "couriernew"
+            | "courier"
+            | "sans"
+            | "sansserif"
+            | "serif"
+            | "mono"
+            | "monospace"
+    )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -814,6 +838,22 @@ mod tests {
 
         let provider = FontconfigProvider::new();
         let result = provider.resolve(&FontQuery::new("sans"));
+
+        assert_eq!(result.path, Some(expected_path));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn fontconfig_provider_uses_arial_default_for_missing_specific_family_like_libass() {
+        let arial = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "Arial:weight=bold"])
+            .output()
+            .expect("fc-match should be available with fontconfig");
+        assert!(arial.status.success());
+        let expected_path = PathBuf::from(String::from_utf8(arial.stdout).expect("utf8 path"));
+
+        let provider = FontconfigProvider::new();
+        let result = provider.resolve(&FontQuery::new("Fontin Sans Rg").with_weight(700));
 
         assert_eq!(result.path, Some(expected_path));
     }

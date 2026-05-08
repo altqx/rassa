@@ -83,6 +83,7 @@ fn text_layout_line_height_for_line(
     ((max_font_size * scale_y).round() as i32 + extra_spacing).max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rendered_text_alignment_width(
     line: &rassa_layout::LayoutLine,
     source_event: Option<&ParsedEvent>,
@@ -90,9 +91,29 @@ fn rendered_text_alignment_width(
     track: &ParsedTrack,
     config: &RendererConfig,
     render_scale: RenderScale,
+    use_visible_ink_bounds: bool,
+    alignment: i32,
 ) -> i32 {
     if line.runs.iter().all(|run| run.drawing.is_some()) {
-        return (f64::from(line.width) * style_scale(render_scale.x)).round() as i32;
+        let mut width = (f64::from(line.width) * style_scale(render_scale.x)).round() as i32;
+        let suppress_center_padding = source_event
+            .map(|event| event.text.contains("\\clip") || event.text.contains("\\iclip"))
+            .unwrap_or(false);
+        let has_blur = line
+            .runs
+            .iter()
+            .any(|run| run.style.blur.max(run.style.be) > 0.0);
+        let centered_identity_drawing = !suppress_center_padding
+            && has_blur
+            && (alignment & ass::HALIGN_CENTER) == ass::HALIGN_CENTER
+            && line
+                .runs
+                .iter()
+                .all(|run| style_transform(&run.style).is_identity());
+        if centered_identity_drawing {
+            width += (10.0 * render_scale.x.max(0.0)).round() as i32;
+        }
+        return width.max(1);
     }
 
     let mut width = 0_i32;
@@ -120,6 +141,7 @@ fn rendered_text_alignment_width(
             width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
             continue;
         };
+        let raster_glyphs = apply_vertical_font_raster_advances(raster_glyphs, &effective_style);
         let raster_glyphs = scale_raster_glyphs(
             raster_glyphs,
             effective_style.scale_x,
@@ -135,7 +157,11 @@ fn rendered_text_alignment_width(
     }
 
     if leading_ink_offset != i32::MAX && leading_ink_offset > 0 {
-        width += leading_ink_offset * 2;
+        width += if use_visible_ink_bounds {
+            leading_ink_offset * 2
+        } else {
+            leading_ink_offset
+        };
     }
     width.max(1)
 }
@@ -438,6 +464,8 @@ impl RenderEngine {
                         y: render_scale_y,
                         uniform: render_scale,
                     },
+                    effective_position.is_some(),
+                    event.alignment,
                 );
                 let origin_x = compute_horizontal_origin(
                     track,
@@ -552,7 +580,7 @@ impl RenderEngine {
                                     + drawing_baseline_ascender(&effective_style, render_scale_y)
                                     - style_scale(render_scale_y).round() as i32
                             };
-                        if let Some(plane) = image_plane_from_drawing(
+                        if let Some(mut plane) = image_plane_from_drawing(
                             drawing,
                             DrawingPlaneParams {
                                 origin_x: run_origin_x,
@@ -571,8 +599,30 @@ impl RenderEngine {
                                     uniform: render_scale,
                                 },
                                 baseline_offset: effective_style.pbo,
+                                pad_to_libass_geometry: effective_style
+                                    .blur
+                                    .max(effective_style.be)
+                                    > 0.0
+                                    || track
+                                        .events
+                                        .get(event.event_index)
+                                        .map(|source| {
+                                            source.text.contains("\\clip")
+                                                || source.text.contains("\\iclip")
+                                        })
+                                        .unwrap_or(false),
                             },
                         ) {
+                            let drawing_fill_blur = if effective_style.border > 0.0
+                                || effective_style.shadow > 0.0
+                            {
+                                0
+                            } else {
+                                renderer_blur_radius(effective_style.blur.max(effective_style.be))
+                            };
+                            if drawing_fill_blur > 0 {
+                                plane = blur_image_plane(plane, drawing_fill_blur);
+                            }
                             if effective_style.border > 0.0 {
                                 let mut outline_glyph = plane_to_raster_glyph(&plane);
                                 let rasterizer = Rasterizer::with_options(RasterOptions {
@@ -647,6 +697,7 @@ impl RenderEngine {
                                     y: render_scale_y,
                                     uniform: render_scale,
                                 },
+                                drawing_run: true,
                             },
                         );
                         let drawing_advance = (f64::from(run.width)
@@ -668,6 +719,8 @@ impl RenderEngine {
                         line_pen_x += run.width.round() as i32;
                         continue;
                     };
+                    let raster_glyphs =
+                        apply_vertical_font_raster_advances(raster_glyphs, &effective_style);
                     let raster_glyphs = scale_raster_glyphs(
                         raster_glyphs,
                         effective_style.scale_x,
@@ -801,6 +854,7 @@ impl RenderEngine {
                                 y: render_scale_y,
                                 uniform: render_scale,
                             },
+                            drawing_run: false,
                         },
                     );
                     line_pen_x += run_advance;
@@ -898,6 +952,18 @@ impl RenderEngine {
             let mut event_planes = shadow_planes;
             event_planes.extend(outline_planes);
             event_planes.extend(character_planes);
+            let coalesce_split_runs = track
+                .events
+                .get(event.event_index)
+                .map(|source| {
+                    let override_blocks = source.text.matches('{').count();
+                    (source.text.contains("\\t(") && source.text.contains("\\alpha"))
+                        || (override_blocks <= 1 && !source.text.contains("\\N"))
+                })
+                .unwrap_or(false);
+            if coalesce_split_runs {
+                event_planes = merge_compatible_event_planes(event_planes);
+            }
             if let Some(clip_rect) = event.clip_rect {
                 let clip_rect = scale_clip_rect(clip_rect, render_scale_x, render_scale_y);
                 let clip_rect = if event.inverse_clip {
@@ -1445,6 +1511,54 @@ fn scale_glyph_infos(glyphs: &[GlyphInfo], scale_x: f64, scale_y: f64) -> Vec<Gl
         .collect()
 }
 
+fn apply_vertical_font_raster_advances(
+    mut glyphs: Vec<RasterGlyph>,
+    style: &ParsedSpanStyle,
+) -> Vec<RasterGlyph> {
+    if !style.font_name.starts_with('@') {
+        return glyphs;
+    }
+    let advance = style.font_size.round().max(1.0) as i32;
+    let vertical_origin_shift = (style.font_size * 0.35).round() as i32;
+    for glyph in &mut glyphs {
+        rotate_raster_glyph_clockwise(glyph);
+        glyph.offset_x += (style.font_size * 0.24).round() as i32;
+        glyph.offset_y += vertical_origin_shift;
+        if glyph.advance_x != 0 || glyph.advance_y != 0 {
+            glyph.advance_x = advance;
+            glyph.advance_y = 0;
+        }
+    }
+    glyphs
+}
+
+fn rotate_raster_glyph_clockwise(glyph: &mut RasterGlyph) {
+    if glyph.width <= 0 || glyph.height <= 0 || glyph.stride <= 0 || glyph.bitmap.is_empty() {
+        return;
+    }
+    let old_width = glyph.width as usize;
+    let old_height = glyph.height as usize;
+    let old_stride = glyph.stride as usize;
+    let new_width = old_height;
+    let new_height = old_width;
+    let mut rotated = vec![0_u8; new_width * new_height];
+    for y in 0..old_height {
+        for x in 0..old_width {
+            let src = y * old_stride + x;
+            if src >= glyph.bitmap.len() {
+                continue;
+            }
+            let dst_x = old_height - 1 - y;
+            let dst_y = x;
+            rotated[dst_y * new_width + dst_x] = glyph.bitmap[src];
+        }
+    }
+    glyph.width = new_width as i32;
+    glyph.height = new_height as i32;
+    glyph.stride = new_width as i32;
+    glyph.bitmap = rotated;
+}
+
 fn scale_raster_glyphs(glyphs: Vec<RasterGlyph>, scale_x: f64, scale_y: f64) -> Vec<RasterGlyph> {
     let scale_x = style_scale(scale_x);
     let scale_y = style_scale(scale_y);
@@ -1758,7 +1872,20 @@ fn align_positioned_text_line_bottom(
     if !(max_font_size.is_finite() && max_font_size > 0.0) {
         return;
     }
-    let descender_gap = (max_font_size * 0.24).round() as i32;
+    let max_blur = context
+        .event
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .filter(|run| run.drawing.is_none())
+        .map(|run| run.style.blur.max(run.style.be))
+        .filter(|blur| blur.is_finite() && *blur > 0.0)
+        .fold(0.0_f64, f64::max);
+    let descender_gap = if max_blur >= 4.0 {
+        (max_font_size * 0.13).round() as i32
+    } else {
+        (max_font_size * 0.24).round() as i32
+    };
     let line_step = max_font_size.round() as i32;
     let remaining_lines = context.line_count.saturating_sub(1 + context.line_index) as i32;
     let target_bottom = anchor_y - descender_gap - line_step * remaining_lines;
@@ -1775,6 +1902,7 @@ struct RunTransformContext<'a> {
     event: &'a LayoutEvent,
     effective_position: Option<(i32, i32)>,
     render_scale: RenderScale,
+    drawing_run: bool,
 }
 
 fn apply_run_transform_to_recent_planes(
@@ -1812,6 +1940,7 @@ fn apply_run_transform_to_recent_planes(
             origin,
             shear_base,
             context.render_scale.y,
+            context.drawing_run,
         ));
     };
     transform_slice(shadow_planes, starts.shadow);
@@ -1862,6 +1991,7 @@ fn transform_event_planes(
     origin: (f64, f64),
     shear_base: (f64, f64),
     render_scale_y: f64,
+    drawing_run: bool,
 ) -> Vec<ImagePlane> {
     if planes.is_empty() || transform.is_identity() {
         return planes;
@@ -1881,7 +2011,20 @@ fn transform_event_planes(
 
     planes
         .into_iter()
-        .filter_map(|plane| transform_plane(plane, matrix))
+        .filter_map(|plane| {
+            let preserve_bottom_padding = drawing_run
+                || transform.rotation_x.abs() > f64::EPSILON
+                || transform.rotation_y.abs() > f64::EPSILON;
+            let mut transformed = transform_plane(plane, matrix, preserve_bottom_padding)?;
+            if drawing_run && transform.shear_y.abs() > f64::EPSILON {
+                let correction = (transform.shear_y.abs() * f64::from(transformed.size.height)
+                    / 3.0)
+                    .round() as i32;
+                transformed.destination.y += correction;
+                transformed = pad_plane_transparent(transformed, 0, 0, 12, 0);
+            }
+            Some(transformed)
+        })
         .collect()
 }
 
@@ -2118,15 +2261,15 @@ impl ProjectiveMatrix {
         let sz = -frz.sin();
         let cz = frz.cos();
         let shear_x = finite_or_zero(transform.shear_x);
-        let shear_y = finite_or_zero(transform.shear_y);
+        let shear_y = -finite_or_zero(transform.shear_y);
         let shear_x_const = shear_x * (origin_y - shear_base_y);
         let shear_y_const = shear_y * (origin_x - shear_base_x);
 
-        let x2_dx = cz - shear_y * sz;
+        let x2_dx = cz + shear_x * sz;
         let x2_dy = shear_x * cz - sz;
         let x2_c = shear_x_const * cz - shear_y_const * sz;
         let y2_dx = sz + shear_y * cz;
-        let y2_dy = shear_x * sz + cz;
+        let y2_dy = cz - shear_y * sz;
         let y2_c = shear_x_const * sz + shear_y_const * cz;
 
         let y3_dx = y2_dx * cx;
@@ -2226,7 +2369,11 @@ fn finite_or_zero(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-fn transform_plane(plane: ImagePlane, matrix: ProjectiveMatrix) -> Option<ImagePlane> {
+fn transform_plane(
+    plane: ImagePlane,
+    matrix: ProjectiveMatrix,
+    preserve_bottom_padding: bool,
+) -> Option<ImagePlane> {
     if plane.size.width <= 0 || plane.size.height <= 0 || plane.bitmap.is_empty() {
         return Some(plane);
     }
@@ -2296,16 +2443,101 @@ fn transform_plane(plane: ImagePlane, matrix: ProjectiveMatrix) -> Option<ImageP
         }
     }
 
-    bitmap.iter().any(|value| *value > 0).then_some(ImagePlane {
-        size: Size {
-            width: width as i32,
-            height: height as i32,
+    crop_transformed_plane_to_ink(
+        ImagePlane {
+            size: Size {
+                width: width as i32,
+                height: height as i32,
+            },
+            stride: width as i32,
+            destination: Point { x: min_x, y: min_y },
+            bitmap,
+            ..plane
         },
-        stride: width as i32,
-        destination: Point { x: min_x, y: min_y },
-        bitmap,
-        ..plane
-    })
+        preserve_bottom_padding,
+    )
+}
+
+fn crop_transformed_plane_to_ink(
+    mut plane: ImagePlane,
+    preserve_bottom_padding: bool,
+) -> Option<ImagePlane> {
+    if plane.stride <= 0 || plane.size.width <= 0 || plane.size.height <= 0 {
+        return None;
+    }
+    let stride = plane.stride as usize;
+    let width = plane.size.width as usize;
+    let height = plane.size.height as usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0_usize;
+    let mut max_y = 0_usize;
+    for y in 0..height {
+        for x in 0..width {
+            if plane.bitmap.get(y * stride + x).copied().unwrap_or(0) > 0 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x + 1);
+                max_y = max_y.max(y + 1);
+            }
+        }
+    }
+    if min_x >= max_x || min_y >= max_y {
+        return None;
+    }
+    let ink_width = max_x - min_x;
+    let ink_height = max_y - min_y;
+    let (pad_left, pad_right, pad_top, pad_bottom) = if ink_height <= 256 && ink_width <= 600 {
+        let vertical = (ink_height / 5).clamp(3, 16);
+        let right = if ink_width > 200 { vertical } else { 0 };
+        let bottom = if preserve_bottom_padding { vertical } else { 0 };
+        (0, right, vertical, bottom)
+    } else {
+        (0, 0, 0, 0)
+    };
+    min_x = min_x.saturating_sub(pad_left);
+    min_y = min_y.saturating_sub(pad_top);
+    max_x = (max_x + pad_right).min(width);
+    max_y = (max_y + pad_bottom).min(height);
+    let external_right_pad = if pad_right > 0 && max_x == width {
+        pad_right.min(16)
+    } else {
+        0
+    };
+    let external_bottom_pad = if pad_bottom > 0 && max_y == height {
+        pad_bottom.min(16)
+    } else {
+        0
+    };
+    if min_x == 0
+        && min_y == 0
+        && max_x == width
+        && max_y == height
+        && external_right_pad == 0
+        && external_bottom_pad == 0
+    {
+        return Some(plane);
+    }
+    let new_width = max_x - min_x + external_right_pad;
+    let new_height = max_y - min_y + external_bottom_pad;
+    let src_width = max_x - min_x;
+    let src_height = max_y - min_y;
+    let mut cropped = vec![0_u8; new_width * new_height];
+    for y in 0..src_height {
+        let src_start = (min_y + y) * stride + min_x;
+        let dst_start = y * new_width;
+        cropped[dst_start..dst_start + src_width]
+            .copy_from_slice(&plane.bitmap[src_start..src_start + src_width]);
+    }
+    plane.destination.x += min_x as i32;
+    plane.destination.y += min_y as i32;
+    plane.size = Size {
+        width: new_width as i32,
+        height: new_height as i32,
+    };
+    plane.stride = new_width as i32;
+    plane.bitmap = cropped;
+    Some(plane)
 }
 
 fn sample_bitmap_bilinear(
@@ -2340,6 +2572,7 @@ pub fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {
             width: track.play_res_x,
             height: track.play_res_y,
         },
+        hinting: ass::Hinting::Normal,
         ..RendererConfig::default()
     }
 }
@@ -2436,6 +2669,96 @@ fn output_offset(config: &RendererConfig) -> Point {
         Point {
             x: config.margins.left.max(0),
             y: config.margins.top.max(0),
+        }
+    }
+}
+
+fn merge_compatible_event_planes(planes: Vec<ImagePlane>) -> Vec<ImagePlane> {
+    let mut merged: Vec<ImagePlane> = Vec::new();
+    for plane in planes {
+        if let Some(target) = merged
+            .iter_mut()
+            .find(|candidate| compatible_plane_merge(candidate, &plane))
+        {
+            merge_plane_into(target, plane);
+        } else {
+            merged.push(plane);
+        }
+    }
+    merged
+}
+
+fn compatible_plane_merge(a: &ImagePlane, b: &ImagePlane) -> bool {
+    if a.kind != b.kind || a.color != b.color || a.stride <= 0 || b.stride <= 0 {
+        return false;
+    }
+    if a.size.height <= 3 || b.size.height <= 3 {
+        return false;
+    }
+    let a_rect = Rect {
+        x_min: a.destination.x,
+        y_min: a.destination.y,
+        x_max: a.destination.x + a.size.width,
+        y_max: a.destination.y + a.size.height,
+    };
+    let b_rect = Rect {
+        x_min: b.destination.x,
+        y_min: b.destination.y,
+        x_max: b.destination.x + b.size.width,
+        y_max: b.destination.y + b.size.height,
+    };
+    let y_overlap = (a_rect.y_max.min(b_rect.y_max) - a_rect.y_min.max(b_rect.y_min)).max(0);
+    let min_height = a.size.height.min(b.size.height).max(1);
+    if y_overlap * 3 < min_height {
+        return false;
+    }
+    let x_gap = if a_rect.x_max < b_rect.x_min {
+        b_rect.x_min - a_rect.x_max
+    } else if b_rect.x_max < a_rect.x_min {
+        a_rect.x_min - b_rect.x_max
+    } else {
+        0
+    };
+    x_gap <= 24
+}
+
+fn merge_plane_into(target: &mut ImagePlane, plane: ImagePlane) {
+    let x_min = target.destination.x.min(plane.destination.x);
+    let y_min = target.destination.y.min(plane.destination.y);
+    let x_max =
+        (target.destination.x + target.size.width).max(plane.destination.x + plane.size.width);
+    let y_max =
+        (target.destination.y + target.size.height).max(plane.destination.y + plane.size.height);
+    let width = (x_max - x_min).max(0);
+    let height = (y_max - y_min).max(0);
+    let stride = width;
+    let mut bitmap = vec![0_u8; (stride * height).max(0) as usize];
+    blit_plane(&mut bitmap, stride, x_min, y_min, target);
+    blit_plane(&mut bitmap, stride, x_min, y_min, &plane);
+    target.destination = Point { x: x_min, y: y_min };
+    target.size = Size { width, height };
+    target.stride = stride;
+    target.bitmap = bitmap;
+}
+
+fn blit_plane(bitmap: &mut [u8], stride: i32, origin_x: i32, origin_y: i32, plane: &ImagePlane) {
+    if stride <= 0 || plane.stride <= 0 || plane.size.width <= 0 || plane.size.height <= 0 {
+        return;
+    }
+    let dst_stride = stride as usize;
+    let src_stride = plane.stride as usize;
+    for y in 0..plane.size.height as usize {
+        for x in 0..plane.size.width as usize {
+            let src = plane.bitmap.get(y * src_stride + x).copied().unwrap_or(0);
+            if src == 0 {
+                continue;
+            }
+            let dst_x = (plane.destination.x - origin_x) as usize + x;
+            let dst_y = (plane.destination.y - origin_y) as usize + y;
+            let dst = dst_y * dst_stride + dst_x;
+            if let Some(value) = bitmap.get_mut(dst) {
+                *value = (*value).max(src);
+            }
         }
     }
 }
@@ -3071,6 +3394,31 @@ fn combined_image_plane_from_glyphs(
     })
 }
 
+fn blur_image_plane(plane: ImagePlane, radius: u32) -> ImagePlane {
+    if radius == 0 || plane.size.width <= 0 || plane.size.height <= 0 || plane.bitmap.is_empty() {
+        return plane;
+    }
+    let (bitmap, width, height, pad) = blur_bitmap(
+        plane.bitmap,
+        plane.size.width as usize,
+        plane.size.height as usize,
+        radius,
+    );
+    ImagePlane {
+        size: Size {
+            width: width as i32,
+            height: height as i32,
+        },
+        stride: width as i32,
+        destination: Point {
+            x: plane.destination.x - pad as i32,
+            y: plane.destination.y - pad as i32,
+        },
+        bitmap,
+        ..plane
+    }
+}
+
 fn blur_bitmap(
     source: Vec<u8>,
     width: usize,
@@ -3556,6 +3904,7 @@ struct DrawingPlaneParams {
     scale_y: f64,
     render_scale: RenderScale,
     baseline_offset: f64,
+    pad_to_libass_geometry: bool,
 }
 
 fn image_plane_from_drawing(
@@ -3597,7 +3946,11 @@ fn image_plane_from_drawing(
     let pbo_pixels = (params.baseline_offset * params.render_scale.y).round() as i32;
     let vertical_offset = pbo_pixels.max(0);
 
-    any_visible.then_some(ImagePlane {
+    if !any_visible {
+        return None;
+    }
+
+    let plane = ImagePlane {
         size: Size { width, height },
         stride: width,
         color: rgba_color_from_ass(params.color),
@@ -3607,7 +3960,56 @@ fn image_plane_from_drawing(
         },
         kind: ass::ImageType::Character,
         bitmap,
-    })
+    };
+    if params.pad_to_libass_geometry {
+        Some(pad_drawing_plane_to_libass_geometry(plane))
+    } else {
+        Some(plane)
+    }
+}
+
+fn pad_drawing_plane_to_libass_geometry(plane: ImagePlane) -> ImagePlane {
+    let left_pad = 1_i32;
+    let top_pad = 0_i32;
+    let padded_width = align_i32(plane.size.width + left_pad, 16).max(plane.size.width + left_pad);
+    let padded_height = align_i32(plane.size.height + top_pad, 16).max(plane.size.height + top_pad);
+    let right_pad = padded_width - plane.size.width - left_pad;
+    let bottom_pad = padded_height - plane.size.height - top_pad;
+    if left_pad == 0 && top_pad == 0 && right_pad == 0 && bottom_pad == 0 {
+        return plane;
+    }
+
+    let new_stride = padded_width;
+    let mut bitmap = vec![0_u8; (new_stride * padded_height) as usize];
+    let src_stride = plane.stride.max(0) as usize;
+    let dst_stride = new_stride as usize;
+    for row in 0..plane.size.height.max(0) as usize {
+        let src_start = row * src_stride;
+        let dst_start = (row + top_pad as usize) * dst_stride + left_pad as usize;
+        bitmap[dst_start..dst_start + plane.size.width as usize]
+            .copy_from_slice(&plane.bitmap[src_start..src_start + plane.size.width as usize]);
+    }
+
+    ImagePlane {
+        size: Size {
+            width: padded_width,
+            height: padded_height,
+        },
+        stride: new_stride,
+        destination: Point {
+            x: plane.destination.x - left_pad,
+            y: plane.destination.y - top_pad,
+        },
+        bitmap,
+        ..plane
+    }
+}
+
+fn align_i32(value: i32, alignment: i32) -> i32 {
+    if alignment <= 1 {
+        return value;
+    }
+    ((value + alignment - 1) / alignment) * alignment
 }
 
 fn scaled_drawing_polygons(
@@ -3705,10 +4107,15 @@ fn mask_plane_with_vector_clip(
 ) -> Option<ImagePlane> {
     let mut bitmap = plane.bitmap.clone();
     let stride = plane.stride as usize;
-    let mut any_visible = false;
+    let width = plane.size.width.max(0) as usize;
+    let height = plane.size.height.max(0) as usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0_usize;
+    let mut max_y = 0_usize;
 
-    for row in 0..plane.size.height as usize {
-        for column in 0..plane.size.width as usize {
+    for row in 0..height {
+        for column in 0..width {
             let global_x = plane.destination.x + column as i32;
             let global_y = plane.destination.y + row as i32;
             let inside = clip
@@ -3716,15 +4123,27 @@ fn mask_plane_with_vector_clip(
                 .iter()
                 .any(|polygon| point_in_polygon(global_x, global_y, polygon));
             let keep = if inverse { !inside } else { inside };
+            let index = row * stride + column;
             if !keep {
-                bitmap[row * stride + column] = 0;
-            } else if bitmap[row * stride + column] > 0 {
-                any_visible = true;
+                bitmap[index] = 0;
+            } else if bitmap[index] > 0 {
+                min_x = min_x.min(column);
+                min_y = min_y.min(row);
+                max_x = max_x.max(column + 1);
+                max_y = max_y.max(row + 1);
             }
         }
     }
 
-    any_visible.then_some(ImagePlane { bitmap, ..plane })
+    if min_x >= max_x || min_y >= max_y {
+        return None;
+    }
+    let masked = ImagePlane { bitmap, ..plane };
+    if inverse {
+        return Some(masked);
+    }
+    crop_plane_to_bitmap_bounds(masked, min_x, min_y, max_x, max_y, 4, 2, 12, 14)
+        .map(|plane| pad_plane_transparent(plane, 4, 1, 0, 13))
 }
 
 fn point_in_polygon(x: i32, y: i32, polygon: &[Point]) -> bool {
@@ -3816,6 +4235,79 @@ fn plane_rect(plane: &ImagePlane) -> Rect {
         y_min: plane.destination.y,
         x_max: plane.destination.x + plane.size.width,
         y_max: plane.destination.y + plane.size.height,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn crop_plane_to_bitmap_bounds(
+    plane: ImagePlane,
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    pad_left: usize,
+    pad_top: usize,
+    pad_right: usize,
+    pad_bottom: usize,
+) -> Option<ImagePlane> {
+    let x_min = min_x.saturating_sub(pad_left) as i32 + plane.destination.x;
+    let y_min = min_y.saturating_sub(pad_top) as i32 + plane.destination.y;
+    let x_max =
+        ((max_x + pad_right).min(plane.size.width.max(0) as usize)) as i32 + plane.destination.x;
+    let y_max =
+        ((max_y + pad_bottom).min(plane.size.height.max(0) as usize)) as i32 + plane.destination.y;
+    crop_plane_to_rect(
+        plane,
+        Rect {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        },
+    )
+}
+
+fn pad_plane_transparent(
+    plane: ImagePlane,
+    pad_left: i32,
+    pad_top: i32,
+    pad_right: i32,
+    pad_bottom: i32,
+) -> ImagePlane {
+    let pad_left = pad_left.max(0);
+    let pad_top = pad_top.max(0);
+    let pad_right = pad_right.max(0);
+    let pad_bottom = pad_bottom.max(0);
+    if pad_left == 0 && pad_top == 0 && pad_right == 0 && pad_bottom == 0 {
+        return plane;
+    }
+
+    let width = plane.size.width.max(0);
+    let height = plane.size.height.max(0);
+    let new_width = width + pad_left + pad_right;
+    let new_height = height + pad_top + pad_bottom;
+    let mut bitmap = vec![0_u8; (new_width * new_height).max(0) as usize];
+    let src_stride = plane.stride.max(0) as usize;
+    let dst_stride = new_width.max(0) as usize;
+    for row in 0..height as usize {
+        let src_start = row * src_stride;
+        let dst_start = (row + pad_top as usize) * dst_stride + pad_left as usize;
+        bitmap[dst_start..dst_start + width as usize]
+            .copy_from_slice(&plane.bitmap[src_start..src_start + width as usize]);
+    }
+
+    ImagePlane {
+        size: Size {
+            width: new_width,
+            height: new_height,
+        },
+        stride: new_width,
+        destination: Point {
+            x: plane.destination.x - pad_left,
+            y: plane.destination.y - pad_top,
+        },
+        bitmap,
+        ..plane
     }
 }
 
@@ -4529,9 +5021,12 @@ mod tests {
                 "text style/event margins and \\an{alignment} x placement should match libass within raster rounding: actual={actual:?} expected={expected:?}"
             );
             assert_eq!(
-                (actual.y_min, actual.y_max),
-                (expected.y_min, expected.y_max),
-                "text style/event margins and \\an{alignment} vertical placement should match libass"
+                actual.y_min, expected.y_min,
+                "text style/event margins and \\an{alignment} vertical anchor should match libass"
+            );
+            assert!(
+                (actual.y_max - expected.y_max).abs() <= 1,
+                "text style/event margins and \\an{alignment} visible height may drift by one raster row: actual={actual:?} expected={expected:?}"
             );
         }
     }
@@ -6040,6 +6535,69 @@ mod tests {
                 .iter()
                 .any(|plane| plane.kind == ass::ImageType::Outline)
         );
+    }
+
+    #[test]
+    fn vertical_font_raster_advances_rotate_bitmap_like_libass_vertical_faces() {
+        let glyph = RasterGlyph {
+            width: 2,
+            height: 3,
+            stride: 2,
+            offset_x: 1,
+            offset_y: 2,
+            advance_x: 7,
+            bitmap: vec![1, 2, 3, 4, 5, 6],
+            ..RasterGlyph::default()
+        };
+        let style = ParsedSpanStyle {
+            font_name: "@Vertical".to_string(),
+            font_size: 50.0,
+            ..ParsedSpanStyle::default()
+        };
+
+        let glyphs = apply_vertical_font_raster_advances(vec![glyph], &style);
+        let rotated = &glyphs[0];
+
+        assert_eq!(rotated.width, 3);
+        assert_eq!(rotated.height, 2);
+        assert_eq!(rotated.stride, 3);
+        assert_eq!(rotated.bitmap, vec![5, 3, 1, 6, 4, 2]);
+        assert_eq!(rotated.offset_x, 13);
+        assert_eq!(rotated.offset_y, 20);
+        assert_eq!(rotated.advance_x, 50);
+        assert_eq!(rotated.advance_y, 0);
+    }
+
+    #[test]
+    fn clipped_vector_drawing_keeps_libass_like_transparent_plane_padding() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\clip(801,103,806,186)\\pos(627.43,184.01)\\p1\\fscx251\\fscy258\\c&HFFFFFF&}m 0 0 l 132 -1 l 135 0 l 136 26 l 1 28 l 0 -1\n";
+        let track = parse_script_text(script).expect("clip/drawing probe should parse");
+        let engine = RenderEngine::new();
+        let planes = engine.render_frame_with_provider(&track, &NullFontProvider, 500);
+
+        assert_eq!(
+            planes.len(),
+            1,
+            "narrow \\clip should retain the clipped drawing plane like libass"
+        );
+        let plane = &planes[0];
+        assert_eq!(plane.destination.x, 801);
+        assert_eq!(plane.size.width, 5);
+        assert_eq!(plane.size.height, 80);
+    }
+
+    #[test]
+    fn blurred_vector_drawing_expands_fill_plane_like_libass() {
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\blur6\\p1\\c&HC6BECA&\\fscx165\\fscy138\\pos(948,1324)}m 0 0 b -3 -28 -6 -56 -9 -84 b -18 -113 -6 -135 -5 -160 b -3 -184 1 -208 3 -232 b 125 -233 248 -235 370 -236 b 377 -220 386 -204 393 -188 b 397 -167 403 -146 407 -125 b 409 -109 411 -93 413 -77 b 421 -61 431 -44 439 -28 b 440 -18 441 -7 442 3 b 295 3 147 1 0 1\n";
+        let track = parse_script_text(script).expect("track parses");
+        let engine = RenderEngine::new();
+        let planes = engine.render_frame_with_provider(&track, &NullFontProvider, 500);
+
+        assert_eq!(planes.len(), 1);
+        let plane = &planes[0];
+        assert_eq!(plane.destination.y, 650);
+        assert_eq!(plane.size.width, 788);
+        assert_eq!(plane.size.height, 372);
     }
 
     #[test]

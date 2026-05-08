@@ -838,7 +838,7 @@ impl Default for ASS_Renderer {
             pixel_aspect: 0.0,
             shaping: ass::ShapingLevel::Complex as c_int,
             font_scale: 1.0,
-            hinting: ass::Hinting::None as c_int,
+            hinting: ass::Hinting::Normal as c_int,
             line_spacing: 0.0,
             line_position: 0.0,
             default_font: None,
