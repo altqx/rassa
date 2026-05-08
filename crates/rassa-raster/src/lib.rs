@@ -275,6 +275,34 @@ fn rasterize_freetype_glyphs(
     glyphs: &[GlyphInfo],
     options: RasterOptions,
 ) -> RassaResult<Vec<RasterGlyph>> {
+    let cache_keys = glyphs
+        .iter()
+        .map(|glyph| GlyphCacheKey {
+            family: font.family.clone(),
+            style: font.style.clone(),
+            synthetic_bold: font.synthetic_bold,
+            synthetic_italic: font.synthetic_italic,
+            face_index: font.face_index,
+            glyph_id: glyph.glyph_id,
+            size_26_6: options.size_26_6,
+            hinting: options.hinting,
+        })
+        .collect::<Vec<_>>();
+    let mut cached_glyphs = {
+        let cache = glyph_cache().lock().expect("glyph cache mutex poisoned");
+        cache_keys
+            .iter()
+            .map(|key| cache.get(key).cloned())
+            .collect::<Vec<_>>()
+    };
+    if cached_glyphs.iter().all(Option::is_some) {
+        return Ok(glyphs
+            .iter()
+            .zip(cached_glyphs)
+            .map(|(glyph, cached)| glyph_from_cache(glyph, cached.expect("checked all cache hits")))
+            .collect());
+    }
+
     let font_path = font
         .path
         .as_ref()
@@ -295,31 +323,10 @@ fn rasterize_freetype_glyphs(
     let mut rasterized = Vec::with_capacity(glyphs.len());
     let mut load_flags = load_flags_for_hinting(options.hinting);
     load_flags.remove(LoadFlag::RENDER);
-    for glyph in glyphs {
-        let cache_key = GlyphCacheKey {
-            family: font.family.clone(),
-            style: font.style.clone(),
-            synthetic_bold: font.synthetic_bold,
-            synthetic_italic: font.synthetic_italic,
-            face_index: font.face_index,
-            glyph_id: glyph.glyph_id,
-            size_26_6: options.size_26_6,
-            hinting: options.hinting,
-        };
-        if let Some(cached) = glyph_cache()
-            .lock()
-            .expect("glyph cache mutex poisoned")
-            .get(&cache_key)
-            .cloned()
-        {
-            rasterized.push(RasterGlyph {
-                cluster: glyph.cluster,
-                offset_x: glyph.x_offset.round() as i32,
-                offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
-                advance_x: cached.advance_x,
-                advance_y: cached.advance_y,
-                ..cached
-            });
+    for ((glyph, cache_key), cached) in glyphs.iter().zip(cache_keys).zip(cached_glyphs.iter_mut())
+    {
+        if let Some(cached) = cached.take() {
+            rasterized.push(glyph_from_cache(glyph, cached));
             continue;
         }
 
@@ -363,6 +370,17 @@ fn rasterize_freetype_glyphs(
     }
 
     Ok(rasterized)
+}
+
+fn glyph_from_cache(glyph: &GlyphInfo, cached: RasterGlyph) -> RasterGlyph {
+    RasterGlyph {
+        cluster: glyph.cluster,
+        offset_x: glyph.x_offset.round() as i32,
+        offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
+        advance_x: cached.advance_x,
+        advance_y: cached.advance_y,
+        ..cached
+    }
 }
 
 fn rasterize_system_glyphs(

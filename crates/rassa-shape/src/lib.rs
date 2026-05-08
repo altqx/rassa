@@ -161,25 +161,36 @@ impl Shaper for SimpleShaper {
         _font: &FontMatch,
         direction: BidiDirection,
     ) -> Vec<GlyphInfo> {
-        let characters = segment.text.chars().collect::<Vec<_>>();
-        let indices: Vec<usize> = match direction {
+        let char_count = segment.text.chars().count();
+        let mut glyphs = Vec::with_capacity(char_count);
+        match direction {
             BidiDirection::RightToLeft | BidiDirection::WeakRightToLeft => {
-                (0..characters.len()).rev().collect()
+                let characters = segment.text.chars().collect::<Vec<_>>();
+                for (cluster, character) in characters.into_iter().enumerate().rev() {
+                    glyphs.push(GlyphInfo {
+                        glyph_id: character as u32,
+                        cluster,
+                        x_advance: 1.0,
+                        y_advance: 0.0,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                    });
+                }
             }
-            _ => (0..characters.len()).collect(),
-        };
-
-        indices
-            .into_iter()
-            .map(|cluster| GlyphInfo {
-                glyph_id: characters[cluster] as u32,
-                cluster,
-                x_advance: 1.0,
-                y_advance: 0.0,
-                x_offset: 0.0,
-                y_offset: 0.0,
-            })
-            .collect()
+            _ => {
+                for (cluster, character) in segment.text.chars().enumerate() {
+                    glyphs.push(GlyphInfo {
+                        glyph_id: character as u32,
+                        cluster,
+                        x_advance: 1.0,
+                        y_advance: 0.0,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                    });
+                }
+            }
+        }
+        glyphs
     }
 }
 

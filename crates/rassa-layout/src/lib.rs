@@ -363,7 +363,12 @@ fn balanced_two_line_wrap(
     breaks: &[LineBreakOpportunity],
     max_width: f32,
 ) -> Option<Vec<LayoutLine>> {
-    let total = pieces_width(pieces);
+    let mut prefix_widths = Vec::with_capacity(pieces.len() + 1);
+    prefix_widths.push(0.0_f32);
+    for piece in pieces {
+        prefix_widths.push(prefix_widths.last().copied().unwrap_or(0.0) + piece.width);
+    }
+    let total = prefix_widths.last().copied().unwrap_or(0.0);
     let mut best: Option<(usize, f32)> = None;
     for index in 1..pieces.len() {
         let previous = &pieces[index - 1];
@@ -373,7 +378,7 @@ fn balanced_two_line_wrap(
         ) {
             continue;
         }
-        let left_width = pieces_width(&pieces[..index]);
+        let left_width = prefix_widths[index];
         let right_width = total - left_width;
         if left_width <= 0.0
             || right_width <= 0.0

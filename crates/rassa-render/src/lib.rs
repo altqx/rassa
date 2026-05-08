@@ -3471,7 +3471,11 @@ fn plane_to_raster_glyph(plane: &ImagePlane) -> RasterGlyph {
 }
 
 fn apply_event_clip(planes: Vec<ImagePlane>, clip_rect: Rect, inverse: bool) -> Vec<ImagePlane> {
-    let mut clipped = Vec::new();
+    let mut clipped = Vec::with_capacity(if inverse {
+        planes.len().saturating_mul(2)
+    } else {
+        planes.len()
+    });
     for plane in planes {
         if inverse {
             clipped.extend(inverse_clip_plane(plane, clip_rect));
@@ -3555,6 +3559,9 @@ fn point_in_polygon(x: i32, y: i32, polygon: &[Point]) -> bool {
 fn clip_plane(plane: ImagePlane, clip_rect: Rect) -> Option<ImagePlane> {
     let plane_rect = plane_rect(&plane);
     let intersection = plane_rect.intersect(clip_rect)?;
+    if intersection == plane_rect {
+        return Some(plane);
+    }
     crop_plane_to_rect(plane, intersection)
 }
 
@@ -3614,6 +3621,9 @@ fn plane_rect(plane: &ImagePlane) -> Rect {
 fn crop_plane_to_rect(plane: ImagePlane, rect: Rect) -> Option<ImagePlane> {
     let plane_rect = plane_rect(&plane);
     let rect = plane_rect.intersect(rect)?;
+    if rect == plane_rect {
+        return Some(plane);
+    }
     let offset_x = (rect.x_min - plane_rect.x_min) as usize;
     let offset_y = (rect.y_min - plane_rect.y_min) as usize;
     let width = rect.width() as usize;

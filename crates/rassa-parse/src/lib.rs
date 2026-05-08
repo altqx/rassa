@@ -1006,15 +1006,25 @@ fn parse_timestamp(value: &str) -> Option<i64> {
     let minutes = parts.next()?.trim().parse::<i64>().ok()?;
     let seconds = parts.next()?.trim();
     let (seconds, centiseconds) = if let Some((seconds, fraction)) = seconds.split_once('.') {
-        let fraction = format!("{fraction:0<2}");
         (
             seconds.trim().parse::<i64>().ok()?,
-            fraction[..2].parse::<i64>().ok()?,
+            parse_centiseconds(fraction)?,
         )
     } else {
         (seconds.parse::<i64>().ok()?, 0)
     };
     Some((((hours * 60 + minutes) * 60) + seconds) * 1000 + centiseconds * 10)
+}
+
+fn parse_centiseconds(fraction: &str) -> Option<i64> {
+    let trimmed = fraction.trim();
+    let mut bytes = trimmed.bytes();
+    let first = bytes.next().unwrap_or(b'0');
+    let second = bytes.next().unwrap_or(b'0');
+    if !first.is_ascii_digit() || !second.is_ascii_digit() {
+        return None;
+    }
+    Some(((first - b'0') as i64) * 10 + (second - b'0') as i64)
 }
 
 fn parse_style_reference(value: &str, styles: &[ParsedStyle]) -> i32 {
