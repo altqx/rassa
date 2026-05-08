@@ -2015,11 +2015,9 @@ impl ProjectiveMatrix {
         let z4_dy = x2_dy * sy + z3_dy * cy;
         let z4_c = x2_c * sy + z3_c * cy;
 
-        // libass uses camera distance 20000 in the active render coordinate space.
-        // Our planes are already scaled to the configured output resolution, so
-        // divide by output scale (not by FreeType's 26.6 factor) to keep frx/fry
-        // perspective stable in compare's 8x supersampled oracle runs.
-        let dist = 20000.0 / render_scale_y.max(f64::EPSILON);
+        // libass applies 3D perspective in its 26.6-ish outline coordinate space;
+        // convert the camera distance back to output pixels before warping planes.
+        let dist = 22_400.0 / 64.0 / render_scale_y.max(f64::EPSILON);
 
         let x_num_dx = dist * x4_dx + origin_x * z4_dx;
         let x_num_dy = dist * x4_dy + origin_x * z4_dy;
@@ -4030,6 +4028,40 @@ mod tests {
         assert!(
             (actual.height() - 158).abs() <= 8,
             "multiline positioned text should keep libass-like line gap: bounds={actual:?}"
+        );
+    }
+
+    #[test]
+    fn positioned_drawing_fry_uses_libass_like_projective_camera() {
+        let script = |override_tags: &str| {
+            format!(
+                "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{{{override_tags}\\p1}}m 0 0 l 710 0 710 18 0 18\n"
+            )
+        };
+        let plain = parse_script_text(&script("\\an2\\pos(953,563)"))
+            .expect("plain positioned drawing should parse");
+        let projected = parse_script_text(&script("\\an2\\pos(953,563)\\frx14\\fry4"))
+            .expect("projected positioned drawing should parse");
+        let engine = RenderEngine::new();
+        let provider = NullFontProvider;
+        let plain_bounds =
+            character_bounds(&engine.render_frame_with_provider(&plain, &provider, 500))
+                .expect("plain drawing should render");
+        let projected_bounds =
+            character_bounds(&engine.render_frame_with_provider(&projected, &provider, 500))
+                .expect("projected drawing should render");
+
+        assert!(
+            projected_bounds.x_min <= plain_bounds.x_min - 24,
+            "libass \\fry perspective shifts bottom-centered drawings left: plain={plain_bounds:?} projected={projected_bounds:?}"
+        );
+        assert!(
+            (projected_bounds.x_min - 568).abs() <= 4,
+            "projective camera should match libass-probed left edge for this fixture: projected={projected_bounds:?}"
+        );
+        assert!(
+            (projected_bounds.y_min - 544).abs() <= 2,
+            "projective transform should preserve libass-probed vertical placement: projected={projected_bounds:?}"
         );
     }
 
