@@ -281,7 +281,13 @@ struct RenderedFrameCacheSignature {
     selective_override_bits: c_int,
     selective_override_style: Option<OwnedStyleOverride>,
     active_event_indices: Vec<usize>,
+    approximate_animation_bucket: i64,
 }
+
+// Approximate animated ASS tags by reusing the previous rendered image within a
+// small time bucket. This intentionally trades sub-frame pixel accuracy for much
+// higher FPS on transform/karaoke/clip-heavy scripts.
+const APPROXIMATE_ANIMATION_FRAME_BUCKET_MS: i64 = 250;
 
 #[derive(Default)]
 struct OwnedImageList {
@@ -778,19 +784,20 @@ pub unsafe extern "C" fn ass_render_frame(
     let track_generation = track_state_ref(track)
         .map(|state| state.cache_generation)
         .unwrap_or_default();
-    let frame_cache_signature =
-        active_events_are_static(parsed, &active_event_indices).then(|| {
-            RenderedFrameCacheSignature {
-                track: track as usize,
-                track_generation,
-                parsed_track: parsed_track_cache_signature(track_ref),
-                renderer_config: renderer_config.clone(),
-                font_provider: font_provider_signature,
-                selective_override_bits: renderer.selective_override_bits,
-                selective_override_style: renderer.selective_override_style.clone(),
-                active_event_indices: active_event_indices.clone(),
-            }
-        });
+    let approximate_animation_bucket = frame_cache_time_bucket(parsed, &active_event_indices, now);
+    let frame_cache_signature = approximate_animation_bucket.map(|approximate_animation_bucket| {
+        RenderedFrameCacheSignature {
+            track: track as usize,
+            track_generation,
+            parsed_track: parsed_track_cache_signature(track_ref),
+            renderer_config: renderer_config.clone(),
+            font_provider: font_provider_signature,
+            selective_override_bits: renderer.selective_override_bits,
+            selective_override_style: renderer.selective_override_style.clone(),
+            active_event_indices: active_event_indices.clone(),
+            approximate_animation_bucket,
+        }
+    });
     if frame_cache_signature.is_some()
         && renderer.frame_cache_signature == frame_cache_signature
         && renderer.rendered_images.is_some()
@@ -1900,6 +1907,25 @@ unsafe fn active_event_indices(track: *mut ASS_Track, now: i64) -> Vec<usize> {
             (now >= event.Start && now < event.Start + event.Duration).then_some(index)
         })
         .collect()
+}
+
+fn frame_cache_time_bucket(
+    track: &ParsedTrack,
+    active_event_indices: &[usize],
+    now: i64,
+) -> Option<i64> {
+    if active_event_indices
+        .iter()
+        .any(|index| track.events.get(*index).is_none())
+    {
+        return None;
+    }
+
+    if active_events_are_static(track, active_event_indices) {
+        Some(0)
+    } else {
+        Some(now.div_euclid(APPROXIMATE_ANIMATION_FRAME_BUCKET_MS))
+    }
 }
 
 fn active_events_are_static(track: &ParsedTrack, active_event_indices: &[usize]) -> bool {
