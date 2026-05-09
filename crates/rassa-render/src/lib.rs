@@ -1918,6 +1918,8 @@ fn align_positioned_text_line_bottom(
         .fold(0.0_f64, f64::max);
     let descender_gap = if max_blur >= 4.0 {
         (max_font_size * 0.13).round() as i32
+    } else if line_contains_deep_thai_glyphs(context.line) {
+        (max_font_size * 0.11).round() as i32
     } else {
         (max_font_size * 0.24).round() as i32
     };
@@ -1929,6 +1931,23 @@ fn align_positioned_text_line_bottom(
     translate_planes_y(&mut shadow_planes[starts.shadow..], delta_y);
     translate_planes_y(&mut outline_planes[starts.outline..], delta_y);
     translate_planes_y(&mut character_planes[starts.character..], delta_y);
+}
+
+fn line_contains_deep_thai_glyphs(line: &rassa_layout::LayoutLine) -> bool {
+    line.runs.iter().any(|run| {
+        run.drawing.is_none()
+            && run.text.chars().any(|character| {
+                matches!(
+                    character,
+                    '\u{0E0D}' // ญ
+                        | '\u{0E10}' // ฐ
+                        | '\u{0E0F}' // ฏ
+                        | '\u{0E0E}' // ฎ
+                        | '\u{0E38}' // ุ
+                        | '\u{0E39}' // ู
+                )
+            })
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4891,6 +4910,29 @@ mod tests {
         assert!(
             (actual.height() - 160).abs() <= 6,
             "deep-glyph multiline block should keep libass-like visible-bottom line spacing: bounds={actual:?}"
+        );
+    }
+
+    #[test]
+    fn positioned_thai_deep_glyphs_keep_libass_like_bottom_anchor() {
+        let provider = FontconfigProvider::new();
+        if provider
+            .resolve(&FontQuery::new("K2D ExtraBold"))
+            .path
+            .is_none()
+        {
+            return;
+        }
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 400\nPlayResY: 240\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED TH2,K2D ExtraBold,75,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0,0,2,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,ED TH2,,0,0,0,,{\\an2\\pos(200,180)\\bord0\\shad0\\blur0}อุ อู ญ ฐ ฏ ฎ\n";
+        let actual = render_text_bounds(script).expect("Thai positioned text should render");
+
+        assert!(
+            (actual.y_min - 132).abs() <= 4,
+            "Thai lower vowels and descender glyphs should not be raised above libass-like bottom anchor: bounds={actual:?}"
+        );
+        assert!(
+            (actual.y_max - 173).abs() <= 4,
+            "Thai deep glyph bottom should stay near libass-like descender plane: bounds={actual:?}"
         );
     }
 

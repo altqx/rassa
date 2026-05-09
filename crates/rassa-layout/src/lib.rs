@@ -451,17 +451,35 @@ fn line_to_pieces(line: &LayoutLine) -> Vec<LayoutPiece> {
         } else {
             0.0
         };
-        for (offset, (character, glyph)) in chars.into_iter().zip(run.glyphs.iter()).enumerate() {
+        let mut offset = 0_usize;
+        while offset < chars.len() {
+            let mut end = offset + 1;
+            while end < chars.len() && is_nonspacing_mark(chars[end]) {
+                end += 1;
+            }
+            let cluster_text = chars[offset..end].iter().collect::<String>();
+            let glyph_start = offset.min(run.glyphs.len());
+            let glyph_end = end.min(run.glyphs.len());
+            let cluster_glyphs = if glyph_start < glyph_end {
+                run.glyphs[glyph_start..glyph_end].to_vec()
+            } else {
+                Vec::new()
+            };
+            let cluster_advance = cluster_glyphs
+                .iter()
+                .map(|glyph| glyph.x_advance)
+                .sum::<f32>();
             let mut piece_run = run.clone();
-            piece_run.text = character.to_string();
-            piece_run.glyphs = vec![glyph.clone()];
-            piece_run.width = glyph.x_advance * scale_x + spacing;
+            piece_run.text = cluster_text.clone();
+            piece_run.glyphs = cluster_glyphs;
+            piece_run.width = cluster_advance * scale_x + spacing;
             pieces.push(LayoutPiece {
-                text: character.to_string(),
+                text: cluster_text,
                 width: piece_run.width,
                 run: piece_run,
-                char_index: char_index + offset,
+                char_index: char_index + end - 1,
             });
+            offset = end;
         }
         char_index += run.text.chars().count();
     }
@@ -573,27 +591,20 @@ fn split_text_by_font<P: FontProvider>(
     let mut chunks: Vec<(String, FontMatch)> = Vec::new();
 
     for character in text.chars() {
-        let font = if base_font.path.is_none()
-            || character.is_whitespace()
-            || character.is_control()
-            || base_font
-                .path
-                .as_ref()
-                .is_some_and(|_| font_match_supports_text(&base_font, &character.to_string()))
-        {
-            base_font.clone()
-        } else {
-            resolve_system_font_for_char(family, style.as_deref(), character)
-                .map(|(resolved_family, resolved_path, face_index)| FontMatch {
-                    family: resolved_family,
-                    path: resolved_path,
-                    face_index,
-                    style: style.clone(),
-                    synthetic_bold: base_font.synthetic_bold,
-                    synthetic_italic: base_font.synthetic_italic,
-                    provider: base_font.provider,
+        let font = if is_nonspacing_mark(character) {
+            // libass/Harfbuzz shape combining marks together with their base glyph.
+            // Splitting fallback runs per scalar breaks Thai lower vowels (อุ/อู)
+            // and tone/above marks because the shaper no longer sees the base+mark
+            // cluster. Prefer the previous run's font for marks so the whole
+            // grapheme cluster remains one shaped run.
+            chunks
+                .last()
+                .map(|(_, font)| font.clone())
+                .unwrap_or_else(|| {
+                    resolve_font_for_character(&base_font, family, style.as_deref(), character)
                 })
-                .unwrap_or_else(|| base_font.clone())
+        } else {
+            resolve_font_for_character(&base_font, family, style.as_deref(), character)
         };
 
         if let Some((chunk, chunk_font)) = chunks.last_mut() {
@@ -606,6 +617,43 @@ fn split_text_by_font<P: FontProvider>(
     }
 
     chunks
+}
+
+fn resolve_font_for_character(
+    base_font: &FontMatch,
+    family: &str,
+    style: Option<&str>,
+    character: char,
+) -> FontMatch {
+    if base_font.path.is_none()
+        || character.is_whitespace()
+        || character.is_control()
+        || base_font
+            .path
+            .as_ref()
+            .is_some_and(|_| font_match_supports_text(base_font, &character.to_string()))
+    {
+        base_font.clone()
+    } else {
+        resolve_system_font_for_char(family, style, character)
+            .map(|(resolved_family, resolved_path, face_index)| FontMatch {
+                family: resolved_family,
+                path: resolved_path,
+                face_index,
+                style: style.map(str::to_string),
+                synthetic_bold: base_font.synthetic_bold,
+                synthetic_italic: base_font.synthetic_italic,
+                provider: base_font.provider,
+            })
+            .unwrap_or_else(|| base_font.clone())
+    }
+}
+
+fn is_nonspacing_mark(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}'
+    )
 }
 
 fn same_font_match(left: &FontMatch, right: &FontMatch) -> bool {
@@ -951,6 +999,39 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
         );
         assert!(layout.vector_clip.is_none());
         assert!(layout.inverse_clip);
+    }
+
+    #[test]
+    fn layout_wrap_keeps_thai_lower_vowel_with_base_glyph() {
+        if resolve_system_font_for_char("K2D ExtraBold", Some("Bold"), 'อ').is_none() {
+            eprintln!("skipping: system fontconfig has no Thai-capable fallback font");
+            return;
+        }
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 400\nPlayResY: 240\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED TH2,K2D ExtraBold,75,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0,0,2,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,ED TH2,,0,0,0,,อุ อู ญ ฐ ฏ ฎ",
+        );
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Complex)
+            .expect("Thai fallback layout should succeed");
+
+        assert!(
+            layout
+                .lines
+                .iter()
+                .flat_map(|line| line.runs.iter())
+                .any(|run| run.text == "อุ"),
+            "auto-wrap must not split Thai lower vowel marks away from their base glyph"
+        );
+        assert!(
+            layout
+                .lines
+                .iter()
+                .flat_map(|line| line.runs.iter())
+                .any(|run| run.text == "อู"),
+            "auto-wrap must keep Thai U+0E39 with its base glyph"
+        );
     }
 
     #[test]
