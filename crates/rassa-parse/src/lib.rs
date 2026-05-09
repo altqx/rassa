@@ -1407,6 +1407,17 @@ fn parse_transforms(value: &str, current_style: &ParsedSpanStyle) -> Vec<ParsedS
     transforms
 }
 
+fn parse_transform_ms(value: &str, fallback: i32) -> i32 {
+    let Some(parsed) = parse_drawing_number(value.trim()) else {
+        return fallback;
+    };
+    if parsed.is_finite() {
+        parsed as i32
+    } else {
+        fallback
+    }
+}
+
 fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<ParsedSpanTransform> {
     let inside = value.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
     let tag_start = inside.find('\\')?;
@@ -1420,16 +1431,16 @@ fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<Parse
     let (start_ms, end_ms, accel) = match params.as_slice() {
         [] => (0, None, 1.0),
         [accel] => (0, None, parse_f64(accel, 1.0)),
-        [start, end] => (
-            parse_i32(start, 0).max(0),
-            Some(parse_i32(end, 0).max(parse_i32(start, 0))),
-            1.0,
-        ),
-        [start, end, accel, ..] => (
-            parse_i32(start, 0).max(0),
-            Some(parse_i32(end, 0).max(parse_i32(start, 0))),
-            parse_f64(accel, 1.0),
-        ),
+        [start, end] => {
+            let start = parse_transform_ms(start, 0).max(0);
+            let end = parse_transform_ms(end, 0).max(start);
+            (start, Some(end), 1.0)
+        }
+        [start, end, accel, ..] => {
+            let start = parse_transform_ms(start, 0).max(0);
+            let end = parse_transform_ms(end, 0).max(start);
+            (start, Some(end), parse_f64(accel, 1.0))
+        }
     };
 
     let mut target_style = current_style.clone();
@@ -1908,8 +1919,8 @@ struct SplineState {
 }
 
 fn parse_drawing_point(tokens: &[&str], index: usize, scale: i32) -> Option<(Point, usize)> {
-    let x = tokens.get(index)?.parse::<f64>().ok()?;
-    let y = tokens.get(index + 1)?.parse::<f64>().ok()?;
+    let x = parse_drawing_number(tokens.get(index)?)?;
+    let y = parse_drawing_number(tokens.get(index + 1)?)?;
     Some((
         scale_drawing_point(x.round() as i32, y.round() as i32, scale),
         index + 2,
@@ -1921,14 +1932,45 @@ fn parse_drawing_point_optional(
     index: usize,
     scale: i32,
 ) -> Option<(Point, usize)> {
-    let x = tokens.get(index)?;
-    let y = tokens.get(index + 1)?;
-    if x.chars().any(|character| character.is_ascii_alphabetic())
-        || y.chars().any(|character| character.is_ascii_alphabetic())
-    {
+    parse_drawing_point(tokens, index, scale)
+}
+
+fn parse_drawing_number(token: &str) -> Option<f64> {
+    if token.parse::<f64>().is_ok() {
+        return token.parse().ok();
+    }
+
+    let mut end = 0;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut previous_was_exponent = false;
+    for (index, character) in token.char_indices() {
+        let allowed = if character.is_ascii_digit() {
+            seen_digit = true;
+            previous_was_exponent = false;
+            true
+        } else if (character == '+' || character == '-') && (index == 0 || previous_was_exponent) {
+            previous_was_exponent = false;
+            true
+        } else if character == '.' && !seen_dot && !previous_was_exponent {
+            seen_dot = true;
+            true
+        } else if (character == 'e' || character == 'E') && seen_digit && !previous_was_exponent {
+            previous_was_exponent = true;
+            true
+        } else {
+            false
+        };
+        if !allowed {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+
+    if !seen_digit || end == 0 || previous_was_exponent {
         return None;
     }
-    parse_drawing_point(tokens, index, scale)
+    token[..end].parse().ok()
 }
 
 fn parse_bezier_segment(
@@ -2225,6 +2267,23 @@ fn parse_matrix(value: &str) -> YCbCrMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_p_drawing_with_numeric_token_followed_by_plain_text_suffix() {
+        let input = "[Script Info]\nPlayResX: 1280\nPlayResY: 720\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,42,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.50,Default,,0000,0000,0000,,{\\p1}m 0 0 l 10 0 10 10 0 10I'm";
+        let track = parse_script_text(input).expect("script should parse");
+        let parsed = parse_dialogue_text_with_wrap_style(
+            &track.events[0].text,
+            &track.styles[0],
+            &track.styles,
+            track.wrap_style,
+        );
+
+        assert!(
+            parsed.lines[0].spans[0].drawing.is_some(),
+            "libass accepts the numeric prefix of a drawing coordinate even when generator text is appended to the same token"
+        );
+    }
 
     #[test]
     fn parses_basic_ass_script() {
@@ -2770,6 +2829,22 @@ mod tests {
         assert_eq!(transforms[0].style.primary_colour, Some(0x0011_2233));
         assert_eq!(transforms[0].style.border, Some(6.0));
         assert_eq!(transforms[0].style.blur, Some(2.0));
+    }
+
+    #[test]
+    fn parses_decimal_transform_timings_like_libass() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\t(53.571428571429,107.14285714286,\\frz4)}Text",
+            &base_style,
+            &[],
+        );
+
+        let transforms = &parsed.lines[0].spans[0].transforms;
+        assert_eq!(transforms.len(), 1);
+        assert_eq!(transforms[0].start_ms, 53);
+        assert_eq!(transforms[0].end_ms, Some(107));
+        assert_eq!(transforms[0].style.rotation_z, Some(4.0));
     }
 
     #[test]

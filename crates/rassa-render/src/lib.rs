@@ -4027,10 +4027,7 @@ fn image_plane_from_drawing(
         for column in 0..width as usize {
             let x = bounds.x_min + column as i32;
             let y = bounds.y_min + row as i32;
-            if polygons
-                .iter()
-                .any(|polygon| point_in_polygon(x, y, polygon))
-            {
+            if point_in_drawing_polygons(x, y, &polygons) {
                 bitmap[row * stride + column] = 255;
                 any_visible = true;
             }
@@ -4277,6 +4274,15 @@ fn mask_plane_with_vector_clip(
     }
     crop_plane_to_bitmap_bounds(masked, min_x, min_y, max_x, max_y, 4, 2, 12, 14)
         .map(|plane| pad_plane_transparent(plane, 4, 1, 0, 13))
+}
+
+fn point_in_drawing_polygons(x: i32, y: i32, polygons: &[Vec<Point>]) -> bool {
+    polygons
+        .iter()
+        .filter(|polygon| point_in_polygon(x, y, polygon))
+        .count()
+        % 2
+        == 1
 }
 
 fn point_in_polygon(x: i32, y: i32, polygon: &[Point]) -> bool {
@@ -6882,6 +6888,26 @@ Dialogue: 7,0:00:00.00,0:00:01.00,ED2,,0,0,0,fx,{\move(808.8,73,808.8,65)\org(71
             .expect("drawing plane");
         assert_eq!(plane.destination.x, 10);
         assert_eq!(plane.destination.y, 10);
+        assert!(plane.bitmap.contains(&255));
+    }
+
+    #[test]
+    fn render_frame_renders_drawing_holes_with_even_odd_fill() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\p1}m 0 0 l 20 0 20 20 0 20 m 5 5 l 15 5 15 15 5 15").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let plane = planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Character)
+            .expect("drawing plane");
+        let center_x = 10 - (plane.destination.x - 10);
+        let center_y = 10 - (plane.destination.y - 10);
+        assert_eq!(
+            plane.bitmap[center_y as usize * plane.stride as usize + center_x as usize],
+            0,
+            "nested drawing contours should punch libass-like hollow holes instead of union-filling"
+        );
         assert!(plane.bitmap.contains(&255));
     }
 
