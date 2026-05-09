@@ -969,10 +969,10 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
             Some(Rect {
                 x_min: 659,
                 y_min: 35,
-                x_max: 1261,
-                y_max: 49
+                x_max: 1260,
+                y_max: 48
             }),
-            "decimal rectangular clips must survive layout as a screen-space rect for renderer clipping"
+            "decimal rectangular clips must survive layout with libass-like truncation"
         );
         assert!(layout.vector_clip.is_none());
         assert!(!layout.inverse_clip);

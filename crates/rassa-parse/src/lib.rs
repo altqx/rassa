@@ -1722,15 +1722,18 @@ fn parse_rect_clip(value: &str) -> Option<Rect> {
     if parts.len() != 4 {
         return None;
     }
-    let x_min = parts[0].parse::<i32>().ok()?;
-    let y_min = parts[1].parse::<i32>().ok()?;
-    let x_max = parts[2].parse::<i32>().ok()?;
-    let y_max = parts[3].parse::<i32>().ok()?;
+    let x_min = parse_drawing_number(parts[0])?;
+    let y_min = parse_drawing_number(parts[1])?;
+    let x_max = parse_drawing_number(parts[2])?;
+    let y_max = parse_drawing_number(parts[3])?;
+    if !x_min.is_finite() || !y_min.is_finite() || !x_max.is_finite() || !y_max.is_finite() {
+        return None;
+    }
     Some(Rect {
-        x_min,
-        y_min,
-        x_max,
-        y_max,
+        x_min: x_min as i32,
+        y_min: y_min as i32,
+        x_max: x_max as i32,
+        y_max: y_max as i32,
     })
 }
 
@@ -2485,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_position_origin_move_and_clip_preserve_exact_coordinates() {
+    fn decimal_position_origin_move_preserve_exact_coordinates_but_clip_truncates_like_libass() {
         let base_style = ParsedStyle::default();
         let positioned =
             parse_dialogue_text("{\\pos(10.25,20.75)\\org(4.5,8.125)}Pos", &base_style, &[]);
@@ -2519,7 +2522,15 @@ mod tests {
                 y_max: 40.75,
             })
         );
-        assert_eq!(clipped.clip_rect, None);
+        assert_eq!(
+            clipped.clip_rect,
+            Some(Rect {
+                x_min: 1,
+                y_min: 2,
+                x_max: 30,
+                y_max: 40,
+            })
+        );
     }
 
     #[test]

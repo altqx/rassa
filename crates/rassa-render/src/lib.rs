@@ -223,6 +223,32 @@ fn positioned_text_y_correction(
     ((layout_height - metric_height).max(0) * 4) / 9
 }
 
+fn positioned_center_anchor_y_adjust(
+    line: &rassa_layout::LayoutLine,
+    alignment: i32,
+    scale_y: f64,
+) -> i32 {
+    if (alignment & ass::VALIGN_CENTER) != ass::VALIGN_CENTER
+        || line.runs.iter().all(|run| run.drawing.is_some())
+        || line
+            .runs
+            .iter()
+            .filter(|run| run.drawing.is_none())
+            .any(|run| run.style.border > 0.0 || run.style.border_y > 0.0)
+    {
+        return 0;
+    }
+    let scale_y = style_scale(scale_y);
+    let max_font_size = line
+        .runs
+        .iter()
+        .filter(|run| run.drawing.is_none())
+        .map(|run| run.style.font_size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .fold(0.0_f64, f64::max);
+    (max_font_size * scale_y * 0.06).round().max(0.0) as i32
+}
+
 fn renderer_blur_radius(blur: f64) -> u32 {
     if !(blur.is_finite() && blur > 0.0) {
         return 0;
@@ -448,6 +474,7 @@ impl RenderEngine {
                         - border_style_3_y_adjust
                         + if has_karaoke_run { 2 } else { 0 }
                         + if has_scaled_run { 2 } else { 0 }
+                        - positioned_center_anchor_y_adjust(line, event.alignment, render_scale_y)
                 } else {
                     line_top
                         + unpositioned_text_y_correction(line, config, render_scale_y)
@@ -4027,8 +4054,9 @@ fn image_plane_from_drawing(
         for column in 0..width as usize {
             let x = bounds.x_min + column as i32;
             let y = bounds.y_min + row as i32;
-            if point_in_drawing_polygons(x, y, &polygons) {
-                bitmap[row * stride + column] = 255;
+            let coverage = drawing_pixel_coverage(x, y, &polygons);
+            if coverage > 0 {
+                bitmap[row * stride + column] = coverage;
                 any_visible = true;
             }
         }
@@ -4276,24 +4304,43 @@ fn mask_plane_with_vector_clip(
         .map(|plane| pad_plane_transparent(plane, 4, 1, 0, 13))
 }
 
-fn point_in_drawing_polygons(x: i32, y: i32, polygons: &[Vec<Point>]) -> bool {
+fn drawing_pixel_coverage(x: i32, y: i32, polygons: &[Vec<Point>]) -> u8 {
+    const SAMPLES: [f64; 4] = [0.125, 0.375, 0.625, 0.875];
+    let mut inside = 0_u32;
+    for sample_y in SAMPLES {
+        for sample_x in SAMPLES {
+            if point_in_drawing_polygons_at(x as f64 + sample_x, y as f64 + sample_y, polygons) {
+                inside += 1;
+            }
+        }
+    }
+    if inside == 0 {
+        0
+    } else {
+        ((inside * 255 + 8) / 16) as u8
+    }
+}
+
+fn point_in_drawing_polygons_at(sample_x: f64, sample_y: f64, polygons: &[Vec<Point>]) -> bool {
     polygons
         .iter()
-        .filter(|polygon| point_in_polygon(x, y, polygon))
+        .filter(|polygon| point_in_polygon_at(sample_x, sample_y, polygon))
         .count()
         % 2
         == 1
 }
 
 fn point_in_polygon(x: i32, y: i32, polygon: &[Point]) -> bool {
+    point_in_polygon_at(x as f64 + 0.5, y as f64 + 0.5, polygon)
+}
+
+fn point_in_polygon_at(sample_x: f64, sample_y: f64, polygon: &[Point]) -> bool {
     if polygon.len() < 3 {
         return false;
     }
 
     let mut inside = false;
     let mut previous = polygon[polygon.len() - 1];
-    let sample_x = x as f64 + 0.5;
-    let sample_y = y as f64 + 0.5;
 
     for &current in polygon {
         let current_y = current.y as f64;
@@ -6909,6 +6956,23 @@ Dialogue: 7,0:00:00.00,0:00:01.00,ED2,,0,0,0,fx,{\move(808.8,73,808.8,65)\org(71
             "nested drawing contours should punch libass-like hollow holes instead of union-filling"
         );
         assert!(plane.bitmap.contains(&255));
+    }
+
+    #[test]
+    fn render_frame_antialiases_vector_drawing_edges() {
+        let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\p1}m 0 0 l 20 0 20 20").expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let plane = planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Character)
+            .expect("drawing plane");
+
+        assert!(
+            plane.bitmap.iter().any(|value| *value > 0 && *value < 255),
+            "vector drawing edges should keep libass-like partial coverage instead of binary rasterization"
+        );
     }
 
     #[test]
