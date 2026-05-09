@@ -78,17 +78,7 @@ pub fn render_script(
     let track = parse_script_text(script)?;
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
-    let config = RendererConfig {
-        frame: Size { width, height },
-        storage: Size { width, height },
-        pixel_aspect: 1.0,
-        font_scale: 1.0,
-        line_spacing: 0.0,
-        line_position: 0.0,
-        hinting: rassa_core::ass::Hinting::None,
-        shaping: rassa_core::ass::ShapingLevel::Complex,
-        ..Default::default()
-    };
+    let config = render_script_config(width, height);
     let planes = engine.render_frame_with_provider_and_config(&track, &provider, time_ms, &config);
     let mut report = RenderReport {
         width,
@@ -165,6 +155,20 @@ pub fn render_script(
     }
 
     Ok(report)
+}
+
+fn render_script_config(width: i32, height: i32) -> RendererConfig {
+    RendererConfig {
+        frame: Size { width, height },
+        storage: Size { width, height },
+        pixel_aspect: 1.0,
+        font_scale: 1.0,
+        line_spacing: 0.0,
+        line_position: 0.0,
+        hinting: rassa_core::ass::Hinting::Normal,
+        shaping: rassa_core::ass::ShapingLevel::Complex,
+        ..Default::default()
+    }
 }
 
 fn composite_plane_pixel(rgb_pixels: &mut [u8], target_index: usize, color: u32, coverage: u8) {
@@ -292,6 +296,13 @@ Style: Default,sans,32,&H0000FF00,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,1
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,Rassa smoke
 "#;
+
+    #[test]
+    fn render_script_config_uses_libass_like_normal_hinting() {
+        let config = render_script_config(320, 180);
+        assert_eq!(config.hinting, rassa_core::ass::Hinting::Normal);
+        assert_eq!(config.shaping, rassa_core::ass::ShapingLevel::Complex);
+    }
 
     #[test]
     fn render_report_confirms_non_empty_frame() {
