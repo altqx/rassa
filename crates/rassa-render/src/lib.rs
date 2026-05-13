@@ -1965,7 +1965,9 @@ fn apply_run_transform_to_recent_planes(
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
         .unwrap_or(origin);
     let pad_frz_text_plane = context.single_line_blurred_text_frz_without_org();
-    let pad_org_frz_text_plane = context.single_line_blurred_text_frz_with_org();
+    let pad_clipped_org_frz_text_plane = context.single_line_clipped_blurred_text_frz_with_org();
+    let pad_org_frz_text_plane =
+        context.single_line_blurred_text_frz_with_org() && !pad_clipped_org_frz_text_plane;
     let transform_slice = |planes: &mut Vec<ImagePlane>, start: usize| {
         let tail = planes.split_off(start);
         planes.extend(transform_event_planes(
@@ -1978,6 +1980,7 @@ fn apply_run_transform_to_recent_planes(
                 drawing_run: context.drawing_run,
                 pad_frz_text_plane,
                 pad_org_frz_text_plane,
+                pad_clipped_org_frz_text_plane,
             },
         ));
     };
@@ -2027,6 +2030,7 @@ struct TransformPlaneOptions {
     drawing_run: bool,
     pad_frz_text_plane: bool,
     pad_org_frz_text_plane: bool,
+    pad_clipped_org_frz_text_plane: bool,
 }
 
 fn transform_event_planes(
@@ -2075,6 +2079,9 @@ fn transform_event_planes(
             if options.pad_org_frz_text_plane {
                 transformed = pad_libass_org_frz_text_plane(transformed);
             }
+            if options.pad_clipped_org_frz_text_plane {
+                transformed = pad_libass_clipped_org_frz_text_plane(transformed);
+            }
             Some(transformed)
         })
         .collect()
@@ -2118,6 +2125,21 @@ impl RunTransformContext<'_> {
             && self.transform.rotation_y.abs() < f64::EPSILON
             && self.transform.shear_x.abs() < f64::EPSILON
             && self.transform.shear_y.abs() < f64::EPSILON
+    }
+
+    fn single_line_clipped_blurred_text_frz_with_org(&self) -> bool {
+        self.single_line_blurred_text_frz_with_org()
+            && self.event.clip_rect.is_some()
+            && !self.event.inverse_clip
+    }
+}
+
+fn pad_libass_clipped_org_frz_text_plane(mut plane: ImagePlane) -> ImagePlane {
+    if plane.kind == ass::ImageType::Character {
+        plane.destination.x += 3;
+        pad_plane_transparent(plane, 6, 0, 5, 0)
+    } else {
+        plane
     }
 }
 
@@ -5054,6 +5076,39 @@ Dialogue: 0,0:21:45.28,0:21:50.57,ED TH2,,0,0,0,fx,{\an2\pos(1246.1,1050)\bord0.
                 y_max: 77,
             },
             "decimal rectangular clip over transformed one-char text should keep libass-like ASS_Image plane geometry"
+        );
+    }
+
+    #[test]
+    fn clipped_org_move_single_char_slice_keeps_libass_like_plane() {
+        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
+            return;
+        }
+        let script = r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2,Arial,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{\move(1072.3,57,1072.3,65)\org(982.3,-25)\t(66.428571428571,132.85714285714,\frz4)\t(132.85714285714,199.28571428571,\frz-4)\t(199.28571428571,265.71428571429,\frz4\t(265.71428571429,332.14285714286,\frz-4\t(332.14285714286,398.57142857143,\frz4\t(398.57142857143,465,\frz-4\t(465,531.42857142857,\frz4\t(1062.8571428571,597.85714285714,\frz-4\t(597.85714285714,664.28571428571,\frz4\t(664.28571428571,730.71428571429,\frz-4\t(730.71428571429,797.14285714286,\frz4\t(797.14285714286,863.57142857143,\frz-4\t(863.57142857143,930,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,930,\fs70\frz0)\clip(659.3,32.4,1260.8,45.8)\c&HDEF2FE&}A
+"#;
+        assert_rect_near(
+            render_text_plane_bounds_at(script, 870),
+            Rect {
+                x_min: 1046,
+                y_min: 39,
+                x_max: 1102,
+                y_max: 45,
+            },
+            2,
+            "02.ass line 577-style clipped org/move transformed glyph should retain libass plane geometry",
         );
     }
 
