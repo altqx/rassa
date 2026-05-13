@@ -4903,12 +4903,7 @@ mod tests {
 
     #[test]
     fn positioned_thai_deep_glyphs_keep_libass_like_bottom_anchor() {
-        let provider = FontconfigProvider::new();
-        if provider
-            .resolve(&FontQuery::new("K2D ExtraBold"))
-            .path
-            .is_none()
-        {
+        if !baseline_fontconfig_family_contains("K2D ExtraBold", "K2D") {
             return;
         }
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 400\nPlayResY: 240\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED TH2,K2D ExtraBold,75,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0,0,2,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,ED TH2,,0,0,0,,{\\an2\\pos(200,180)\\bord0\\shad0\\blur0}อุ อู ญ ฐ ฏ ฎ\n";
@@ -4946,14 +4941,10 @@ mod tests {
 
     #[test]
     fn lower_ed_th2_positioned_per_glyph_line_matches_libass_bounds() {
-        let provider = FontconfigProvider::new();
-        if provider
-            .resolve(&FontQuery::new("K2D ExtraBold"))
-            .path
-            .is_none()
-        {
+        if !baseline_fontconfig_family_contains("K2D ExtraBold", "K2D") {
             return;
         }
+        let provider = FontconfigProvider::new();
         let script = r#"[Script Info]
 ScriptType: v4.00+
 WrapStyle: 0
@@ -5023,6 +5014,9 @@ Dialogue: 0,0:21:45.28,0:21:50.57,ED TH2,,0,0,0,fx,{\an2\pos(1246.1,1050)\bord0.
 
     #[test]
     fn rotated_positioned_text_keeps_libass_like_transparent_frz_plane() {
+        if !baseline_fontconfig_family_contains("Raphtalia", "Raphtalia") {
+            return;
+        }
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Placas,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Placas,,0,0,0,,{\\fs66\\shad\\bord0\\blur1\\fnRaphtalia\\c&H070707&\\b0\\fscx99\\fscy107\\frz345.2\\pos(1258.48,593.06)}หลังเลิกเรียน จะรอที่\n";
         let actual =
             render_text_plane_bounds(script).expect("rotated positioned text should render");
