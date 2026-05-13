@@ -1898,7 +1898,7 @@ fn align_positioned_text_line_bottom(
     } else if line_contains_deep_thai_glyphs(context.line) {
         (max_font_size * 0.11).round() as i32
     } else {
-        (max_font_size * 0.24).round() as i32
+        (max_font_size * 0.19).round() as i32
     };
     let line_step = max_font_size.round() as i32;
     let remaining_lines = context.line_count.saturating_sub(1 + context.line_index) as i32;
@@ -4955,6 +4955,26 @@ mod tests {
         assert!(
             (actual.y_max - 173).abs() <= 4,
             "Thai deep glyph bottom should stay near libass-like descender plane: bounds={actual:?}"
+        );
+    }
+
+    #[test]
+    fn bottom_positioned_latin_glyph_uses_libass_like_sub_anchor() {
+        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
+            return;
+        }
+        let script = "[Script Info]\nScriptType: v4.00+\nWrapStyle: 0\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED TH2,Arial,75,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0.7,3,2,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,ED TH2,,0,0,0,fx,{\\an2\\pos(1167.9,1050)\\bord0.7\\shad3\\blur0\\c&HFFFFFF&\\3c&H000000&\\4c&HB5B7B7&}A\n";
+
+        assert_rect_near(
+            render_text_kind_bounds_at(script, 500, ass::ImageType::Character),
+            Rect {
+                x_min: 1145,
+                y_min: 989,
+                x_max: 1193,
+                y_max: 1037,
+            },
+            1,
+            "02.ass lower Latin bottom-positioned glyphs should use libass-like sub-anchor placement",
         );
     }
 
