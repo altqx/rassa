@@ -2097,6 +2097,15 @@ fn trim_plane_bottom(mut plane: ImagePlane, rows: i32) -> ImagePlane {
     plane
 }
 
+fn trim_plane_top(plane: ImagePlane, rows: i32) -> ImagePlane {
+    if rows <= 0 || plane.size.height <= rows || plane.stride <= 0 {
+        return plane;
+    }
+    let mut rect = plane_rect(&plane);
+    rect.y_min += rows;
+    crop_plane_to_rect(plane, rect).unwrap_or_else(|| unreachable!())
+}
+
 impl RunTransformContext<'_> {
     fn single_line_blurred_text_frz_without_org(&self) -> bool {
         !self.drawing_run
@@ -2135,11 +2144,19 @@ impl RunTransformContext<'_> {
 }
 
 fn pad_libass_clipped_org_frz_text_plane(mut plane: ImagePlane) -> ImagePlane {
-    if plane.kind == ass::ImageType::Character {
-        plane.destination.x += 3;
-        pad_plane_transparent(plane, 6, 0, 5, 0)
+    if plane.kind != ass::ImageType::Character {
+        return plane;
+    }
+
+    if plane.size.width <= 32 {
+        plane.destination.x += 4;
+        plane.destination.y -= 3;
+        plane = trim_plane_top(plane, 1);
+        pad_plane_transparent(plane, 3, 0, 7, 4)
     } else {
-        plane
+        plane.destination.x += 3;
+        plane = trim_plane_top(plane, 1);
+        pad_plane_transparent(plane, 6, 0, 5, 7)
     }
 }
 
@@ -5109,6 +5126,74 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{\move(1072.3,57,1072.3,65)\org(
             },
             2,
             "02.ass line 577-style clipped org/move transformed glyph should retain libass plane geometry",
+        );
+    }
+
+    #[test]
+    fn clipped_org_move_empty_edge_slices_keep_libass_like_planes() {
+        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
+            return;
+        }
+
+        let script = |clip: &str, text: &str, move_x: &str, move_y: &str, org_x: &str| {
+            format!(
+                r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2,Arial,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_x},65)\org({org_x},-25)\t(66.428571428571,132.85714285714,\frz4)\t(132.85714285714,199.28571428571,\frz-4)\t(199.28571428571,265.71428571429,\frz4\t(265.71428571429,332.14285714286,\frz-4\t(332.14285714286,398.57142857143,\frz4\t(398.57142857143,465,\frz-4\t(465,531.42857142857,\frz4\t(1062.8571428571,597.85714285714,\frz-4\t(597.85714285714,664.28571428571,\frz4\t(664.28571428571,730.71428571429,\frz-4\t(730.71428571429,797.14285714286,\frz4\t(797.14285714286,863.57142857143,\frz-4\t(863.57142857143,930,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,930,\fs70\frz0){clip}\c&H62C3FA&}}{text}
+"#
+            )
+        };
+
+        assert_rect_near(
+            render_text_plane_bounds_at(
+                &script(
+                    "\\clip(659.3,92.2,1260.8,106.36666666667)",
+                    "A",
+                    "1072.3",
+                    "57",
+                    "982.3",
+                ),
+                870,
+            ),
+            Rect {
+                x_min: 1046,
+                y_min: 92,
+                x_max: 1102,
+                y_max: 95,
+            },
+            1,
+            "02.ass lower empty clipped A slice should keep libass transparent ASS_Image plane geometry",
+        );
+        assert_rect_near(
+            render_text_plane_bounds_at(
+                &script(
+                    "\\clip(659.3,27.2,1260.8,40.533333333333)",
+                    "h",
+                    "1106.8",
+                    "73",
+                    "1016.8",
+                ),
+                870,
+            ),
+            Rect {
+                x_min: 1089,
+                y_min: 38,
+                x_max: 1129,
+                y_max: 40,
+            },
+            1,
+            "02.ass upper empty clipped h slice should keep libass transparent ASS_Image plane geometry",
         );
     }
 
