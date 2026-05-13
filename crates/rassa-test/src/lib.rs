@@ -674,9 +674,14 @@ mod tests {
         }
     }
 
-    fn assert_pixel_perfect_compare_fixture(script: &str, now_ms: i64, reference_png: &[u8]) {
-        const COMPARE_SCALE: usize = 8;
-        let (width, height, target) = decode_png_compare_target(reference_png);
+    const COMPARE_SCALE: usize = 8;
+
+    fn compare_fixture_planes(
+        script: &str,
+        now_ms: i64,
+        reference_png: &[u8],
+    ) -> Vec<rassa_core::ImagePlane> {
+        let (width, height, _) = decode_png_compare_target(reference_png);
         let track = parse_fixture(script);
         let provider = compare_fixture_font_provider();
         let config = RendererConfig {
@@ -690,7 +695,29 @@ mod tests {
             },
             ..RendererConfig::default()
         };
-        let planes = render_track_planes_with_config(&track, &provider, now_ms, &config);
+        render_track_planes_with_config(&track, &provider, now_ms, &config)
+    }
+
+    fn plane_geometries(
+        planes: &[rassa_core::ImagePlane],
+    ) -> Vec<(ass::ImageType, i32, i32, i32, i32)> {
+        planes
+            .iter()
+            .map(|plane| {
+                (
+                    plane.kind,
+                    plane.destination.x,
+                    plane.destination.y,
+                    plane.size.width,
+                    plane.size.height,
+                )
+            })
+            .collect()
+    }
+
+    fn assert_pixel_perfect_compare_fixture(script: &str, now_ms: i64, reference_png: &[u8]) {
+        let (width, height, target) = decode_png_compare_target(reference_png);
+        let planes = compare_fixture_planes(script, now_ms, reference_png);
         maybe_dump_compare_planes(script, now_ms, &planes);
         let actual = downsample_compare_frame(
             &blend_planes_to_compare_frame(width * COMPARE_SCALE, height * COMPARE_SCALE, &planes),
@@ -773,6 +800,61 @@ mod tests {
             target_alpha_sum,
             row_summary(&actual),
             row_summary(&target),
+        );
+    }
+
+    #[test]
+    fn upstream_broad_static_positioned_center_bbox_matches_libass_planes() {
+        let script = include_str!("../fixtures/libass/compare/broad/broad_static.ass");
+        let planes = compare_fixture_planes(
+            script,
+            500,
+            include_bytes!("../fixtures/libass/compare/broad/broad_static-0500.png"),
+        );
+
+        assert_eq!(
+            plane_geometries(&planes),
+            vec![(ass::ImageType::Character, 671, 591, 1264, 368)],
+        );
+    }
+
+    #[test]
+    fn upstream_broad_karaoke_positioned_center_bboxes_match_libass_planes() {
+        let script = include_str!("../fixtures/libass/compare/broad/broad_karaoke.ass");
+        let planes = compare_fixture_planes(
+            script,
+            500,
+            include_bytes!("../fixtures/libass/compare/broad/broad_karaoke-0500.png"),
+        );
+
+        assert_eq!(
+            plane_geometries(&planes),
+            vec![
+                (ass::ImageType::Outline, 623, 615, 368, 240),
+                (ass::ImageType::Outline, 1007, 663, 368, 192),
+                (ass::ImageType::Character, 631, 623, 352, 224),
+                (ass::ImageType::Character, 1015, 671, 352, 176),
+                (ass::ImageType::Character, 1399, 623, 544, 224),
+            ],
+        );
+    }
+
+    #[test]
+    fn upstream_broad_box_borderstyle3_fill_plane_matches_libass_anchor() {
+        let script = include_str!("../fixtures/libass/compare/broad/broad_box.ass");
+        let planes = compare_fixture_planes(
+            script,
+            500,
+            include_bytes!("../fixtures/libass/compare/broad/broad_box-0500.png"),
+        );
+        let character_plane = plane_geometries(&planes)
+            .into_iter()
+            .find(|(kind, _, _, _, _)| *kind == ass::ImageType::Character);
+
+        assert_eq!(
+            character_plane,
+            Some((ass::ImageType::Character, 1070, 630, 454, 208)),
+            "BorderStyle=3 must not anchor the fill text from an opaque-box padding heuristic; libass keeps the fill plane at the glyph bbox base point",
         );
     }
 

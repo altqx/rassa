@@ -1308,11 +1308,7 @@ fn suppress_transform_fields_for_override(
 
     for transform in current_transforms.iter_mut() {
         let style = &mut transform.style;
-        if tag
-            .strip_prefix("1c")
-            .or_else(|| tag.strip_prefix('c'))
-            .is_some()
-        {
+        if strip_primary_colour_tag(tag).is_some() {
             style.primary_colour = None;
         } else if tag.strip_prefix("2c").is_some() {
             style.secondary_colour = None;
@@ -1444,17 +1440,158 @@ fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<Parse
     };
 
     let mut target_style = current_style.clone();
+    let mut explicit_style = ParsedAnimatedStyle::default();
     for raw_tag in split_override_tags(tags_part) {
-        apply_transform_tag(raw_tag.trim(), &mut target_style);
+        let tag = raw_tag.trim();
+        apply_transform_tag(tag, &mut target_style);
+        record_explicit_transform_tag(tag, &target_style, &mut explicit_style);
     }
 
-    let animated = diff_animated_style(current_style, &target_style);
+    let mut animated = diff_animated_style(current_style, &target_style);
+    merge_explicit_transform_style(&mut animated, explicit_style);
     (!animated.is_empty()).then_some(ParsedSpanTransform {
         start_ms,
         end_ms,
         accel: if accel > 0.0 { accel } else { 1.0 },
         style: animated,
     })
+}
+
+fn merge_explicit_transform_style(target: &mut ParsedAnimatedStyle, explicit: ParsedAnimatedStyle) {
+    if explicit.font_size.is_some() {
+        target.font_size = explicit.font_size;
+    }
+    if explicit.scale_x.is_some() {
+        target.scale_x = explicit.scale_x;
+    }
+    if explicit.scale_y.is_some() {
+        target.scale_y = explicit.scale_y;
+    }
+    if explicit.spacing.is_some() {
+        target.spacing = explicit.spacing;
+    }
+    if explicit.rotation_x.is_some() {
+        target.rotation_x = explicit.rotation_x;
+    }
+    if explicit.rotation_y.is_some() {
+        target.rotation_y = explicit.rotation_y;
+    }
+    if explicit.rotation_z.is_some() {
+        target.rotation_z = explicit.rotation_z;
+    }
+    if explicit.shear_x.is_some() {
+        target.shear_x = explicit.shear_x;
+    }
+    if explicit.shear_y.is_some() {
+        target.shear_y = explicit.shear_y;
+    }
+    if explicit.primary_colour.is_some() {
+        target.primary_colour = explicit.primary_colour;
+    }
+    if explicit.secondary_colour.is_some() {
+        target.secondary_colour = explicit.secondary_colour;
+    }
+    if explicit.outline_colour.is_some() {
+        target.outline_colour = explicit.outline_colour;
+    }
+    if explicit.back_colour.is_some() {
+        target.back_colour = explicit.back_colour;
+    }
+    if explicit.border.is_some() {
+        target.border = explicit.border;
+    }
+    if explicit.border_x.is_some() {
+        target.border_x = explicit.border_x;
+    }
+    if explicit.border_y.is_some() {
+        target.border_y = explicit.border_y;
+    }
+    if explicit.shadow.is_some() {
+        target.shadow = explicit.shadow;
+    }
+    if explicit.shadow_x.is_some() {
+        target.shadow_x = explicit.shadow_x;
+    }
+    if explicit.shadow_y.is_some() {
+        target.shadow_y = explicit.shadow_y;
+    }
+    if explicit.blur.is_some() {
+        target.blur = explicit.blur;
+    }
+    if explicit.be.is_some() {
+        target.be = explicit.be;
+    }
+}
+
+fn record_explicit_transform_tag(
+    tag: &str,
+    style: &ParsedSpanStyle,
+    animated: &mut ParsedAnimatedStyle,
+) {
+    if strip_primary_colour_tag(tag).is_some() {
+        animated.primary_colour = Some(style.primary_colour);
+    } else if tag.strip_prefix("2c").is_some() {
+        animated.secondary_colour = Some(style.secondary_colour);
+    } else if tag.strip_prefix("3c").is_some() {
+        animated.outline_colour = Some(style.outline_colour);
+    } else if tag.strip_prefix("4c").is_some() {
+        animated.back_colour = Some(style.back_colour);
+    } else if tag.strip_prefix("alpha").is_some() {
+        animated.primary_colour = Some(style.primary_colour);
+        animated.secondary_colour = Some(style.secondary_colour);
+        animated.outline_colour = Some(style.outline_colour);
+        animated.back_colour = Some(style.back_colour);
+    } else if tag.strip_prefix("1a").is_some() {
+        animated.primary_colour = Some(style.primary_colour);
+    } else if tag.strip_prefix("2a").is_some() {
+        animated.secondary_colour = Some(style.secondary_colour);
+    } else if tag.strip_prefix("3a").is_some() {
+        animated.outline_colour = Some(style.outline_colour);
+    } else if tag.strip_prefix("4a").is_some() {
+        animated.back_colour = Some(style.back_colour);
+    } else if tag.strip_prefix("fscx").is_some() {
+        animated.scale_x = Some(style.scale_x);
+    } else if tag.strip_prefix("fscy").is_some() {
+        animated.scale_y = Some(style.scale_y);
+    } else if tag.strip_prefix("fsp").is_some() {
+        animated.spacing = Some(style.spacing);
+    } else if tag.strip_prefix("frx").is_some() {
+        animated.rotation_x = Some(style.rotation_x);
+    } else if tag.strip_prefix("fry").is_some() {
+        animated.rotation_y = Some(style.rotation_y);
+    } else if tag
+        .strip_prefix("frz")
+        .or_else(|| tag.strip_prefix("fr"))
+        .is_some()
+    {
+        animated.rotation_z = Some(style.rotation_z);
+    } else if tag.strip_prefix("fax").is_some() {
+        animated.shear_x = Some(style.shear_x);
+    } else if tag.strip_prefix("fay").is_some() {
+        animated.shear_y = Some(style.shear_y);
+    } else if tag.strip_prefix("fs").is_some() {
+        animated.font_size = Some(style.font_size);
+    } else if tag.strip_prefix("xbord").is_some() {
+        animated.border_x = Some(style.border_x);
+    } else if tag.strip_prefix("ybord").is_some() {
+        animated.border_y = Some(style.border_y);
+    } else if tag.strip_prefix("bord").is_some() {
+        animated.border = Some(style.border);
+        animated.border_x = Some(style.border_x);
+        animated.border_y = Some(style.border_y);
+    } else if tag.strip_prefix("xshad").is_some() {
+        animated.shadow_x = Some(style.shadow_x);
+    } else if tag.strip_prefix("yshad").is_some() {
+        animated.shadow_y = Some(style.shadow_y);
+    } else if tag.strip_prefix("shad").is_some() {
+        animated.shadow = Some(style.shadow);
+        animated.shadow_x = Some(style.shadow_x);
+        animated.shadow_y = Some(style.shadow_y);
+    } else if tag.strip_prefix("blur").is_some() {
+        animated.blur = Some(style.blur);
+    } else if tag.strip_prefix("be").is_some() {
+        animated.be = Some(style.be);
+    }
 }
 
 fn split_override_tags(block: &str) -> Vec<&str> {
@@ -1490,7 +1627,7 @@ fn split_override_tags(block: &str) -> Vec<&str> {
 }
 
 fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
-    if let Some(rest) = tag.strip_prefix("1c").or_else(|| tag.strip_prefix('c')) {
+    if let Some(rest) = strip_primary_colour_tag(tag) {
         style.primary_colour = parse_override_color(rest, style.primary_colour);
     } else if let Some(rest) = tag.strip_prefix("2c") {
         style.secondary_colour = parse_override_color(rest, style.secondary_colour);
@@ -1563,6 +1700,17 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
     } else if let Some(rest) = tag.strip_prefix("be") {
         style.be = parse_f64(rest, style.be);
     }
+}
+
+fn strip_primary_colour_tag(tag: &str) -> Option<&str> {
+    if let Some(rest) = tag.strip_prefix("1c") {
+        return Some(rest);
+    }
+
+    let rest = tag.strip_prefix('c')?;
+    // Avoid treating ASS feature tags such as `\clip(...)` as `\c` colour
+    // resets. Colour overrides are either bare `\c` or `\c&H...&`.
+    (rest.is_empty() || rest.starts_with('&')).then_some(rest)
 }
 
 fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> ParsedAnimatedStyle {
@@ -2856,6 +3004,32 @@ mod tests {
         assert_eq!(transforms[0].start_ms, 53);
         assert_eq!(transforms[0].end_ms, Some(107));
         assert_eq!(transforms[0].style.rotation_z, Some(4.0));
+    }
+
+    #[test]
+    fn transform_records_explicit_target_equal_to_static_style() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\frz0\\t(0,100,\\frz4)\\t(0,200,\\frz0)}Text",
+            &base_style,
+            &[],
+        );
+
+        let transforms = &parsed.lines[0].spans[0].transforms;
+        assert_eq!(transforms.len(), 2);
+        assert_eq!(transforms[0].style.rotation_z, Some(4.0));
+        assert_eq!(transforms[1].style.rotation_z, Some(0.0));
+    }
+
+    #[test]
+    fn transform_clip_tag_is_not_misclassified_as_colour() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\t(0,100,\\clip(0,0,10,10))}Text", &base_style, &[]);
+
+        assert!(
+            parsed.lines[0].spans[0].transforms.is_empty(),
+            "unsupported animated clip must not become a no-op primary-colour transform"
+        );
     }
 
     #[test]
