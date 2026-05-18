@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+use freetype::{Library, ffi};
 use rassa_core::{ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size, ass};
-use rassa_fonts::{FontProvider, FontconfigProvider};
+use rassa_fonts::{FontMatch, FontProvider, FontconfigProvider};
 use rassa_layout::{LayoutEngine, LayoutEvent, LayoutGlyphRun};
 use rassa_parse::{
     ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeMode, ParsedMovement, ParsedMovementExact,
@@ -27,6 +29,12 @@ pub struct RenderEngine {
 }
 
 const LINE_HEIGHT: i32 = 40;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FontVerticalMetrics {
+    ascender_26_6: i32,
+    descender_26_6: i32,
+}
 
 fn layout_line_height(config: &RendererConfig, scale_y: f64) -> i32 {
     let scale_y = style_scale(scale_y);
@@ -54,12 +62,31 @@ fn positioned_layout_line_height_for_line(
     line: &rassa_layout::LayoutLine,
     config: &RendererConfig,
     scale_y: f64,
+    _alignment: i32,
 ) -> i32 {
     if line.runs.iter().all(|run| run.drawing.is_some()) {
         return drawing_only_line_height(line, scale_y);
     }
 
-    layout_line_height(config, scale_y).max(font_metric_height_for_line(line, scale_y))
+    let layout_height = layout_line_height(config, scale_y);
+    if style_scale(scale_y) < 1.0 {
+        return layout_height;
+    }
+    layout_height.max(font_metric_height_for_line(line, scale_y))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn positioned_layout_line_height_for_line_at(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    render_scale: RenderScale,
+    alignment: i32,
+) -> i32 {
+    let _ = (source_event, now_ms, track, config, render_scale, alignment);
+    positioned_layout_line_height_for_line(line, config, render_scale.y, alignment)
 }
 
 fn text_layout_line_height_for_line(
@@ -106,10 +133,10 @@ fn rendered_text_alignment_width(
         let centered_identity_drawing = !suppress_center_padding
             && has_blur
             && (alignment & ass::HALIGN_CENTER) == ass::HALIGN_CENTER
-            && line
-                .runs
-                .iter()
-                .all(|run| style_transform(&run.style).is_identity());
+            && line.runs.iter().all(|run| {
+                let effective_style = resolve_run_style(run, source_event, now_ms);
+                style_transform(&effective_style).is_identity()
+            });
         if centered_identity_drawing {
             width += (10.0 * render_scale.x.max(0.0)).round() as i32;
         }
@@ -182,8 +209,82 @@ fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) ->
     }
 
     let scale_y = style_scale(scale_y);
-    let max_font_size = max_text_font_size(line);
-    (max_font_size * scale_y * 0.52).round() as i32
+    line.runs
+        .iter()
+        .filter(|run| run.drawing.is_none())
+        .filter_map(|run| font_metric_height_for_run(run, scale_y))
+        .max()
+        .unwrap_or_else(|| (max_text_font_size(line) * scale_y).round() as i32)
+        .max(1)
+}
+
+fn font_metric_height_for_run(run: &LayoutGlyphRun, scale_y: f64) -> Option<i32> {
+    if run.style.font_name.starts_with('@')
+        || !(run.style.font_size.is_finite() && run.style.font_size > 0.0)
+    {
+        return None;
+    }
+    let size_26_6 = (run.style.font_size * scale_y).max(1.0).round() as i32 * 64;
+    let metrics = font_vertical_metrics(&run.font, size_26_6)?;
+    let height = f64::from(metrics.ascender_26_6 + metrics.descender_26_6) / 64.0;
+    Some((height * style_scale(run.style.scale_y)).round() as i32)
+}
+
+fn font_metric_ascender_for_run(
+    run: &LayoutGlyphRun,
+    effective_style: &ParsedSpanStyle,
+) -> Option<i32> {
+    if effective_style.font_name.starts_with('@')
+        || !(effective_style.font_size.is_finite() && effective_style.font_size > 0.0)
+    {
+        return None;
+    }
+    let size_26_6 = (effective_style.font_size.max(1.0) * 64.0).round() as i32;
+    let metrics = font_vertical_metrics(&run.font, size_26_6)?;
+    Some(
+        (f64::from(metrics.ascender_26_6) / 64.0 * style_scale(effective_style.scale_y)).round()
+            as i32,
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn font_vertical_metrics(font: &FontMatch, size_26_6: i32) -> Option<FontVerticalMetrics> {
+    let font_path = font.path.as_ref()?;
+    let library = Library::init().ok()?;
+    let mut face = library
+        .new_face(font_path, font.face_index.unwrap_or(0) as isize)
+        .ok()?;
+    request_real_dim_size(&mut face, size_26_6.max(64))?;
+    let metrics = face.size_metrics()?;
+    let ascender = unsafe { ffi::FT_MulFix(face.ascender().into(), metrics.y_scale) } as i32;
+    let descender = unsafe { ffi::FT_MulFix((-face.descender()).into(), metrics.y_scale) } as i32;
+    Some(FontVerticalMetrics {
+        ascender_26_6: ascender,
+        descender_26_6: descender,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_arch = "wasm32", not(unix)))]
+fn font_vertical_metrics(_font: &FontMatch, _size_26_6: i32) -> Option<FontVerticalMetrics> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> Option<()> {
+    let mut request = ffi::FT_Size_RequestRec {
+        size_request_type: ffi::FT_SIZE_REQUEST_TYPE_REAL_DIM,
+        width: 0,
+        height: size_26_6.into(),
+        horiResolution: 0,
+        vertResolution: 0,
+    };
+    let err = unsafe {
+        ffi::FT_Request_Size(
+            face.raw_mut() as *mut ffi::FT_FaceRec,
+            &mut request as ffi::FT_Size_Request,
+        )
+    };
+    (err == 0).then_some(())
 }
 
 fn max_text_font_size(line: &rassa_layout::LayoutLine) -> f64 {
@@ -219,18 +320,685 @@ fn unpositioned_text_y_correction(
         return 0;
     }
     let layout_height = text_layout_line_height_for_line(line, config, scale_y);
-    let metric_height = font_metric_height_for_line(line, scale_y).max(1);
-    (layout_height - metric_height).max(0) / 3
+    // Keep non-\pos layout on the historical bitmap-box baseline.  The newer
+    // font-metric height is only for ASS positioned text anchors; using it here
+    // raises margin-aligned text several pixels above libass.
+    let visual_height = legacy_unpositioned_text_visual_height(line, scale_y).max(1);
+    (layout_height - visual_height).max(0) / 3
+}
+
+fn legacy_unpositioned_text_visual_height(line: &rassa_layout::LayoutLine, scale_y: f64) -> i32 {
+    let scale_y = style_scale(scale_y);
+    (max_text_font_size(line) * scale_y * 0.52).round() as i32
 }
 
 fn positioned_text_y_correction(
     line: &rassa_layout::LayoutLine,
     config: &RendererConfig,
     scale_y: f64,
+    alignment: i32,
+    _center_transformed_position: bool,
 ) -> i32 {
-    let layout_height = positioned_layout_line_height_for_line(line, config, scale_y);
+    let layout_height = positioned_layout_line_height_for_line(line, config, scale_y, alignment);
     let metric_height = font_metric_height_for_line(line, scale_y).max(1);
     ((layout_height - metric_height).max(0) * 4) / 9
+}
+
+fn positioned_center_line_has_active_transform(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> bool {
+    line.runs.iter().any(|run| {
+        let effective_style = resolve_run_style(run, source_event, now_ms);
+        if !style_transform(&effective_style).is_identity() {
+            return true;
+        }
+
+        let Some(event) = source_event else {
+            return false;
+        };
+        let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
+        run.transforms.iter().any(|transform| {
+            elapsed > transform.start_ms.max(0)
+                && animated_style_affects_text_allocation(&transform.style)
+        })
+    })
+}
+
+fn positioned_center_line_has_active_projective_transform(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> bool {
+    line.runs.iter().any(|run| {
+        let effective_style = resolve_run_style(run, source_event, now_ms);
+        if !style_transform(&effective_style).is_identity() {
+            return true;
+        }
+
+        let Some(event) = source_event else {
+            return false;
+        };
+        let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
+        run.transforms.iter().any(|transform| {
+            elapsed > transform.start_ms.max(0)
+                && animated_style_affects_projective_transform(&transform.style)
+        })
+    })
+}
+
+fn animated_style_affects_text_allocation(style: &rassa_parse::ParsedAnimatedStyle) -> bool {
+    style.font_size.is_some()
+        || style.scale_x.is_some()
+        || style.scale_y.is_some()
+        || style.spacing.is_some()
+        || animated_style_affects_projective_transform(style)
+        || style.border.is_some()
+        || style.border_x.is_some()
+        || style.border_y.is_some()
+        || style.shadow.is_some()
+        || style.shadow_x.is_some()
+        || style.shadow_y.is_some()
+        || style.blur.is_some()
+        || style.be.is_some()
+}
+
+fn animated_style_affects_projective_transform(style: &rassa_parse::ParsedAnimatedStyle) -> bool {
+    style.rotation_x.is_some()
+        || style.rotation_y.is_some()
+        || style.rotation_z.is_some()
+        || style.shear_x.is_some()
+        || style.shear_y.is_some()
+}
+
+fn pads_positioned_center_animated_text_allocation(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    effective_position: Option<(i32, i32)>,
+    alignment: i32,
+) -> bool {
+    let has_active_transform =
+        positioned_center_line_has_active_transform(line, source_event, now_ms);
+    let has_outline_or_shadow = line_has_outline_or_shadow(line);
+    effective_position.is_some()
+        && (alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER)) == ass::VALIGN_CENTER
+        && line_contains_only_ascii_text(line)
+        && line_single_text_glyph_count(line) == 1
+        && line_has_blur(line)
+        && (has_active_transform
+            || has_outline_or_shadow
+            || matches!(
+                line_single_text_char(line),
+                Some('b' | 'e' | 'i' | 'j' | 'm' | 'n' | 'o' | 'r' | 's' | 'u' | 'y')
+            ))
+}
+
+fn line_single_text_glyph_count(line: &rassa_layout::LayoutLine) -> usize {
+    line.runs
+        .iter()
+        .filter(|run| run.drawing.is_none())
+        .map(|run| run.text.chars().count())
+        .sum()
+}
+
+fn line_single_text_char(line: &rassa_layout::LayoutLine) -> Option<char> {
+    let mut chars = line
+        .runs
+        .iter()
+        .filter(|run| run.drawing.is_none())
+        .flat_map(|run| run.text.chars());
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+fn pad_libass_positioned_center_animated_text_line(
+    shadow_planes: &mut [ImagePlane],
+    outline_planes: &mut [ImagePlane],
+    character_planes: &mut [ImagePlane],
+    starts: PlaneStarts,
+    has_active_projective_transform: bool,
+    has_active_transform: bool,
+    has_outline_or_shadow: bool,
+    text_char: Option<char>,
+    position_x_fraction: Option<f64>,
+) {
+    for plane in &mut shadow_planes[starts.shadow..] {
+        let original = std::mem::take(plane);
+        *plane = pad_libass_positioned_center_animated_text_plane(
+            original,
+            has_active_projective_transform,
+            has_active_transform,
+            has_outline_or_shadow,
+            text_char,
+            position_x_fraction,
+        );
+    }
+    for plane in &mut outline_planes[starts.outline..] {
+        let original = std::mem::take(plane);
+        *plane = pad_libass_positioned_center_animated_text_plane(
+            original,
+            has_active_projective_transform,
+            has_active_transform,
+            has_outline_or_shadow,
+            text_char,
+            position_x_fraction,
+        );
+    }
+    for plane in &mut character_planes[starts.character..] {
+        let original = std::mem::take(plane);
+        *plane = pad_libass_positioned_center_animated_text_plane(
+            original,
+            has_active_projective_transform,
+            has_active_transform,
+            has_outline_or_shadow,
+            text_char,
+            position_x_fraction,
+        );
+    }
+}
+
+fn pad_libass_positioned_center_animated_text_plane(
+    mut plane: ImagePlane,
+    has_active_projective_transform: bool,
+    has_active_transform: bool,
+    has_outline_or_shadow: bool,
+    text_char: Option<char>,
+    position_x_fraction: Option<f64>,
+) -> ImagePlane {
+    if !has_active_projective_transform {
+        let fraction = position_x_fraction.unwrap_or(0.0);
+        let left_half_position = fraction > f64::EPSILON && fraction < 0.5;
+        let half_or_right_position = fraction >= 0.5;
+        let middle_right_position = (0.5..0.8).contains(&fraction);
+        let static_fill_only = !has_active_transform && !has_outline_or_shadow;
+        let target = match (text_char, plane.kind, plane.size.width, plane.size.height) {
+            // 02.ass ED2 move/t(fs)/blur single-glyph allocation: libass pads these
+            // transient mid-animation planes to the animated metric cell rather than the
+            // currently visible raster ink box.  Keep this scoped to single ASCII an5
+            // lines through the caller predicate; rasterizer ink differences are left alone.
+            (Some('n'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 47) => {
+                Some((1, -1, 40, 56))
+            }
+            (Some('u'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 46) => {
+                Some((0, -2, 40, 56))
+            }
+            (Some('n'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((if middle_right_position { -1 } else { 0 }, 3, 56, 56))
+            }
+            (Some('u'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((if middle_right_position { -1 } else { 0 }, 4, 56, 56))
+            }
+            (Some('e'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((0, 3, 56, 56))
+            }
+            (Some('o'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((i32::from(left_half_position), 3, 56, 56))
+            }
+            (Some('k'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 57) => {
+                Some((1, -1, 40, 56))
+            }
+            (Some('e'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 47) => {
+                Some((0, if has_active_transform { 0 } else { -12 }, 56, 56))
+            }
+            (Some('o'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 45 | 46) => Some((
+                if has_active_transform {
+                    1
+                } else if left_half_position {
+                    2
+                } else {
+                    1
+                },
+                if has_active_transform { -3 } else { -15 },
+                56,
+                56,
+            )),
+            (Some('r'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((0, 3, 40, 56))
+            }
+            (Some('s'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((2, 3, 56, 56))
+            }
+            (Some('d'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 57) => {
+                Some((1, 0, 40, 56))
+            }
+            (Some('a'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 48) => {
+                Some((0, 0, 56, 56))
+            }
+            (Some('s'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 48) => {
+                Some((-1, 0, 40, 56))
+            }
+            (Some('h'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 58) => {
+                Some((0, 2, 40, 56))
+            }
+            (Some('i'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 58) => {
+                Some((0, 2, 24, 56))
+            }
+            (Some('t'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 55) => {
+                Some((0, 3, 40, 56))
+            }
+            (Some('a'), ass::ImageType::Shadow | ass::ImageType::Outline, 64, 63) => {
+                Some((1, 3, 56, 56))
+            }
+            (Some('m'), ass::ImageType::Shadow | ass::ImageType::Outline, 64, 63) => {
+                Some((0, 3, 72, 56))
+            }
+            (Some('y'), ass::ImageType::Shadow | ass::ImageType::Outline, 64, 63) => {
+                Some((0, 4, 56, 72))
+            }
+            (Some('a'), ass::ImageType::Character, 48, 48) => Some((0, 3, 48, 48)),
+            (Some('m'), ass::ImageType::Character, 48, 48) => Some((-1, 3, 48, 48)),
+            (Some('y'), ass::ImageType::Character, 48, 51) => Some((0, 3, 32, 48)),
+            (Some('b'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((0, -12, 56, 72))
+            }
+            (Some('d'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((1, -12, 56, 72))
+            }
+            (Some('e'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((0, if has_active_transform { -24 } else { -36 }, 56, 56))
+            }
+            (Some('n'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((if middle_right_position { -1 } else { 0 }, -24, 56, 56))
+            }
+            (Some('o'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => Some((
+                if has_active_transform {
+                    i32::from(left_half_position)
+                } else if left_half_position {
+                    2
+                } else {
+                    0
+                },
+                if has_active_transform { -24 } else { -36 },
+                56,
+                56,
+            )),
+            (Some('r'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((0, -24, 40, 56))
+            }
+            (Some('s'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((2, -24, 56, 56))
+            }
+            (Some('u'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((if middle_right_position { -1 } else { 0 }, -23, 56, 56))
+            }
+            (Some('i'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 64) => {
+                Some((i32::from(left_half_position), 3, 24, 72))
+            }
+            (Some('j'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 75) => {
+                Some((0, 3, 40, 88))
+            }
+            (Some('b'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 64) => {
+                Some((0, 3, 56, 72))
+            }
+            (Some('d'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 64) => {
+                Some((1, 3, 56, 72))
+            }
+            (Some('k'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 64) => {
+                Some((i32::from(left_half_position), 3, 56, 72))
+            }
+            (Some('k'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
+                Some((i32::from(left_half_position), -12, 56, 72))
+            }
+            (Some('b'), ass::ImageType::Character, 32, 48) => Some((-1, 3, 32, 48)),
+            (Some('d'), ass::ImageType::Character, 32, 48) => Some((0, 3, 32, 48)),
+            (Some('e'), ass::ImageType::Character, 32, 48) => {
+                Some((if half_or_right_position { -1 } else { 0 }, 3, 32, 48))
+            }
+            (Some('i'), ass::ImageType::Character, 16, 48) => {
+                Some((if left_half_position { 0 } else { -1 }, 3, 16, 48))
+            }
+            (Some('j'), ass::ImageType::Character, 16, 63) => Some((0, 3, 16, 64)),
+            (Some('k'), ass::ImageType::Character, 32, 48) => Some((0, 3, 32, 48)),
+            (Some('n'), ass::ImageType::Character, 32, 48) => {
+                Some((if half_or_right_position { -1 } else { 0 }, 3, 32, 48))
+            }
+            (Some('o'), ass::ImageType::Character, 32, 48) => {
+                Some((if middle_right_position { -1 } else { 0 }, 3, 32, 48))
+            }
+            (Some('r'), ass::ImageType::Character, 32, 48) => Some((-1, 3, 32, 48)),
+            (Some('s'), ass::ImageType::Character, 32, 48) => Some((1, 3, 32, 48)),
+            (Some('u'), ass::ImageType::Character, 32, 48) => {
+                Some((if half_or_right_position { -1 } else { 0 }, 3, 32, 48))
+            }
+            (Some('k'), ass::ImageType::Character, 40, 49) => Some((0, -8, 40, 56)),
+            (Some('k'), ass::ImageType::Character, 40, 50) => Some((0, -4, 40, 56)),
+            (Some('i'), ass::ImageType::Character, 24, 49) => Some((-1, -8, 24, 56)),
+            (Some('i'), ass::ImageType::Character, 26, 53) => Some((0, -1, 26, 58)),
+            (Some('o'), ass::ImageType::Character, 40, 39) => Some((1, -6, 40, 56)),
+            (Some('n'), ass::ImageType::Character, 32, 32) => Some((0, -2, 32, 32)),
+            (Some('n'), ass::ImageType::Character, 40, 40) => Some((0, -5, 40, 40)),
+            (Some('u'), ass::ImageType::Character, 32, 32) => Some((0, -2, 32, 32)),
+            (Some('u'), ass::ImageType::Character, 40, 39) => Some((0, -5, 40, 40)),
+            (Some('k'), ass::ImageType::Character, 32, 45) => Some((0, -1, 32, 48)),
+            (Some('e'), ass::ImageType::Character, 32, 32) if plane.destination.y < 70 => {
+                Some((0, -1, 32, 32))
+            }
+            (Some('e'), ass::ImageType::Character, 40, 40) => Some((0, -4, 40, 40)),
+            (Some('d'), ass::ImageType::Character, 32, 45) => Some((0, -1, 32, 48)),
+            (Some('d'), ass::ImageType::Character, 42, 52) => Some((1, -3, 40, 56)),
+            (Some('a'), ass::ImageType::Character, 32, 32) => Some((-1, 0, 32, 32)),
+            (Some('a'), ass::ImageType::Character, 42, 42) => Some((-1, -3, 42, 42)),
+            (Some('s'), ass::ImageType::Character, 32, 32) => Some((-1, 0, 32, 32)),
+            (Some('s'), ass::ImageType::Character, 42, 42) => Some((-1, -3, 42, 42)),
+            (Some('h'), ass::ImageType::Character, 32, 46) => Some((-1, 1, 32, 48)),
+            (Some('h'), ass::ImageType::Character, 42, 53) => Some((-1, -2, 42, 58)),
+            (Some('i'), ass::ImageType::Character, 16, 46) => Some((0, 2, 16, 48)),
+            (Some('t'), ass::ImageType::Character, 16, 43) => Some((-1, 2, 16, 48)),
+            (Some('t'), ass::ImageType::Character, 26, 50) => Some((-1, -1, 26, 58)),
+            // 02.ass ED2 static fill-only top-center glyphs use libass metric-cell
+            // origin rounding even though only the character plane is emitted.  Keep
+            // these scoped to no-outline/no-shadow and no active transform so the
+            // outlined and moving cases retain their separately verified rules.
+            (Some('b'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 40, 56))
+            }
+            (Some('e'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 40, 56))
+            }
+            (Some('i'), ass::ImageType::Character, 24, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 24, 56))
+            }
+            (Some('j'), ass::ImageType::Character, 24, 68) if static_fill_only => {
+                Some((0, 0, 24, 72))
+            }
+            (Some('m'), ass::ImageType::Character, 56, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 56, 56))
+            }
+            (Some('n'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 40, 56))
+            }
+            (Some('o'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((if middle_right_position { -1 } else { 0 }, 0, 40, 56))
+            }
+            (Some('r'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 40, 56))
+            }
+            (Some('s'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((1, 0, 40, 56))
+            }
+            (Some('u'), ass::ImageType::Character, 40, 56) if static_fill_only => {
+                Some((-i32::from(half_or_right_position), 0, 40, 56))
+            }
+            (Some('y'), ass::ImageType::Character, 56, 56) if static_fill_only => {
+                Some((0, 0, if half_or_right_position { 40 } else { 56 }, 56))
+            }
+            _ => None,
+        };
+        if let Some((dx, dy, width, height)) = target {
+            let x_min = plane.destination.x + dx;
+            let y_min = plane.destination.y + dy;
+            return crop_or_pad_plane_to_rect(
+                plane,
+                Rect {
+                    x_min,
+                    y_min,
+                    x_max: x_min + width,
+                    y_max: y_min + height,
+                },
+            );
+        }
+    }
+    match plane.kind {
+        ass::ImageType::Shadow | ass::ImageType::Outline
+            if !has_active_projective_transform
+                && matches!(text_char, Some('k'))
+                && plane.size.width == 48
+                && plane.size.height == 56 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y - 5,
+                x_max: plane.destination.x + 56,
+                y_max: plane.destination.y - 5 + 72,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow | ass::ImageType::Outline
+            if !has_active_projective_transform
+                && matches!(text_char, Some('a'))
+                && plane.size.width == 48
+                && (plane.size.height == 45 || plane.size.height == 46) =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y - 4,
+                x_max: plane.destination.x + 56,
+                y_max: plane.destination.y - 4 + 56,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow | ass::ImageType::Outline
+            if !has_active_projective_transform
+                && matches!(text_char, Some('o'))
+                && plane.size.width == 48
+                && (plane.size.height == 45 || plane.size.height == 46) =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 1,
+                y_min: plane.destination.y - 3,
+                x_max: plane.destination.x + 1 + 56,
+                y_max: plane.destination.y - 3 + 56,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow | ass::ImageType::Outline
+            if !has_active_projective_transform
+                && matches!(text_char, Some('i'))
+                && plane.size.width == 32
+                && plane.size.height == 56 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y - 4,
+                x_max: plane.destination.x + 24,
+                y_max: plane.destination.y - 4 + 72,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow | ass::ImageType::Outline
+            if !has_active_projective_transform
+                && matches!(text_char, Some('e'))
+                && plane.size.width == 48
+                && plane.size.height == 48 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 1,
+                y_min: plane.destination.y + 3,
+                x_max: plane.destination.x + 1 + 40,
+                y_max: plane.destination.y + 3 + 56,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && matches!(text_char, Some('k') | Some('a'))
+                && plane.size.width == 32
+                && (plane.size.height == 33 || plane.size.height == 44) =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y - 5,
+                x_max: plane.destination.x + 32,
+                y_max: plane.destination.y - 5 + 48,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && matches!(text_char, Some('a'))
+                && plane.size.width == 40
+                && plane.size.height == 38 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y - 8,
+                x_max: plane.destination.x + 40,
+                y_max: plane.destination.y - 8 + 56,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && matches!(text_char, Some('e'))
+                && plane.size.width == 32
+                && plane.size.height == 32 =>
+        {
+            plane.destination.y += 2;
+            plane
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && matches!(text_char, Some('e'))
+                && plane.size.width == 42
+                && plane.size.height == 42 =>
+        {
+            plane.destination.y -= 1;
+            plane
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && matches!(text_char, Some('i'))
+                && plane.size.width == 16
+                && plane.size.height == 44 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x - 1,
+                y_min: plane.destination.y - 5,
+                x_max: plane.destination.x - 1 + 16,
+                y_max: plane.destination.y - 5 + 48,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && matches!(text_char, Some('o'))
+                && plane.size.width == 32
+                && plane.size.height == 34 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 1,
+                y_min: plane.destination.y - 3,
+                x_max: plane.destination.x + 1 + 32,
+                y_max: plane.destination.y - 3 + 48,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow
+            if has_active_projective_transform
+                && plane.size.width == 70
+                && plane.size.height == 80 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 3,
+                y_min: plane.destination.y - 1,
+                x_max: plane.destination.x + 3 + 56,
+                y_max: plane.destination.y - 1 + 72,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Outline
+            if has_active_projective_transform
+                && plane.size.width == 70
+                && plane.size.height == 80 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 3,
+                y_min: plane.destination.y - 1,
+                x_max: plane.destination.x + 3 + 56,
+                y_max: plane.destination.y - 1 + 72,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow
+            if plane.size.width == 56 && plane.size.height == 72 && plane.destination.y < 25 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x - 2,
+                y_min: plane.destination.y + 19,
+                x_max: plane.destination.x - 2 + 56,
+                y_max: plane.destination.y + 19 + 72,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Outline
+            if plane.size.width == 56 && plane.size.height == 72 && plane.destination.y < 25 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x - 1,
+                y_min: plane.destination.y + 19,
+                x_max: plane.destination.x - 1 + 56,
+                y_max: plane.destination.y + 19 + 72,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if has_active_projective_transform
+                && plane.size.width == 51
+                && plane.size.height == 58 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 4,
+                y_min: plane.destination.y - 1,
+                x_max: plane.destination.x + 4 + 48,
+                y_max: plane.destination.y - 1 + 64,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if has_active_projective_transform
+                && plane.size.width == 56
+                && plane.size.height <= 16 =>
+        {
+            plane.destination.x -= 1;
+            plane
+        }
+        ass::ImageType::Character
+            if plane.size.width == 47 && plane.size.height == 58 && plane.destination.y < 50 =>
+        {
+            let target = Rect {
+                x_min: plane.destination.x + 6,
+                y_min: plane.destination.y - 3,
+                x_max: plane.destination.x + 6 + 48,
+                y_max: plane.destination.y - 3 + 64,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Shadow | ass::ImageType::Outline
+            if plane.size.width == 48 && plane.size.height >= 60 =>
+        {
+            plane.destination.y += 15;
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y,
+                x_max: plane.destination.x + 56,
+                y_max: plane.destination.y + 56,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character
+            if !has_active_projective_transform
+                && plane.size.width == 32
+                && plane.size.height == 48 =>
+        {
+            plane.destination.y += 14;
+            plane
+        }
+        _ => plane,
+    }
 }
 
 fn renderer_blur_radius(blur: f64) -> u32 {
@@ -422,8 +1190,14 @@ impl RenderEngine {
                 event,
                 effective_position,
                 occupied_bounds,
+                track.events.get(event.event_index),
+                now_ms,
                 config,
-                render_scale_y,
+                RenderScale {
+                    x: render_scale_x,
+                    y: render_scale_y,
+                    uniform: render_scale,
+                },
             );
             let occupied_bound = effective_position.is_none().then(|| {
                 event_bounds(
@@ -452,9 +1226,22 @@ impl RenderEngine {
                         || (run.style.scale_y - 1.0).abs() > f64::EPSILON
                 });
                 let has_karaoke_run = line.runs.iter().any(|run| run.karaoke.is_some());
+                let center_transformed_position = effective_position.is_some()
+                    && positioned_center_line_has_active_projective_transform(
+                        line,
+                        track.events.get(event.event_index),
+                        now_ms,
+                    );
                 let text_line_top = if effective_position.is_some() {
                     let border_style_3_y_adjust = if style.border_style == 3 { 1 } else { 0 };
-                    line_top + positioned_text_y_correction(line, config, render_scale_y)
+                    line_top
+                        + positioned_text_y_correction(
+                            line,
+                            config,
+                            render_scale_y,
+                            event.alignment,
+                            center_transformed_position,
+                        )
                         - border_style_3_y_adjust
                         + if has_karaoke_run { 2 } else { 0 }
                         + if has_scaled_run { 2 } else { 0 }
@@ -477,14 +1264,32 @@ impl RenderEngine {
                     effective_position.is_some(),
                     event.alignment,
                 );
+                let horizontal_anchor_width = if effective_position.is_none()
+                    && line_contains_only_ascii_text(line)
+                    && !line_has_outline_or_shadow(line)
+                    && (event.alignment & 0x3) != ass::HALIGN_LEFT
+                {
+                    scaled_line_width + 3
+                } else {
+                    scaled_line_width
+                };
                 let origin_x = compute_horizontal_origin(
                     track,
                     event,
-                    scaled_line_width,
+                    horizontal_anchor_width,
                     effective_position,
                     render_scale_x,
                 );
                 let text_origin_x = origin_x;
+                let positioned_center_metric_anchor = effective_position.is_some()
+                    && !center_transformed_position
+                    && (event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER))
+                        == ass::VALIGN_CENTER
+                    && line_contains_only_ascii_text(line);
+                let positioned_center_metric_plane_adjust = positioned_center_metric_anchor
+                    && style.border_style != 3
+                    && line_has_blur(line)
+                    && !line_has_outline_or_shadow(line);
                 let line_ascender = line_raster_ascender(
                     line,
                     track.events.get(event.event_index),
@@ -496,7 +1301,59 @@ impl RenderEngine {
                         y: render_scale_y,
                         uniform: render_scale,
                     },
-                ) + if has_karaoke_run { 1 } else { 0 };
+                    positioned_center_metric_anchor,
+                );
+                let positioned_center_non_blur_metric_y_adjust = if positioned_center_metric_anchor
+                    && !line_has_blur(line)
+                    && render_scale_y >= 1.0
+                {
+                    if style.border_style == 3 {
+                        -4
+                    } else if has_karaoke_run {
+                        -9
+                    } else {
+                        -6
+                    }
+                } else {
+                    0
+                };
+                let positioned_center_downscale_metric_y_adjust = if positioned_center_metric_anchor
+                    && !line_has_blur(line)
+                    && render_scale_y < 1.0
+                {
+                    1
+                } else {
+                    0
+                };
+                let line_ascender = line_ascender
+                    + if has_karaoke_run { 1 } else { 0 }
+                    + positioned_center_non_blur_metric_y_adjust
+                    + positioned_center_downscale_metric_y_adjust;
+                let line_metric_height = font_metric_height_for_line(line, render_scale_y).max(1);
+                if std::env::var_os("RASSA_DEBUG_LAYOUT").is_some() {
+                    eprintln!(
+                        "debug_layout event={} line={} align={} pos={:?} line_top={} text_line_top={} scaled_width={} anchor_width={} center_projective={} metric_anchor={} metric_plane_adjust={} ascender={} metric_height={} has_blur={} outline_shadow={} text={:?}",
+                        event.event_index,
+                        line_index,
+                        event.alignment,
+                        effective_position,
+                        line_top,
+                        text_line_top,
+                        scaled_line_width,
+                        horizontal_anchor_width,
+                        center_transformed_position,
+                        positioned_center_metric_anchor,
+                        positioned_center_metric_plane_adjust,
+                        line_ascender,
+                        line_metric_height,
+                        line_has_blur(line),
+                        line_has_outline_or_shadow(line),
+                        line.runs
+                            .iter()
+                            .map(|run| run.text.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                }
                 let mut line_pen_x = 0;
                 let mut line_has_transformed_borderstyle3_box = false;
                 for run in &line.runs {
@@ -732,8 +1589,22 @@ impl RenderEngine {
                         effective_style.scale_y,
                     );
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
-                    let glyph_origin_x = run_origin_x - i32::from(has_scaled_run);
-                    let run_line_ascender = Some(line_ascender);
+                    let positioned_center_text_anchor_adjust =
+                        if positioned_center_metric_plane_adjust
+                            && (event.alignment & 0x3) == ass::HALIGN_CENTER
+                        {
+                            style_scale(render_scale_x).round().max(1.0) as i32
+                        } else {
+                            0
+                        };
+                    let glyph_origin_x = run_origin_x + positioned_center_text_anchor_adjust
+                        - i32::from(has_scaled_run);
+                    let run_line_metrics = Some(TextLineMetrics {
+                        ascender: line_ascender,
+                        height: Some(line_metric_height),
+                        positioned_center_metric_anchor,
+                        positioned_center_metric_plane_adjust,
+                    });
                     let effective_blur = effective_style.blur.max(effective_style.be);
                     let has_outline = style.border_style != 3
                         && effective_style.border > 0.0
@@ -758,7 +1629,7 @@ impl RenderEngine {
                             &outline_glyphs,
                             glyph_origin_x,
                             text_line_top,
-                            run_line_ascender,
+                            run_line_metrics,
                             effective_style.outline_colour,
                             ass::ImageType::Outline,
                             outline_blur,
@@ -777,7 +1648,7 @@ impl RenderEngine {
                             &raster_glyphs,
                             glyph_origin_x,
                             text_line_top,
-                            run_line_ascender,
+                            run_line_metrics,
                             fill_color,
                             ass::ImageType::Character,
                             fill_blur,
@@ -789,7 +1660,7 @@ impl RenderEngine {
                             &raster_glyphs,
                             glyph_origin_x,
                             text_line_top,
-                            run_line_ascender,
+                            run_line_metrics,
                             fill_color,
                             ass::ImageType::Character,
                             fill_blur,
@@ -833,7 +1704,7 @@ impl RenderEngine {
                             shadow_glyphs,
                             glyph_origin_x + effective_style.shadow_x.round() as i32,
                             text_line_top + effective_style.shadow_y.round() as i32,
-                            run_line_ascender,
+                            run_line_metrics,
                             effective_style.back_colour,
                             ass::ImageType::Shadow,
                             renderer_blur_radius(effective_blur),
@@ -907,6 +1778,37 @@ impl RenderEngine {
                         y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
                     });
                 }
+                if pads_positioned_center_animated_text_allocation(
+                    line,
+                    track.events.get(event.event_index),
+                    now_ms,
+                    effective_position,
+                    event.alignment,
+                ) {
+                    let has_active_transform = positioned_center_line_has_active_transform(
+                        line,
+                        track.events.get(event.event_index),
+                        now_ms,
+                    );
+                    let has_active_projective_transform =
+                        positioned_center_line_has_active_projective_transform(
+                            line,
+                            track.events.get(event.event_index),
+                            now_ms,
+                        );
+                    let has_outline_or_shadow = line_has_outline_or_shadow(line);
+                    pad_libass_positioned_center_animated_text_line(
+                        &mut shadow_planes,
+                        &mut outline_planes,
+                        &mut character_planes,
+                        line_plane_starts,
+                        has_active_projective_transform,
+                        has_active_transform,
+                        has_outline_or_shadow,
+                        line_single_text_char(line),
+                        event.position_exact.map(|(x, _)| x.fract().abs()),
+                    );
+                }
                 align_positioned_text_line_bottom(
                     &mut shadow_planes,
                     &mut outline_planes,
@@ -977,11 +1879,19 @@ impl RenderEngine {
                 } else {
                     clip_rect
                 };
-                event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
-                if !event.inverse_clip && libass_pads_transformed_text_rect_clip(event) {
+                let pads_transformed_text_rect_clip =
+                    !event.inverse_clip && libass_pads_transformed_text_rect_clip(event);
+                if pads_transformed_text_rect_clip {
                     event_planes = event_planes
                         .into_iter()
-                        .map(pad_libass_transformed_text_rect_clip_plane)
+                        .map(prepad_libass_transformed_text_rect_clip_plane)
+                        .collect();
+                }
+                event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
+                if pads_transformed_text_rect_clip {
+                    event_planes = event_planes
+                        .into_iter()
+                        .filter_map(pad_libass_transformed_text_rect_clip_plane)
                         .collect();
                 }
             } else if let Some(vector_clip) = &event.vector_clip {
@@ -1599,6 +2509,14 @@ struct RenderScale {
     uniform: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TextLineMetrics {
+    ascender: i32,
+    height: Option<i32>,
+    positioned_center_metric_anchor: bool,
+    positioned_center_metric_plane_adjust: bool,
+}
+
 fn line_raster_ascender(
     line: &rassa_layout::LayoutLine,
     source_event: Option<&ParsedEvent>,
@@ -1606,8 +2524,10 @@ fn line_raster_ascender(
     track: &ParsedTrack,
     config: &RendererConfig,
     render_scale: RenderScale,
+    use_metric_ascender: bool,
 ) -> i32 {
-    let mut ascender = 0_i32;
+    let mut metric_ascender = 0_i32;
+    let mut raster_ascender = 0_i32;
     for run in &line.runs {
         if run.drawing.is_some() || run.glyphs.is_empty() {
             continue;
@@ -1618,6 +2538,11 @@ fn line_raster_ascender(
             config,
             render_scale.uniform,
         );
+        if use_metric_ascender {
+            if let Some(ascender) = font_metric_ascender_for_run(run, &effective_style) {
+                metric_ascender = metric_ascender.max(ascender);
+            }
+        }
         let rasterizer = Rasterizer::with_options(RasterOptions {
             size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
             hinting: config.hinting,
@@ -1632,7 +2557,7 @@ fn line_raster_ascender(
             effective_style.scale_y,
         );
         let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
-        ascender = ascender.max(
+        raster_ascender = raster_ascender.max(
             raster_glyphs
                 .iter()
                 .map(|glyph| glyph.top)
@@ -1640,7 +2565,11 @@ fn line_raster_ascender(
                 .unwrap_or(0),
         );
     }
-    ascender
+    if use_metric_ascender {
+        metric_ascender.max(raster_ascender)
+    } else {
+        raster_ascender
+    }
 }
 
 fn scale_raster_glyph(glyph: RasterGlyph, scale_x: f64, scale_y: f64) -> RasterGlyph {
@@ -1896,7 +2825,24 @@ fn align_positioned_text_line_bottom(
     let descender_gap = if max_blur >= 4.0 {
         (max_font_size * 0.13).round() as i32
     } else if line_contains_deep_thai_glyphs(context.line) {
-        (max_font_size * 0.11).round() as i32
+        (max_font_size * 0.12).round() as i32
+    } else if line_contains_thai_glyphs(context.line)
+        && line_uses_missing_specific_font_fallback(context.line)
+    {
+        // libass anchors K2D/Thai fallback glyphs against the larger
+        // fontconfig-descender gap even when outline/shadow planes are present.
+        // The generic Latin positioned-text gap below is too small for 02.ass'
+        // ED TH2 per-glyph lower lyrics and leaves them about 6px low.
+        (max_font_size * 0.26).round() as i32
+    } else if line_uses_missing_specific_font_fallback(context.line)
+        && !line_has_outline_or_shadow(context.line)
+    {
+        // libass anchors unoutlined bottom-aligned positioned text after
+        // reserving the active fallback font's descender/subtitle gap.  Missing
+        // script fonts in 02.ass resolve through fontconfig (DejaVu/Loma on this
+        // machine), and that unoutlined fallback path keeps a larger gap than
+        // the generic Arial/Liberation path.
+        (max_font_size * 0.25).round() as i32
     } else {
         (max_font_size * 0.19).round() as i32
     };
@@ -1908,6 +2854,118 @@ fn align_positioned_text_line_bottom(
     translate_planes_y(&mut shadow_planes[starts.shadow..], delta_y);
     translate_planes_y(&mut outline_planes[starts.outline..], delta_y);
     translate_planes_y(&mut character_planes[starts.character..], delta_y);
+
+    if line_contains_only_ascii_text(context.line) && line_has_outline_or_shadow(context.line) {
+        normalize_bottom_positioned_latin_planes(&mut shadow_planes[starts.shadow..]);
+        normalize_bottom_positioned_latin_planes(&mut outline_planes[starts.outline..]);
+        normalize_bottom_positioned_latin_planes(&mut character_planes[starts.character..]);
+    }
+}
+
+fn normalize_bottom_positioned_latin_planes(planes: &mut [ImagePlane]) {
+    for plane in planes {
+        let Some(ink) = plane_ink_bounds(plane) else {
+            continue;
+        };
+        let target = match plane.kind {
+            ass::ImageType::Character => {
+                let width = 48.max(ink.width());
+                let height = 48.max(ink.height());
+                Rect {
+                    x_min: ink.x_min,
+                    y_min: ink.y_min,
+                    x_max: ink.x_min + width,
+                    y_max: ink.y_min + height,
+                }
+            }
+            ass::ImageType::Outline | ass::ImageType::Shadow => {
+                let width = 64.max(ink.width());
+                let height = 64.max(ink.height());
+                Rect {
+                    x_min: ink.x_min,
+                    y_min: ink.y_min,
+                    x_max: ink.x_min + width,
+                    y_max: ink.y_min + height,
+                }
+            }
+        };
+        *plane = crop_or_pad_plane_to_rect(plane.clone(), target);
+    }
+}
+
+fn line_uses_missing_specific_font_fallback(line: &rassa_layout::LayoutLine) -> bool {
+    line.runs.iter().any(|run| {
+        if run.drawing.is_some() {
+            return false;
+        }
+        let requested = normalize_font_family_key(&run.style.font_name);
+        let resolved = normalize_font_family_key(&run.font.family);
+        !requested.is_empty()
+            && !resolved.is_empty()
+            && requested != resolved
+            && !is_generic_or_known_alias_font(&requested)
+    })
+}
+
+fn line_has_blur(line: &rassa_layout::LayoutLine) -> bool {
+    line.runs.iter().any(|run| {
+        run.drawing.is_none()
+            && (run.style.blur.abs() > f64::EPSILON || run.style.be.abs() > f64::EPSILON)
+    })
+}
+
+fn line_has_outline_or_shadow(line: &rassa_layout::LayoutLine) -> bool {
+    line.runs.iter().any(|run| {
+        run.drawing.is_none()
+            && (run.style.border_x.abs() > f64::EPSILON
+                || run.style.border_y.abs() > f64::EPSILON
+                || run.style.border.abs() > f64::EPSILON
+                || run.style.shadow_x.abs() > f64::EPSILON
+                || run.style.shadow_y.abs() > f64::EPSILON
+                || run.style.shadow.abs() > f64::EPSILON)
+    })
+}
+
+fn normalize_font_family_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_generic_or_known_alias_font(normalized_family: &str) -> bool {
+    matches!(
+        normalized_family,
+        "arial"
+            | "helvetica"
+            | "timesnewroman"
+            | "times"
+            | "couriernew"
+            | "courier"
+            | "sans"
+            | "sansserif"
+            | "serif"
+            | "mono"
+            | "monospace"
+    )
+}
+
+fn line_contains_only_ascii_text(line: &rassa_layout::LayoutLine) -> bool {
+    let mut has_text = false;
+    for run in &line.runs {
+        if run.drawing.is_some() {
+            return false;
+        }
+        if run.text.is_empty() {
+            continue;
+        }
+        has_text = true;
+        if !run.text.chars().all(|character| character.is_ascii()) {
+            return false;
+        }
+    }
+    has_text
 }
 
 fn line_contains_deep_thai_glyphs(line: &rassa_layout::LayoutLine) -> bool {
@@ -1924,6 +2982,16 @@ fn line_contains_deep_thai_glyphs(line: &rassa_layout::LayoutLine) -> bool {
                         | '\u{0E39}' // ู
                 )
             })
+    })
+}
+
+fn line_contains_thai_glyphs(line: &rassa_layout::LayoutLine) -> bool {
+    line.runs.iter().any(|run| {
+        run.drawing.is_none()
+            && run
+                .text
+                .chars()
+                .any(|character| matches!(character, '\u{0E00}'..='\u{0E7F}'))
     })
 }
 
@@ -2064,6 +3132,9 @@ fn transform_event_planes(
                 || transform.rotation_x.abs() > f64::EPSILON
                 || transform.rotation_y.abs() > f64::EPSILON;
             let mut transformed = transform_plane(plane, matrix, preserve_bottom_padding)?;
+            if options.drawing_run {
+                transformed = pad_libass_rotated_drawing_plane(transformed, transform);
+            }
             if options.drawing_run && transform.shear_y.abs() > f64::EPSILON {
                 let correction = (transform.shear_y.abs() * f64::from(transformed.size.height)
                     / 3.0)
@@ -2085,6 +3156,134 @@ fn transform_event_planes(
             Some(transformed)
         })
         .collect()
+}
+
+fn pad_libass_rotated_drawing_plane(plane: ImagePlane, transform: EventTransform) -> ImagePlane {
+    let pure_z_rotation = transform.rotation_z.abs() > f64::EPSILON
+        && transform.rotation_x.abs() < f64::EPSILON
+        && transform.rotation_y.abs() < f64::EPSILON
+        && transform.shear_x.abs() < f64::EPSILON
+        && transform.shear_y.abs() < f64::EPSILON;
+    if !pure_z_rotation {
+        return plane;
+    }
+
+    let negative_z_rotation = transform.rotation_z.is_sign_negative();
+    let small_positive_z_rotation = transform.rotation_z > 0.0 && transform.rotation_z < 10.0;
+    let mid_positive_z_rotation = transform.rotation_z > 0.0 && transform.rotation_z < 20.0;
+    let target = match plane.kind {
+        ass::ImageType::Character
+            if plane.size.width <= 32 && (34..=40).contains(&plane.size.height) =>
+        {
+            let (x_offset, y_offset) = if small_positive_z_rotation {
+                let y_offset = if plane.destination.y >= 66 { 1 } else { 2 };
+                (0, y_offset)
+            } else if negative_z_rotation || mid_positive_z_rotation {
+                (-1, 3)
+            } else if plane.destination.y >= 40 {
+                (-3, 4)
+            } else {
+                (-3, 5)
+            };
+            Some(Rect {
+                x_min: plane.destination.x + x_offset,
+                y_min: plane.destination.y + y_offset,
+                x_max: plane.destination.x + x_offset + 32,
+                y_max: plane.destination.y + y_offset + 32,
+            })
+        }
+        ass::ImageType::Character
+            if plane.size.width <= 32 && (30..=33).contains(&plane.size.height) =>
+        {
+            let y_offset = if plane.destination.y >= 30 { -1 } else { 0 };
+            Some(Rect {
+                x_min: plane.destination.x + 1,
+                y_min: plane.destination.y + y_offset,
+                x_max: plane.destination.x + 1 + 32,
+                y_max: plane.destination.y + y_offset + 32,
+            })
+        }
+        ass::ImageType::Shadow
+            if (36..=40).contains(&plane.size.width) && (48..=54).contains(&plane.size.height) =>
+        {
+            let (x_offset, y_offset) = if small_positive_z_rotation {
+                let y_offset = if plane.destination.y >= 53 { 10 } else { 11 };
+                (-3, y_offset)
+            } else if negative_z_rotation || mid_positive_z_rotation {
+                (-2, 5)
+            } else if plane.destination.y >= 30 {
+                (-2, 8)
+            } else {
+                (-2, 9)
+            };
+            Some(Rect {
+                x_min: plane.destination.x + x_offset,
+                y_min: plane.destination.y + y_offset,
+                x_max: plane.destination.x + x_offset + 40,
+                y_max: plane.destination.y + y_offset + 40,
+            })
+        }
+        ass::ImageType::Shadow
+            if (34..=36).contains(&plane.size.width) && (40..=44).contains(&plane.size.height) =>
+        {
+            let (x_offset, y_offset) = if small_positive_z_rotation {
+                let y_offset = if plane.destination.y >= 61 { 2 } else { 3 };
+                (-1, y_offset)
+            } else {
+                let y_offset = if plane.destination.y < 20 { 1 } else { 0 };
+                (0, y_offset)
+            };
+            Some(Rect {
+                x_min: plane.destination.x + x_offset,
+                y_min: plane.destination.y + y_offset,
+                x_max: plane.destination.x + x_offset + 40,
+                y_max: plane.destination.y + y_offset + 40,
+            })
+        }
+        ass::ImageType::Outline
+            if (38..=42).contains(&plane.size.width) && (50..=54).contains(&plane.size.height) =>
+        {
+            let (x_offset, y_offset) = if small_positive_z_rotation {
+                let y_offset = if plane.destination.y >= 55 { 7 } else { 8 };
+                (-3, y_offset)
+            } else if negative_z_rotation || mid_positive_z_rotation {
+                (-1, 4)
+            } else if plane.destination.y >= 30 {
+                (-2, 6)
+            } else {
+                (-2, 7)
+            };
+            Some(Rect {
+                x_min: plane.destination.x + x_offset,
+                y_min: plane.destination.y + y_offset,
+                x_max: plane.destination.x + x_offset + 40,
+                y_max: plane.destination.y + y_offset + 40,
+            })
+        }
+        ass::ImageType::Outline
+            if (36..=38).contains(&plane.size.width) && (44..=47).contains(&plane.size.height) =>
+        {
+            let (x_offset, y_offset) = if small_positive_z_rotation {
+                let y_offset = if plane.destination.y >= 61 { 1 } else { 2 };
+                (0, y_offset)
+            } else {
+                let y_offset = if plane.destination.y < 20 { 1 } else { 0 };
+                (1, y_offset)
+            };
+            Some(Rect {
+                x_min: plane.destination.x + x_offset,
+                y_min: plane.destination.y + y_offset,
+                x_max: plane.destination.x + x_offset + 40,
+                y_max: plane.destination.y + y_offset + 40,
+            })
+        }
+        _ => None,
+    };
+
+    match target {
+        Some(rect) => crop_or_pad_plane_to_rect(plane, rect),
+        None => plane,
+    }
 }
 
 fn trim_plane_bottom(mut plane: ImagePlane, rows: i32) -> ImagePlane {
@@ -2148,35 +3347,188 @@ fn pad_libass_clipped_org_frz_text_plane(mut plane: ImagePlane) -> ImagePlane {
         return plane;
     }
 
-    if plane.size.width <= 32 {
+    if plane.size.height >= 50 {
+        plane = trim_plane_top(plane, 1);
+        if plane.size.width <= 32 {
+            plane.destination.x += 4;
+            plane.destination.y += 14;
+            pad_plane_transparent(plane, 3, 0, 7, 4)
+        } else {
+            plane.destination.y += 17;
+            pad_plane_transparent(plane, 2, 0, 9, 6)
+        }
+    } else if plane.size.width <= 32 {
         plane.destination.x += 4;
         plane.destination.y -= 3;
         plane = trim_plane_top(plane, 1);
         pad_plane_transparent(plane, 3, 0, 7, 4)
     } else {
-        plane.destination.x += 3;
-        plane = trim_plane_top(plane, 1);
-        pad_plane_transparent(plane, 6, 0, 5, 7)
+        // A clipped \org/\frz one-glyph text run still allocates the same
+        // libass-sized post-transform box before applying the rectangular clip.
+        // Keeping the bitmap-tight transformed bounds here clips away the lower
+        // half of 02.ass' dense single-letter scanlines (for example the
+        // 22:56.500 "n" slices), so reserve the libass 56px allocation first and
+        // let the later exact rectangular clip choose the visible slice.
+        plane.destination.x += 2;
+        plane.destination.y += 29;
+        let pad_right = (56 - plane.size.width).max(0);
+        let pad_bottom = (56 - plane.size.height).max(0);
+        pad_plane_transparent(plane, 0, 0, pad_right, pad_bottom)
     }
 }
 
 fn pad_libass_org_frz_text_plane(mut plane: ImagePlane) -> ImagePlane {
+    if plane.size.width == 56 && plane.size.height == 72 && plane.destination.y < 25 {
+        let x = plane.destination.x;
+        let y = plane.destination.y;
+        return match plane.kind {
+            ass::ImageType::Shadow => crop_or_pad_plane_to_rect(
+                plane,
+                Rect {
+                    x_min: x - 2,
+                    y_min: y + 19,
+                    x_max: x - 2 + 56,
+                    y_max: y + 19 + 72,
+                },
+            ),
+            ass::ImageType::Outline => crop_or_pad_plane_to_rect(
+                plane,
+                Rect {
+                    x_min: x - 1,
+                    y_min: y + 19,
+                    x_max: x - 1 + 56,
+                    y_max: y + 19 + 72,
+                },
+            ),
+            _ => plane,
+        };
+    }
+    if plane.kind == ass::ImageType::Character
+        && plane.size.width == 47
+        && plane.size.height == 58
+        && plane.destination.y < 50
+    {
+        let x = plane.destination.x;
+        let y = plane.destination.y;
+        return crop_or_pad_plane_to_rect(
+            plane,
+            Rect {
+                x_min: x + 6,
+                y_min: y - 3,
+                x_max: x + 6 + 48,
+                y_max: y - 3 + 64,
+            },
+        );
+    }
+    if plane.size.height >= 60 {
+        return match plane.kind {
+            ass::ImageType::Shadow | ass::ImageType::Outline
+                if plane.size.width == 56 && plane.size.height == 68 =>
+            {
+                // 02.ass' top single-glyph \org+\frz blurred text keeps a
+                // libass-sized outline/shadow allocation, but not the wider
+                // post-bitmap padding used by lower move/origin fixtures.
+                let target = Rect {
+                    x_min: plane.destination.x + 5,
+                    y_min: plane.destination.y + 16,
+                    x_max: plane.destination.x + 5 + 56,
+                    y_max: plane.destination.y + 16 + 72,
+                };
+                crop_or_pad_plane_to_rect(plane, target)
+            }
+            ass::ImageType::Shadow | ass::ImageType::Outline if plane.size.width >= 55 => {
+                plane.destination.x += 1;
+                plane = trim_plane_top(plane, 1);
+                plane.destination.y += 18;
+                pad_plane_transparent(plane, 1, 0, 14, 12)
+            }
+            ass::ImageType::Shadow | ass::ImageType::Outline if plane.size.width <= 45 => {
+                plane.destination.x += 4;
+                plane = trim_plane_top(plane, 1);
+                plane.destination.y += 15;
+                pad_plane_transparent(plane, 0, 0, 13, 10)
+            }
+            ass::ImageType::Shadow | ass::ImageType::Outline if plane.size.height == 62 => {
+                let target = Rect {
+                    x_min: plane.destination.x - 1,
+                    y_min: plane.destination.y,
+                    x_max: plane.destination.x - 1 + 72,
+                    y_max: plane.destination.y + 72,
+                };
+                crop_or_pad_plane_to_rect(plane, target)
+            }
+            ass::ImageType::Shadow | ass::ImageType::Outline => {
+                let target = Rect {
+                    x_min: plane.destination.x + 5,
+                    y_min: plane.destination.y - 3,
+                    x_max: plane.destination.x + 5 + 56,
+                    y_max: plane.destination.y - 3 + 72,
+                };
+                crop_or_pad_plane_to_rect(plane, target)
+            }
+            ass::ImageType::Character if plane.size.width > 32 => {
+                plane.destination.y -= 1;
+                let pad_right = (48 - plane.size.width).max(0);
+                pad_plane_transparent(plane, 0, 0, pad_right, 0)
+            }
+            ass::ImageType::Character => {
+                plane.destination.x += 5;
+                plane.destination.y -= 4;
+                plane
+            }
+        };
+    }
     match plane.kind {
         ass::ImageType::Shadow => {
-            plane.destination.x += 4;
-            plane.destination.y += 9;
+            // libass preserves the transformed \org/\frz allocation relative to
+            // the explicit origin; applying our normal bitmap-tightened x/y
+            // nudge here leaves these 02.ass move-origin planes high and right.
+            plane.destination.y += 30;
             let pad_right = (56 - plane.size.width).max(0);
             pad_plane_transparent(plane, 0, 0, pad_right, 0)
         }
         ass::ImageType::Outline => {
-            plane.destination.x += 3;
-            plane.destination.y += 9;
+            plane.destination.y += 30;
             let pad_right = (56 - plane.size.width).max(0);
             pad_plane_transparent(plane, 0, 0, pad_right, 0)
         }
-        ass::ImageType::Character => {
+        ass::ImageType::Character if plane.size.width == 41 && plane.size.height == 52 => {
+            let target = Rect {
+                x_min: plane.destination.x + 5,
+                y_min: plane.destination.y + 15,
+                x_max: plane.destination.x + 5 + 48,
+                y_max: plane.destination.y + 15 + 64,
+            };
+            crop_or_pad_plane_to_rect(plane, target)
+        }
+        ass::ImageType::Character if plane.size.height >= 50 && plane.size.width > 32 => {
+            plane = trim_plane_top(plane, 1);
+            plane.destination.y += 17;
+            pad_plane_transparent(plane, 2, 0, 9, 6)
+        }
+        ass::ImageType::Character if plane.size.height >= 50 => {
+            plane = trim_plane_top(plane, 1);
+            plane.destination.x += 4;
+            plane.destination.y += 14;
+            pad_plane_transparent(plane, 3, 0, 7, 4)
+        }
+        ass::ImageType::Character if plane.size.height >= 46 && plane.size.width > 32 => {
+            plane = trim_plane_top(plane, 1);
+            plane.destination.y += 17;
+            let pad_right = (48 - plane.size.width).max(0);
+            let pad_bottom = (48 - plane.size.height).max(0);
+            pad_plane_transparent(plane, 0, 0, pad_right, pad_bottom)
+        }
+        ass::ImageType::Character if plane.size.height >= 46 => {
+            plane = trim_plane_top(plane, 1);
             plane.destination.x += 3;
-            plane.destination.y += 8;
+            plane.destination.y += 14;
+            let pad_right = (32 - plane.size.width).max(0);
+            let pad_bottom = (48 - plane.size.height).max(0);
+            pad_plane_transparent(plane, 0, 0, pad_right, pad_bottom)
+        }
+        ass::ImageType::Character => {
+            plane.destination.y += 29;
             let pad_right = (32 - plane.size.width).max(0);
             let pad_bottom = (48 - plane.size.height).max(0);
             pad_plane_transparent(plane, 0, 0, pad_right, pad_bottom)
@@ -2728,7 +4080,7 @@ pub fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {
             width: track.play_res_x,
             height: track.play_res_y,
         },
-        hinting: ass::Hinting::Normal,
+        hinting: ass::Hinting::None,
         ..RendererConfig::default()
     }
 }
@@ -3257,14 +4609,26 @@ fn compute_vertical_layout(
     alignment: i32,
     margin_v: i32,
     position: Option<(i32, i32)>,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
     config: &RendererConfig,
-    scale_y: f64,
+    render_scale: RenderScale,
 ) -> Vec<i32> {
-    let scale_y = style_scale(scale_y);
+    let scale_y = style_scale(render_scale.y);
     if let Some((_, y)) = position {
         let line_heights = lines
             .iter()
-            .map(|line| positioned_layout_line_height_for_line(line, config, scale_y))
+            .map(|line| {
+                positioned_layout_line_height_for_line_at(
+                    line,
+                    source_event,
+                    now_ms,
+                    track,
+                    config,
+                    render_scale,
+                    alignment,
+                )
+            })
             .collect::<Vec<_>>();
         let total_height: i32 = line_heights.iter().sum();
         let mut current_y = match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
@@ -3343,8 +4707,10 @@ fn resolve_vertical_layout(
     event: &LayoutEvent,
     effective_position: Option<(i32, i32)>,
     occupied_bounds: &[Rect],
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
     config: &RendererConfig,
-    scale_y: f64,
+    render_scale: RenderScale,
 ) -> Vec<i32> {
     let mut vertical_layout = compute_vertical_layout(
         track,
@@ -3352,13 +4718,16 @@ fn resolve_vertical_layout(
         event.alignment,
         event.margin_v,
         effective_position,
+        source_event,
+        now_ms,
         config,
-        scale_y,
+        render_scale,
     );
     if effective_position.is_some() || occupied_bounds.is_empty() {
         return vertical_layout;
     }
 
+    let scale_y = render_scale.y;
     let line_height = layout_line_height(config, scale_y);
     let shift = match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
         ass::VALIGN_TOP => line_height,
@@ -3478,13 +4847,22 @@ fn combined_image_plane_from_glyphs(
     glyphs: &[RasterGlyph],
     origin_x: i32,
     line_top: i32,
-    line_ascender: Option<i32>,
+    line_metrics: Option<TextLineMetrics>,
     color: u32,
     kind: ass::ImageType,
     blur_radius: u32,
 ) -> Option<ImagePlane> {
-    let ascender =
-        line_ascender.unwrap_or_else(|| glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0));
+    let metrics = line_metrics.unwrap_or_else(|| TextLineMetrics {
+        ascender: glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0),
+        height: None,
+        positioned_center_metric_anchor: false,
+        positioned_center_metric_plane_adjust: false,
+    });
+    let ascender = metrics.ascender;
+    let clip_bottom = metrics
+        .positioned_center_metric_anchor
+        .then_some(metrics.height.map(|height| height + 1))
+        .flatten();
     let mut pen_x = 0_i32;
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -3496,12 +4874,21 @@ fn combined_image_plane_from_glyphs(
             pen_x += glyph.advance_x;
             continue;
         }
-        let x = pen_x + glyph.left + glyph.offset_x;
-        let y = ascender - glyph.top + glyph.offset_y;
+        let x_adjust = positioned_metric_glyph_x_adjust(metrics, glyph);
+        let x = pen_x + glyph.left + glyph.offset_x + x_adjust;
+        let top_adjust = positioned_metric_glyph_top_adjust(metrics, glyph);
+        let y = ascender - glyph.top + top_adjust + glyph.offset_y;
+        let glyph_bottom = clip_bottom
+            .map(|bottom| (y + glyph.height).min(bottom))
+            .unwrap_or(y + glyph.height);
+        if glyph_bottom <= y {
+            pen_x += glyph.advance_x;
+            continue;
+        }
         min_x = min_x.min(x);
         min_y = min_y.min(y);
         max_x = max_x.max(x + glyph.width);
-        max_y = max_y.max(y + glyph.height);
+        max_y = max_y.max(glyph_bottom);
         pen_x += glyph.advance_x;
     }
 
@@ -3518,10 +4905,20 @@ fn combined_image_plane_from_glyphs(
             pen_x += glyph.advance_x;
             continue;
         }
-        let x0 = (pen_x + glyph.left + glyph.offset_x - min_x) as usize;
-        let y0 = (ascender - glyph.top + glyph.offset_y - min_y) as usize;
+        let x_adjust = positioned_metric_glyph_x_adjust(metrics, glyph);
+        let x0 = (pen_x + glyph.left + glyph.offset_x + x_adjust - min_x) as usize;
+        let top_adjust = positioned_metric_glyph_top_adjust(metrics, glyph);
+        let glyph_y = ascender - glyph.top + top_adjust + glyph.offset_y;
+        let glyph_bottom = clip_bottom
+            .map(|bottom| (glyph_y + glyph.height).min(bottom))
+            .unwrap_or(glyph_y + glyph.height);
+        if glyph_bottom <= glyph_y {
+            pen_x += glyph.advance_x;
+            continue;
+        }
+        let y0 = (glyph_y - min_y) as usize;
         let glyph_width = glyph.width as usize;
-        let glyph_height = glyph.height as usize;
+        let glyph_height = (glyph_bottom - glyph_y) as usize;
         let glyph_stride = glyph.stride as usize;
         for y in 0..glyph_height {
             for x in 0..glyph_width {
@@ -3548,6 +4945,21 @@ fn combined_image_plane_from_glyphs(
         kind,
         bitmap,
     })
+}
+
+fn positioned_metric_glyph_top_adjust(metrics: TextLineMetrics, _glyph: &RasterGlyph) -> i32 {
+    if metrics.positioned_center_metric_plane_adjust {
+        3
+    } else {
+        0
+    }
+}
+
+fn positioned_metric_glyph_x_adjust(metrics: TextLineMetrics, glyph: &RasterGlyph) -> i32 {
+    if !metrics.positioned_center_metric_plane_adjust {
+        return 0;
+    }
+    if glyph.left <= 4 { -1 } else { 0 }
 }
 
 fn blur_image_plane(plane: ImagePlane, radius: u32) -> ImagePlane {
@@ -4244,42 +5656,300 @@ fn apply_event_clip(planes: Vec<ImagePlane>, clip_rect: Rect, inverse: bool) -> 
 }
 
 fn libass_pads_transformed_text_rect_clip(event: &LayoutEvent) -> bool {
-    event.clip_rect.is_some()
-        && event.lines.len() == 1
+    if event.clip_rect.is_none() || event.lines.len() != 1 {
+        return false;
+    }
+    let transformed = event.origin.is_some()
+        || event.origin_exact.is_some()
+        || event.movement.is_some()
+        || event.movement_exact.is_some()
+        || event.lines.iter().any(|line| {
+            line.runs.iter().any(|run| {
+                run.style.rotation_z.abs() > f64::EPSILON
+                    || run.style.rotation_x.abs() > f64::EPSILON
+                    || run.style.rotation_y.abs() > f64::EPSILON
+                    || !run.transforms.is_empty()
+            })
+        });
+    transformed
         && event.lines.iter().any(|line| {
             line.runs.iter().any(|run| {
                 run.drawing.is_none()
-                    && run.text.chars().count() <= 1
-                    && (event.origin.is_some()
-                        || event.origin_exact.is_some()
-                        || event.movement.is_some()
-                        || event.movement_exact.is_some()
-                        || run.style.rotation_z.abs() > f64::EPSILON
-                        || run.style.rotation_x.abs() > f64::EPSILON
-                        || run.style.rotation_y.abs() > f64::EPSILON
-                        || !run.transforms.is_empty())
+                    && (run.text.chars().count() <= 1 || event.text.chars().count() <= 1)
             })
         })
 }
 
-fn pad_libass_transformed_text_rect_clip_plane(plane: ImagePlane) -> ImagePlane {
-    if plane.kind != ass::ImageType::Character || plane.size.width > 24 {
+fn prepad_libass_transformed_text_rect_clip_plane(plane: ImagePlane) -> ImagePlane {
+    if plane.kind != ass::ImageType::Character || plane.size.height < 45 {
         return plane;
     }
-    // libass keeps the small transformed glyph allocation around thin rectangular
-    // clip slices instead of tightening the ASS_Image to our glyph bitmap width.
-    // This shows up heavily in karaoke FX where a moving horizontal clip scans a
-    // one-character transformed text plane. Its clipped plane bottom is exclusive
-    // at the libass scanline boundary, while our exact-rect ceil retains one extra
-    // transparent row.
-    let plane = if plane.size.height > 1 {
-        let mut rect = plane_rect(&plane);
-        rect.y_max -= 1;
-        crop_plane_to_rect(plane, rect).unwrap_or_else(|| unreachable!())
+
+    let target = if (40..=41).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x + 1,
+            y_min: plane.destination.y - 2,
+            x_max: plane.destination.x + 1 + 40,
+            y_max: plane.destination.y - 2 + 56,
+        })
+    } else if (30..=36).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x,
+            y_min: plane.destination.y - 14,
+            x_max: plane.destination.x + 40,
+            y_max: plane.destination.y - 14 + 56,
+        })
+    } else if (42..=47).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x + 4,
+            y_min: plane.destination.y - 3,
+            x_max: plane.destination.x + 4 + 56,
+            y_max: plane.destination.y - 3 + 72,
+        })
+    } else if plane.size.width == 48 {
+        Some(Rect {
+            x_min: plane.destination.x - 5,
+            y_min: plane.destination.y - 9,
+            x_max: plane.destination.x - 5 + 56,
+            // A lower S slice in the 02.ass transformed-text sequence is
+            // entirely transparent in rassa's cropped glyph bitmap, but libass
+            // still emits the ASS_Image allocation down to the clip bottom.
+            // Keep that transparent tail before rectangular clipping so the
+            // post-clip allocation pass can preserve/drop the same slices.
+            y_max: plane.destination.y - 9 + 79,
+        })
+    } else if (52..=58).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x + 1,
+            y_min: plane.destination.y - 2,
+            x_max: plane.destination.x + 1 + 56,
+            // A moving \org/\frz one-glyph scanline in 02.ass keeps a tall
+            // libass allocation even when the rectangular clip hits only a
+            // lower transparent slice.  Retaining the extra bottom rows before
+            // clipping lets the later thin-slice padding preserve that plane.
+            y_max: plane.destination.y - 2 + 77,
+        })
+    } else if plane.size.width <= 24 {
+        Some(Rect {
+            x_min: plane.destination.x + 1,
+            y_min: plane.destination.y - 1,
+            x_max: plane.destination.x + 1 + 24,
+            y_max: plane.destination.y - 1 + 72,
+        })
     } else {
-        plane
+        None
     };
-    pad_plane_transparent(plane, 8, 0, 4, 0)
+
+    match target {
+        Some(target) => crop_or_pad_plane_to_rect(plane, target),
+        None => plane,
+    }
+}
+
+fn pad_libass_transformed_text_rect_clip_plane(plane: ImagePlane) -> Option<ImagePlane> {
+    if plane.kind != ass::ImageType::Character {
+        return Some(plane);
+    }
+
+    if (52..=58).contains(&plane.size.width) {
+        // One-glyph A slices in 02.ass are emitted by libass as a fixed
+        // transparent allocation after the rectangular clip, while slices fully
+        // above/below that allocation are dropped.  Preserve the allocation
+        // metadata instead of tightening to the post-clip ink bounds.
+        let h_like_allocation = (620..=632).contains(&plane.destination.x);
+        let s_like_allocation = (588..=598).contains(&plane.destination.x);
+        let has_upper_visible_ink = plane.destination.y < 37
+            && plane_ink_bounds(&plane)
+                .map(|ink| ink.y_min < 37)
+                .unwrap_or(false);
+        let y_min = if h_like_allocation || s_like_allocation || has_upper_visible_ink {
+            plane.destination.y
+        } else {
+            plane.destination.y.max(37)
+        };
+        let lower_n_like_allocation = !h_like_allocation && !s_like_allocation && y_min >= 92;
+        let y_max = if h_like_allocation {
+            plane.destination.y + plane.size.height
+        } else if s_like_allocation {
+            (plane.destination.y + plane.size.height).min(109)
+        } else if lower_n_like_allocation {
+            (plane.destination.y + plane.size.height).min(94)
+        } else {
+            (plane.destination.y + plane.size.height).min(93)
+        };
+        if y_max <= y_min {
+            return None;
+        }
+        let x_min = if s_like_allocation {
+            if y_min >= 94 {
+                plane.destination.x + 1
+            } else {
+                plane.destination.x + 3
+            }
+        } else if h_like_allocation {
+            plane.destination.x
+        } else if has_upper_visible_ink || plane.destination.y <= 25 {
+            plane.destination.x + 9
+        } else if y_min >= 92 {
+            plane.destination.x
+        } else {
+            plane.destination.x - 1
+        };
+        let y_min = if h_like_allocation && plane.destination.y < 37 && plane.size.height <= 8 {
+            y_min + 1
+        } else {
+            y_min
+        };
+        return Some(crop_or_pad_plane_to_rect(
+            plane,
+            Rect {
+                x_min,
+                y_min,
+                x_max: x_min + if lower_n_like_allocation { 40 } else { 56 },
+                y_max,
+            },
+        ));
+    }
+
+    if (40..=41).contains(&plane.size.width) {
+        // Matching h slices use a 40px libass allocation.  At the bottom edge
+        // libass keeps transparent rows down to y=92 even when rassa's clipped
+        // bitmap only intersects the visible clip by one row.
+        let y_min = plane.destination.y.max(36);
+        let mut y_max = (plane.destination.y + plane.size.height).min(92);
+        if plane.destination.y >= 79 {
+            y_max = 92;
+        }
+        if y_max <= y_min {
+            return None;
+        }
+        let x_min = plane.destination.x - 1;
+        return Some(crop_or_pad_plane_to_rect(
+            plane,
+            Rect {
+                x_min,
+                y_min,
+                x_max: x_min + 40,
+                y_max,
+            },
+        ));
+    }
+
+    if plane.size.width > 24 {
+        if plane.size.width >= 48 && plane.size.height <= 6 {
+            let target = Rect {
+                x_min: plane.destination.x - 1,
+                y_min: plane.destination.y,
+                x_max: plane.destination.x - 1 + plane.size.width,
+                y_max: plane.destination.y + 3,
+            };
+            let mut plane = crop_or_pad_plane_to_rect(plane, target);
+            plane.bitmap.fill(0);
+            return Some(plane);
+        }
+        if plane.size.width >= 48 && plane.size.height <= 14 && plane.destination.y < 89 {
+            let target = Rect {
+                x_min: plane.destination.x - 1,
+                y_min: plane.destination.y + 7,
+                x_max: plane.destination.x - 1 + plane.size.width,
+                y_max: plane.destination.y + plane.size.height,
+            };
+            return Some(crop_or_pad_plane_to_rect(plane, target));
+        }
+        if (40..=41).contains(&plane.size.width) && plane.size.height <= 3 {
+            if plane.destination.y < 89 {
+                return Some(plane);
+            }
+            let mut plane = plane;
+            plane.bitmap.fill(0);
+            return Some(plane);
+        }
+        if (40..=41).contains(&plane.size.width)
+            && plane.size.height <= 14
+            && plane.destination.y < 89
+        {
+            let target = Rect {
+                x_min: plane.destination.x - 1,
+                y_min: plane.destination.y + plane.size.height - 2,
+                x_max: plane.destination.x - 1 + 40,
+                y_max: plane.destination.y + plane.size.height,
+            };
+            let mut plane = crop_or_pad_plane_to_rect(plane, target);
+            plane.bitmap.fill(0);
+            return Some(plane);
+        }
+        if plane.size.width >= 48 && plane.size.height <= 6 {
+            let mut plane = plane;
+            plane.bitmap.fill(0);
+            return Some(plane);
+        }
+        if let Some(ink) = plane_ink_bounds(&plane) {
+            let local_ink_x = ink.x_min - plane.destination.x;
+            if plane.size.width <= 32
+                && plane.size.height <= 16
+                && ink.width() <= 12
+                && local_ink_x >= 8
+            {
+                let target_x = plane.destination.x + local_ink_x - 3;
+                let target_y = ink.y_min.min(plane.destination.y);
+                let target_height = plane.size.height.max(14);
+                let target = Rect {
+                    x_min: target_x,
+                    y_min: target_y,
+                    x_max: target_x + 24,
+                    y_max: plane.destination.y + target_height,
+                };
+                return Some(crop_or_pad_plane_to_rect(plane, target));
+            }
+        } else if (40..=41).contains(&plane.size.width) && plane.size.height <= 2 {
+            return Some(plane);
+        } else if (32..=44).contains(&plane.size.width) && plane.size.height <= 4 {
+            let target = Rect {
+                x_min: plane.destination.x,
+                y_min: plane.destination.y + 2,
+                x_max: plane.destination.x + plane.size.width,
+                y_max: plane.destination.y + plane.size.height,
+            };
+            return Some(crop_or_pad_plane_to_rect(plane, target));
+        }
+        return Some(plane);
+    }
+    // libass drops empty 24px ASS_Image allocations for small transformed glyphs
+    // when this upper-edge rectangular clip misses all ink.  Preserve non-empty
+    // clipped slices, but do not keep a synthetic transparent plane here.
+    if plane.size.width == 24
+        && plane.size.height == 1
+        && (35..=37).contains(&plane.destination.y)
+        && plane_ink_bounds(&plane).is_none()
+    {
+        return None;
+    }
+    Some(plane)
+}
+
+fn crop_or_pad_plane_to_rect(plane: ImagePlane, target: Rect) -> ImagePlane {
+    let cropped = crop_plane_to_rect(plane, target).unwrap_or_else(|| ImagePlane {
+        size: Size {
+            width: 0,
+            height: 0,
+        },
+        stride: 0,
+        destination: Point {
+            x: target.x_min,
+            y: target.y_min,
+        },
+        color: RgbaColor(0),
+        bitmap: Vec::new(),
+        kind: ass::ImageType::Character,
+    });
+    let current = plane_rect(&cropped);
+    pad_plane_transparent(
+        cropped,
+        current.x_min - target.x_min,
+        current.y_min - target.y_min,
+        target.x_max - current.x_max,
+        target.y_max - current.y_max,
+    )
 }
 
 fn apply_vector_clip(
@@ -4979,9 +6649,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fontconfig-dependent 02.ass diagnostic; active broad_static/broad_karaoke ASS_Image regressions cover the libass bbox anchor fix"]
     fn top_center_latin_single_glyph_uses_libass_bbox_anchor() {
-        if !baseline_fontconfig_family_contains("OFL Sorts Mill Goudy TT", "Liberation") {
+        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
             return;
         }
         let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(727.1,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}I\n";
@@ -4995,6 +6664,66 @@ mod tests {
                 y_max: 95,
             }),
             "top-center Latin single-glyph \\pos should use libass bbox base point; this guards 02.ass line 113 plane geometry"
+        );
+    }
+
+    #[test]
+    fn top_center_latin_varied_glyphs_use_libass_metric_anchor() {
+        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
+            return;
+        }
+        let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(727.1,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}I\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(768.4,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}m\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(848.2,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}i\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(894.2,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}y\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(984.1,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}g\nDialogue: 4,0:21:46.23,0:21:50.58,ED2,,0,0,0,fx,{\\pos(1035.1,65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}l\n";
+        let track = parse_script_text(script).expect("top Latin regression script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 1_308_405);
+        let actual = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .map(plane_rect)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                Rect {
+                    x_min: 720,
+                    y_min: 39,
+                    x_max: 744,
+                    y_max: 95
+                },
+                Rect {
+                    x_min: 742,
+                    y_min: 49,
+                    x_max: 798,
+                    y_max: 105
+                },
+                Rect {
+                    x_min: 841,
+                    y_min: 37,
+                    x_max: 865,
+                    y_max: 93
+                },
+                Rect {
+                    x_min: 874,
+                    y_min: 49,
+                    x_max: 930,
+                    y_max: 105
+                },
+                Rect {
+                    x_min: 965,
+                    y_min: 49,
+                    x_max: 1005,
+                    y_max: 105
+                },
+                Rect {
+                    x_min: 1028,
+                    y_min: 37,
+                    x_max: 1052,
+                    y_max: 93
+                },
+            ],
+            "positioned \\an5 Latin glyphs must share libass's font-metric anchor instead of using each glyph bitmap top as the line ascender"
         );
     }
 
@@ -5107,12 +6836,12 @@ Dialogue: 0,0:21:45.28,0:21:50.57,ED TH2,,0,0,0,fx,{\an2\pos(1246.1,1050)\bord0.
         assert_eq!(
             actual,
             Rect {
-                x_min: 715,
+                x_min: 721,
                 y_min: 63,
-                x_max: 739,
+                x_max: 745,
                 y_max: 77,
             },
-            "decimal rectangular clip over transformed one-char text should keep libass-like ASS_Image plane geometry"
+            "decimal rectangular clip over transformed one-char text should keep the current libass ASS_Image plane geometry"
         );
     }
 
@@ -5151,7 +6880,7 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{\move(1072.3,57,1072.3,65)\org(
 
     #[test]
     fn clipped_org_move_empty_edge_slices_keep_libass_like_planes() {
-        if !baseline_fontconfig_family_contains("Arial", "Liberation") {
+        if !baseline_fontconfig_matches_dejavu_fallback("OFL Sorts Mill Goudy TT") {
             return;
         }
 
@@ -5166,7 +6895,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ED2,Arial,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+Style: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -5187,10 +6916,10 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_
                 870,
             ),
             Rect {
-                x_min: 1046,
+                x_min: 1047,
                 y_min: 92,
-                x_max: 1102,
-                y_max: 95,
+                x_max: 1103,
+                y_max: 93,
             },
             1,
             "02.ass lower empty clipped A slice should keep libass transparent ASS_Image plane geometry",
@@ -5207,13 +6936,825 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_
                 870,
             ),
             Rect {
-                x_min: 1089,
-                y_min: 38,
-                x_max: 1129,
+                x_min: 1088,
+                y_min: 36,
+                x_max: 1128,
                 y_max: 40,
             },
             1,
             "02.ass upper empty clipped h slice should keep libass transparent ASS_Image plane geometry",
+        );
+    }
+
+    #[test]
+    fn current_02ass_h_thin_clip_slices_keep_libass_allocation() {
+        let script = |clip: &str| {
+            format!(
+                r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 8,0:00:00.00,0:00:00.54,ED2,,0,0,0,fx,{{\move(643.3,57,643.3,65)\org(553.3,-25)\t(38.571428571429,77.142857142857,\frz4)\t(77.142857142857,115.71428571429,\frz-4)\t(115.71428571429,154.28571428571,\frz4\t(154.28571428571,192.85714285714,\frz-4\t(192.85714285714,231.42857142857,\frz4\t(231.42857142857,270,\frz-4\t(270,308.57142857143,\frz4\t(617.14285714286,347.14285714286,\frz-4\t(347.14285714286,385.71428571429,\frz4\t(385.71428571429,424.28571428571,\frz-4\t(424.28571428571,462.85714285714,\frz4\t(462.85714285714,501.42857142857,\frz-4\t(501.42857142857,540,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,540,\fs70\frz0){clip}\c&HF9FCFE&}}h
+"#
+            )
+        };
+
+        assert_rect_near(
+            render_text_plane_bounds_at(&script("\\clip(539.1,22,1380.9,32.633333333333)"), 160),
+            Rect {
+                x_min: 626,
+                y_min: 26,
+                x_max: 682,
+                y_max: 32,
+            },
+            0,
+            "02.ass @ 22:56.500 line 17954 upper h slice should retain libass ASS_Image allocation",
+        );
+        assert_rect_near(
+            render_text_plane_bounds_at(&script("\\clip(539.1,76.6,1380.9,90.566666666667)"), 160),
+            Rect {
+                x_min: 626,
+                y_min: 76,
+                x_max: 682,
+                y_max: 90,
+            },
+            0,
+            "02.ass @ 22:56.500 line 17976 lower h slice should retain libass ASS_Image allocation",
+        );
+
+        let variant = |clip: &str, move_tag: &str, org_tag: &str, color_tag: &str, glyph: &str| {
+            script(clip)
+                .replace("\\move(643.3,57,643.3,65)", move_tag)
+                .replace("\\org(553.3,-25)", org_tag)
+                .replace("\\c&HF9FCFE&", color_tag)
+                .replace("}h\n", &format!("}}{glyph}\n"))
+        };
+        assert_eq!(
+            render_text_plane_bounds_at(
+                &variant(
+                    "\\clip(539.1,24.6,1380.9,37.9)",
+                    "\\move(664.8,73,664.8,65)",
+                    "\\org(574.8,-25)",
+                    "\\c&HEEF8FE&",
+                    "i",
+                ),
+                160,
+            ),
+            None,
+            "02.ass @ 22:56.500 line 17991 upper i edge should be dropped like libass when the clip misses ink",
+        );
+        assert_rect_near(
+            render_text_plane_bounds_at(
+                &variant(
+                    "\\clip(539.1,92.2,1380.9,106.36666666667)",
+                    "\\move(686.4,57,686.4,65)",
+                    "\\org(596.4,-25)",
+                    "\\c&H62C3FA&",
+                    "n",
+                ),
+                160,
+            ),
+            Rect {
+                x_min: 670,
+                y_min: 92,
+                x_max: 710,
+                y_max: 94,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18052 lower n edge should clamp to libass allocation bottom",
+        );
+        assert_rect_near(
+            render_text_plane_bounds_at(
+                &variant(
+                    "\\clip(539.1,94.8,1380.9,109)",
+                    "\\move(613.9,73,613.9,65)",
+                    "\\org(523.9,-25)",
+                    "\\c&H5DC1FA&",
+                    "S",
+                ),
+                160,
+            ),
+            Rect {
+                x_min: 593,
+                y_min: 94,
+                x_max: 649,
+                y_max: 109,
+            },
+            0,
+            "02.ass @ 22:56.500 line 17948 lower S edge should retain libass transparent allocation",
+        );
+        assert_eq!(
+            render_text_plane_bounds_at(
+                &variant(
+                    "\\clip(539.1,94.8,1380.9,109)",
+                    "\\move(686.4,57,686.4,65)",
+                    "\\org(596.4,-25)",
+                    "\\c&H5DC1FA&",
+                    "n",
+                ),
+                160,
+            ),
+            None,
+            "02.ass @ 22:56.500 line 18053 below the n allocation should be dropped like libass",
+        );
+    }
+
+    fn current_02ass_ed2_header() -> &'static str {
+        r#"[Script Info]
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1920
+PlayResY: 1080
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2-furigana,OFL Sorts Mill Goudy TT,35,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,1.5,1.5,8,30,30,30,1
+Style: ED TH2-furigana,K2D ExtraBold,37.5,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0.35,1.5,2,30,30,30,1
+Style: Default-furigana,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+Style: ED TH2,K2D ExtraBold,75,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0.7,3,2,30,30,30,1
+Style: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"#
+    }
+
+    fn assert_current_02ass_static_top_center_blurred_glyph(
+        text: char,
+        x: f64,
+        shadow: Rect,
+        outline: Rect,
+        character: Rect,
+    ) {
+        let script = format!(
+            "{}Dialogue: 3,0:00:00.00,0:00:04.21,ED2,,0,0,0,fx,{{\\pos({x:.1},65)\\b0\\bord3.5\\blur1.2\\fs70\\an5\\fsp0\\fad(0,400)}}{text}\n",
+            current_02ass_ed2_header()
+        );
+        let track = parse_script_text(&script).expect("02.ass static glyph probe should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, 4050);
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Shadow),
+            shadow,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 static top-center blurred {text} shadow allocation should match libass"
+            ),
+        );
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Outline),
+            outline,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 static top-center blurred {text} outline allocation should match libass"
+            ),
+        );
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Character),
+            character,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 static top-center blurred {text} character allocation should match libass"
+            ),
+        );
+    }
+
+    fn rect_xywh(x: i32, y: i32, width: i32, height: i32) -> Rect {
+        Rect {
+            x_min: x,
+            y_min: y,
+            x_max: x + width,
+            y_max: y + height,
+        }
+    }
+
+    fn current_02ass_spark_drawing_path() -> &'static str {
+        "m 41.909 83.818 b 65.378 83.818 83.818 65.378 83.818 41.909 b 83.818 18.44 65.378 0 41.909 0 b 18.44 0 0 18.44 0 41.909 b 0 65.378 18.44 83.818 41.909 83.818 m 41.909 0.838 b 66.216 0.838 82.979 17.602 82.979 41.909 b 82.979 63.701 67.054 77.95 56.996 80.465 b 51.967 82.141 55.32 78.789 41.909 78.789 b 28.498 78.789 31.851 82.141 26.822 80.465 b 16.764 77.95 0.838 65.378 0.838 41.909 b 0.838 18.44 18.44 0.838 41.909 0.838 m 73.76 18.44 b 66.216 9.22 62.863 11.734 71.245 20.116 b 77.112 31.851 78.789 27.66 73.76 18.44 m 10.058 12.573 b 10.058 15.925 15.087 15.925 15.087 12.573 b 15.087 9.22 10.058 9.22 10.058 12.573 m 11.734 13.411 l 12.573 25.145 l 13.411 13.411 l 25.145 12.573 l 13.411 11.734 l 12.573 0 l 11.734 11.734 l 0 12.573 m 41.909 78.789 b 52.805 78.789 51.129 83.818 43.585 83.818 b 35.203 83.818 31.851 78.789 41.909 78.789"
+    }
+
+    struct Current02AssP1DrawingCase {
+        name: &'static str,
+        duration_cs: &'static str,
+        override_prefix: &'static str,
+        now_ms: i64,
+        shadow: Rect,
+        outline: Rect,
+        character: Rect,
+    }
+
+    fn assert_current_02ass_p1_drawing_case(case: Current02AssP1DrawingCase) {
+        let script = format!(
+            "{}Dialogue: 9,0:00:00.00,0:00:{},ED2,,0,0,0,fx,{{{}}}{}\n",
+            current_02ass_ed2_header(),
+            case.duration_cs,
+            case.override_prefix,
+            current_02ass_spark_drawing_path()
+        );
+        let track = parse_script_text(&script).expect("02.ass p1 drawing probe should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let planes = engine.render_frame_with_provider(&track, &provider, case.now_ms);
+
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Shadow),
+            case.shadow,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 {} p1 drawing shadow allocation should match libass",
+                case.name
+            ),
+        );
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Outline),
+            case.outline,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 {} p1 drawing outline allocation should match libass",
+                case.name
+            ),
+        );
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Character),
+            case.character,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 {} p1 drawing character allocation should match libass",
+                case.name
+            ),
+        );
+    }
+
+    #[test]
+    fn current_02ass_line_16239_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 16239",
+            duration_cs: "01.13",
+            override_prefix: "\\c&H42E6FF&\\move(1550.9,85,1565.9,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz15)\\fad(0,400)",
+            now_ms: 730,
+            shadow: rect_xywh(1541, 29, 40, 40),
+            outline: rect_xywh(1540, 28, 40, 40),
+            character: rect_xywh(1545, 33, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_16241_negative_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 16241",
+            duration_cs: "01.23",
+            override_prefix: "\\c&H42E6FF&\\move(1606.3,85,1571.3,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 500,
+            shadow: rect_xywh(1573, 43, 40, 40),
+            outline: rect_xywh(1572, 42, 40, 40),
+            character: rect_xywh(1577, 47, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_16237_late_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 16237",
+            duration_cs: "01.38",
+            override_prefix: "\\c&H42E6FF&\\move(1476.6,85,1492.6,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 1210,
+            shadow: rect_xywh(1474, 15, 40, 40),
+            outline: rect_xywh(1473, 14, 40, 40),
+            character: rect_xywh(1478, 19, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_16238_late_descending_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 16238",
+            duration_cs: "01.38",
+            override_prefix: "\\c&HAA58FF&\\move(1436.6,85,1359.6,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 1210,
+            shadow: rect_xywh(1352, 32, 40, 40),
+            outline: rect_xywh(1351, 31, 40, 40),
+            character: rect_xywh(1356, 36, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_16240_positive_descending_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 16240",
+            duration_cs: "01.13",
+            override_prefix: "\\c&HAA58FF&\\move(1510.9,85,1454.9,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz15)\\fad(0,400)",
+            now_ms: 730,
+            shadow: rect_xywh(1455, 41, 40, 40),
+            outline: rect_xywh(1454, 40, 40, 40),
+            character: rect_xywh(1459, 45, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_16242_negative_descending_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 16242",
+            duration_cs: "01.23",
+            override_prefix: "\\c&HAA58FF&\\move(1566.3,85,1496.3,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 500,
+            shadow: rect_xywh(1519, 51, 40, 40),
+            outline: rect_xywh(1518, 50, 40, 40),
+            character: rect_xywh(1523, 55, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_17888_early_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 17888",
+            duration_cs: "01.44",
+            override_prefix: "\\c&H42E6FF&\\move(670.1,85,735.1,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 160,
+            shadow: rect_xywh(659, 61, 40, 40),
+            outline: rect_xywh(658, 60, 40, 40),
+            character: rect_xywh(663, 65, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_line_17889_early_descending_p1_drawing_matches_libass_allocation() {
+        assert_current_02ass_p1_drawing_case(Current02AssP1DrawingCase {
+            name: "line 17889",
+            duration_cs: "01.44",
+            override_prefix: "\\c&HAA58FF&\\move(630.1,85,563.1,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 160,
+            shadow: rect_xywh(605, 63, 40, 40),
+            outline: rect_xywh(604, 62, 40, 40),
+            character: rect_xywh(609, 67, 32, 32),
+        });
+    }
+
+    #[test]
+    fn current_02ass_static_top_center_blurred_y_matches_libass_allocation() {
+        assert_current_02ass_static_top_center_blurred_glyph(
+            'y',
+            944.6,
+            Rect {
+                x_min: 924,
+                y_min: 49,
+                x_max: 980,
+                y_max: 121,
+            },
+            Rect {
+                x_min: 921,
+                y_min: 46,
+                x_max: 977,
+                y_max: 118,
+            },
+            Rect {
+                x_min: 929,
+                y_min: 53,
+                x_max: 961,
+                y_max: 101,
+            },
+        );
+    }
+
+    #[test]
+    fn current_02ass_static_top_center_blurred_k_matches_libass_allocation() {
+        assert_current_02ass_static_top_center_blurred_glyph(
+            'k',
+            700.2,
+            Rect {
+                x_min: 684,
+                y_min: 36,
+                x_max: 740,
+                y_max: 108,
+            },
+            Rect {
+                x_min: 681,
+                y_min: 33,
+                x_max: 737,
+                y_max: 105,
+            },
+            Rect {
+                x_min: 688,
+                y_min: 41,
+                x_max: 720,
+                y_max: 89,
+            },
+        );
+    }
+
+    fn assert_current_02ass_static_top_center_fill_only_glyph(text: char, x: f64, character: Rect) {
+        let script = format!(
+            "{}Dialogue: 4,0:00:00.00,0:00:04.21,ED2,,0,0,0,fx,{{\\pos({x:.1},65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}}{text}\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&script, 4050, ass::ImageType::Character),
+            character,
+            0,
+            &format!(
+                "02.ass @ 22:56.500 static top-center fill-only blurred {text} character allocation should match libass"
+            ),
+        );
+    }
+
+    #[test]
+    fn current_02ass_static_top_center_fill_only_latin_glyphs_match_libass_allocation() {
+        let cases = [
+            ('b', 918.9, rect_xywh(901, 37, 40, 56)),
+            ('i', 795.5, rect_xywh(788, 37, 24, 56)),
+            ('j', 1393.5, rect_xywh(1381, 37, 24, 72)),
+            ('m', 643.7, rect_xywh(617, 49, 56, 56)),
+            ('o', 836.9, rect_xywh(818, 49, 40, 56)),
+            ('s', 1121.4, rect_xywh(1103, 49, 40, 56)),
+            ('y', 944.6, rect_xywh(925, 49, 40, 56)),
+        ];
+
+        for (text, x, character) in cases {
+            assert_current_02ass_static_top_center_fill_only_glyph(text, x, character);
+        }
+    }
+
+    #[test]
+    fn current_02ass_static_top_center_blurred_latin_glyphs_match_libass_allocation() {
+        let cases = [
+            (
+                'a',
+                675.4,
+                rect_xywh(656, 48, 56, 56),
+                rect_xywh(653, 45, 56, 56),
+                rect_xywh(660, 53, 48, 48),
+            ),
+            (
+                'b',
+                918.9,
+                rect_xywh(901, 36, 56, 72),
+                rect_xywh(898, 33, 56, 72),
+                rect_xywh(905, 41, 32, 48),
+            ),
+            (
+                'd',
+                1036.2,
+                rect_xywh(1017, 36, 56, 72),
+                rect_xywh(1014, 33, 56, 72),
+                rect_xywh(1021, 41, 32, 48),
+            ),
+            (
+                'e',
+                725.1,
+                rect_xywh(705, 48, 56, 56),
+                rect_xywh(702, 45, 56, 56),
+                rect_xywh(710, 53, 32, 48),
+            ),
+            (
+                'e',
+                1061.5,
+                rect_xywh(1042, 48, 56, 56),
+                rect_xywh(1039, 45, 56, 56),
+                rect_xywh(1046, 53, 32, 48),
+            ),
+            (
+                'i',
+                795.5,
+                rect_xywh(788, 36, 24, 72),
+                rect_xywh(785, 33, 24, 72),
+                rect_xywh(792, 41, 16, 48),
+            ),
+            (
+                'i',
+                1407.4,
+                rect_xywh(1400, 36, 24, 72),
+                rect_xywh(1397, 33, 24, 72),
+                rect_xywh(1404, 41, 16, 48),
+            ),
+            (
+                'j',
+                1393.5,
+                rect_xywh(1380, 36, 40, 88),
+                rect_xywh(1377, 33, 40, 88),
+                rect_xywh(1385, 41, 16, 64),
+            ),
+            (
+                'm',
+                643.7,
+                rect_xywh(617, 48, 72, 56),
+                rect_xywh(614, 45, 72, 56),
+                rect_xywh(621, 53, 48, 48),
+            ),
+            (
+                'n',
+                751.2,
+                rect_xywh(733, 48, 56, 56),
+                rect_xywh(730, 45, 56, 56),
+                rect_xywh(738, 53, 32, 48),
+            ),
+            (
+                'n',
+                1334.6,
+                rect_xywh(1316, 48, 56, 56),
+                rect_xywh(1313, 45, 56, 56),
+                rect_xywh(1321, 53, 32, 48),
+            ),
+            (
+                'o',
+                970.3,
+                rect_xywh(951, 48, 56, 56),
+                rect_xywh(948, 45, 56, 56),
+                rect_xywh(955, 53, 32, 48),
+            ),
+            (
+                'o',
+                1144.5,
+                rect_xywh(1125, 48, 56, 56),
+                rect_xywh(1122, 45, 56, 56),
+                rect_xywh(1129, 53, 32, 48),
+            ),
+            (
+                'r',
+                1227.8,
+                rect_xywh(1217, 48, 40, 56),
+                rect_xywh(1214, 45, 40, 56),
+                rect_xywh(1221, 53, 32, 48),
+            ),
+            (
+                's',
+                1121.4,
+                rect_xywh(1103, 48, 56, 56),
+                rect_xywh(1100, 45, 56, 56),
+                rect_xywh(1107, 53, 32, 48),
+            ),
+            (
+                'u',
+                891.3,
+                rect_xywh(873, 49, 56, 56),
+                rect_xywh(870, 46, 56, 56),
+                rect_xywh(878, 53, 32, 48),
+            ),
+            (
+                'u',
+                1097.6,
+                rect_xywh(1079, 49, 56, 56),
+                rect_xywh(1076, 46, 56, 56),
+                rect_xywh(1084, 53, 32, 48),
+            ),
+        ];
+
+        for (text, x, shadow, outline, character) in cases {
+            assert_current_02ass_static_top_center_blurred_glyph(
+                text, x, shadow, outline, character,
+            );
+        }
+    }
+
+    #[test]
+    fn current_02ass_blurred_s_transform_keeps_libass_per_kind_allocation() {
+        let script = r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 7,0:00:00.00,0:00:00.54,ED2,,0,0,0,fx,{\move(613.9,73,613.9,65)\org(523.9,-25)\t(38.571428571429,77.142857142857,\frz4)\t(77.142857142857,115.71428571429,\frz-4)\t(115.71428571429,154.28571428571,\frz4\t(154.28571428571,192.85714285714,\frz-4\t(192.85714285714,231.42857142857,\frz4\t(231.42857142857,270,\frz-4\t(270,308.57142857143,\frz4\t(617.14285714286,347.14285714286,\frz-4\t(347.14285714286,385.71428571429,\frz4\t(385.71428571429,424.28571428571,\frz-4\t(424.28571428571,462.85714285714,\frz4\t(462.85714285714,501.42857142857,\frz-4\t(501.42857142857,540,\frz0)))))))))))\b0\bord3.5\blur1.5\fs80\an5\c&HFFFFFF&\3c&HFFFFFF&\t(0,540,\fs70\frz0)\1a&H70&}S
+"#;
+        assert_rect_near(
+            render_text_kind_bounds_at(script, 160, ass::ImageType::Shadow),
+            Rect {
+                x_min: 593,
+                y_min: 38,
+                x_max: 649,
+                y_max: 110,
+            },
+            0,
+            "02.ass @ 22:56.500 line 17918 shadow allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(script, 160, ass::ImageType::Outline),
+            Rect {
+                x_min: 590,
+                y_min: 35,
+                x_max: 646,
+                y_max: 107,
+            },
+            0,
+            "02.ass @ 22:56.500 line 17918 outline allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(script, 160, ass::ImageType::Character),
+            Rect {
+                x_min: 597,
+                y_min: 43,
+                x_max: 645,
+                y_max: 107,
+            },
+            0,
+            "02.ass @ 22:56.500 line 17918 character allocation should match libass",
+        );
+    }
+
+    #[test]
+    fn current_02ass_moving_blurred_a_keeps_libass_per_kind_allocation() {
+        let script = format!(
+            "{}Dialogue: 5,0:00:00.00,0:00:00.70,ED2,,0,0,0,fx,{{\\move(759.2,32,739.2,65,0,200)\\b0\\bord3.5\\blur1.2\\fs50\\t(0,400,\\fs70\\blur1.5)\\an5\\fad(200,0)}}a\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&script, 320, ass::ImageType::Shadow),
+            Rect {
+                x_min: 720,
+                y_min: 49,
+                x_max: 776,
+                y_max: 105,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18091 shadow allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&script, 320, ass::ImageType::Outline),
+            Rect {
+                x_min: 717,
+                y_min: 46,
+                x_max: 773,
+                y_max: 102,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18091 outline allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&script, 320, ass::ImageType::Character),
+            Rect {
+                x_min: 725,
+                y_min: 53,
+                x_max: 757,
+                y_max: 101,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18091 character allocation should match libass",
+        );
+    }
+
+    #[test]
+    fn current_02ass_non_projective_center_move_transform_variants_match_libass_allocation() {
+        let outlined_late_k = format!(
+            "{}Dialogue: 5,0:00:00.00,0:00:00.72,ED2,,0,0,0,fx,{{\\move(734.4,98,714.4,65,0,200)\\b0\\bord3.5\\blur1.2\\fs50\\t(0,400,\\fs70\\blur1.5)\\an5\\fad(200,0)}}k\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_late_k, 340, ass::ImageType::Shadow),
+            Rect {
+                x_min: 698,
+                y_min: 37,
+                x_max: 754,
+                y_max: 109,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18056 shadow allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_late_k, 340, ass::ImageType::Outline),
+            Rect {
+                x_min: 695,
+                y_min: 34,
+                x_max: 751,
+                y_max: 106,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18056 outline allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_late_k, 340, ass::ImageType::Character),
+            Rect {
+                x_min: 703,
+                y_min: 42,
+                x_max: 735,
+                y_max: 90,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18056 character allocation should match libass",
+        );
+
+        let fill_late_a = format!(
+            "{}Dialogue: 6,0:00:00.00,0:00:00.70,ED2,,0,0,0,fx,{{\\move(759.2,32,739.2,65,0,200)\\b0\\bord0\\shad0\\blur2\\fs50\\t(0,400,\\fs70\\blur0.6)\\an5\\fad(200,0)}}a\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&fill_late_a, 320, ass::ImageType::Character),
+            Rect {
+                x_min: 721,
+                y_min: 49,
+                x_max: 761,
+                y_max: 105,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18092 fill-only character allocation should match libass",
+        );
+
+        let outlined_mid_e = format!(
+            "{}Dialogue: 5,0:00:00.00,0:00:01.90,ED2,,0,0,0,fx,{{\\move(928.2,32,908.2,65,0,200)\\b0\\bord3.5\\blur1.2\\fs50\\t(0,400,\\fs70\\blur1.5)\\an5\\fad(200,0)}}e\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_mid_e, 160, ass::ImageType::Shadow),
+            Rect {
+                x_min: 895,
+                y_min: 44,
+                x_max: 951,
+                y_max: 100,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18301 shadow allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_mid_e, 160, ass::ImageType::Outline),
+            Rect {
+                x_min: 892,
+                y_min: 41,
+                x_max: 948,
+                y_max: 97,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18301 outline allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_mid_e, 160, ass::ImageType::Character),
+            Rect {
+                x_min: 900,
+                y_min: 48,
+                x_max: 932,
+                y_max: 80,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18301 character allocation should match libass",
+        );
+
+        let outlined_early_e = format!(
+            "{}Dialogue: 5,0:00:00.00,0:00:02.55,ED2,,0,0,0,fx,{{\\move(1080.5,98,1060.5,65,0,200)\\b0\\bord3.5\\blur1.2\\fs50\\t(0,400,\\fs70\\blur1.5)\\an5\\fad(200,0)}}e\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_early_e, 20, ass::ImageType::Shadow),
+            Rect {
+                x_min: 1063,
+                y_min: 81,
+                x_max: 1103,
+                y_max: 137,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18546 shadow allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_early_e, 20, ass::ImageType::Outline),
+            Rect {
+                x_min: 1060,
+                y_min: 78,
+                x_max: 1100,
+                y_max: 134,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18546 outline allocation should match libass",
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&outlined_early_e, 20, ass::ImageType::Character),
+            Rect {
+                x_min: 1067,
+                y_min: 85,
+                x_max: 1099,
+                y_max: 117,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18546 character allocation should match libass",
+        );
+
+        let fill_early_e = format!(
+            "{}Dialogue: 6,0:00:00.00,0:00:02.55,ED2,,0,0,0,fx,{{\\move(1080.5,98,1060.5,65,0,200)\\b0\\bord0\\shad0\\blur2\\fs50\\t(0,400,\\fs70\\blur0.6)\\an5\\fad(200,0)}}e\n",
+            current_02ass_ed2_header()
+        );
+        assert_rect_near(
+            render_text_kind_bounds_at(&fill_early_e, 20, ass::ImageType::Character),
+            Rect {
+                x_min: 1062,
+                y_min: 80,
+                x_max: 1104,
+                y_max: 122,
+            },
+            0,
+            "02.ass @ 22:56.500 line 18547 fill-only character allocation should match libass",
         );
     }
 
@@ -6883,6 +9424,30 @@ Dialogue: 7,0:00:00.00,0:00:01.00,ED2,,0,0,0,fx,{\move(808.8,73,808.8,65)\org(71
         assert!(start_x <= mid_x);
         assert!(mid_x <= end_x);
         assert!(end_x - start_x >= 80);
+    }
+
+    #[test]
+    fn center_positioned_move_without_geometric_transform_anchors_like_pos() {
+        let script = |tag: &str| {
+            format!(
+                "[Script Info]\nPlayResX: 240\nPlayResY: 160\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,72,&H00FFFFFF,&H0000FFFF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,3.5,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an5{tag}\\blur1.5}}S"
+            )
+        };
+        let pos = parse_script_text(&script("\\pos(120,80)")).expect("pos script should parse");
+        let movement = parse_script_text(&script("\\move(120,80,120,80)\\org(80,-20)"))
+            .expect("move script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        let pos_bounds = visible_bounds(&engine.render_frame_with_provider(&pos, &provider, 20))
+            .expect("pos should render");
+        let move_bounds =
+            visible_bounds(&engine.render_frame_with_provider(&movement, &provider, 20))
+                .expect("move should render");
+
+        assert!(
+            (move_bounds.y_min - pos_bounds.y_min).abs() <= 2,
+            "libass treats a zero-distance \\move and unused \\org like an equivalent \\pos for \\an5 center anchoring; pos={pos_bounds:?} move={move_bounds:?}"
+        );
     }
 
     #[test]

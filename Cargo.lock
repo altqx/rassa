@@ -753,6 +753,7 @@ dependencies = [
 name = "rassa-render"
 version = "0.5.1"
 dependencies = [
+ "freetype-rs",
  "rassa-core",
  "rassa-fonts",
  "rassa-layout",
