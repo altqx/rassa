@@ -498,6 +498,84 @@ fn top_center_latin_varied_glyphs_use_libass_metric_anchor() {
 }
 
 #[test]
+fn current_02ass_lower_latin_liberation_fallback_allocations_match_libass() {
+    if !baseline_fontconfig_family_contains("K2D ExtraBold", "Liberation") {
+        return;
+    }
+
+    struct Case {
+        name: &'static str,
+        text: &'static str,
+        tags: &'static str,
+        shadow: Rect,
+        outline: Rect,
+        character: Rect,
+    }
+
+    let cases = [
+        Case {
+            name: "line 21439 h",
+            text: "h",
+            tags: r"\an2\pos(1192.6,1050)\bord0.7\shad3\blur0\c&HFFFFFF&\3c&H000000&\4c&HB5B7B7&\fad(200,400)\alpha&HFF&\t(460,620,\alpha&H00&)\t(5250,\alpha&HFF&)",
+            shadow: rect_xywh(1179, 989, 48, 64),
+            outline: rect_xywh(1176, 986, 48, 64),
+            character: rect_xywh(1176, 987, 48, 64),
+        },
+        Case {
+            name: "line 21441 a",
+            text: "a",
+            tags: r"\an2\pos(1224.4,1050)\bord0.7\shad3\blur0\c&HFFFFFF&\3c&H000000&\4c&HB5B7B7&\fad(200,400)\alpha&HFF&\t(500,660,\alpha&H00&)\t(5290,\alpha&HFF&)",
+            shadow: rect_xywh(1210, 1001, 48, 48),
+            outline: rect_xywh(1207, 998, 48, 48),
+            character: rect_xywh(1207, 999, 48, 48),
+        },
+        Case {
+            name: "line 21442 h",
+            text: "h",
+            tags: r"\an2\pos(1246.1,1050)\bord0.7\shad3\blur0\c&HFFFFFF&\3c&H000000&\4c&HB5B7B7&\fad(200,400)\alpha&HFF&\t(520,680,\alpha&H00&)\t(5310,\alpha&HFF&)",
+            shadow: rect_xywh(1232, 989, 48, 64),
+            outline: rect_xywh(1229, 986, 48, 64),
+            character: rect_xywh(1230, 987, 48, 64),
+        },
+    ];
+
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    for case in cases {
+        let script = format!(
+            "{}Dialogue: 0,0:21:45.28,0:21:50.57,ED TH2,,0,0,0,fx,{{{}}}{}\n",
+            current_02ass_ed2_header(),
+            case.tags,
+            case.text
+        );
+        let track = parse_script_text(&script)
+            .expect("02.ass lower Latin Liberation fallback probe should parse");
+        let config = default_renderer_config(&track);
+        let planes =
+            engine.render_frame_with_provider_and_config(&track, &provider, 1_308_405, &config);
+
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Shadow),
+            case.shadow,
+            0,
+            &format!("{} shadow allocation should match libass", case.name),
+        );
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Outline),
+            case.outline,
+            0,
+            &format!("{} outline allocation should match libass", case.name),
+        );
+        assert_rect_near(
+            kind_bounds(&planes, ass::ImageType::Character),
+            case.character,
+            0,
+            &format!("{} character allocation should match libass", case.name),
+        );
+    }
+}
+
+#[test]
 fn lower_ed_th2_positioned_per_glyph_line_matches_libass_bounds() {
     if !baseline_fontconfig_family_contains("K2D ExtraBold", "K2D") {
         return;

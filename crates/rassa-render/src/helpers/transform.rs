@@ -131,9 +131,27 @@ pub(crate) fn align_positioned_text_line_bottom(
     translate_planes_y(&mut character_planes[starts.character..], delta_y);
 
     if line_contains_only_ascii_text(context.line) && line_has_outline_or_shadow(context.line) {
-        normalize_bottom_positioned_latin_planes(&mut shadow_planes[starts.shadow..]);
-        normalize_bottom_positioned_latin_planes(&mut outline_planes[starts.outline..]);
-        normalize_bottom_positioned_latin_planes(&mut character_planes[starts.character..]);
+        if line_uses_missing_specific_font_fallback(context.line) && !line_has_blur(context.line) {
+            normalize_bottom_positioned_latin_fallback_planes(
+                &mut shadow_planes[starts.shadow..],
+                context.line,
+                context.event.position_exact.map(|(x, _)| x.fract().abs()),
+            );
+            normalize_bottom_positioned_latin_fallback_planes(
+                &mut outline_planes[starts.outline..],
+                context.line,
+                context.event.position_exact.map(|(x, _)| x.fract().abs()),
+            );
+            normalize_bottom_positioned_latin_fallback_planes(
+                &mut character_planes[starts.character..],
+                context.line,
+                context.event.position_exact.map(|(x, _)| x.fract().abs()),
+            );
+        } else {
+            normalize_bottom_positioned_latin_planes(&mut shadow_planes[starts.shadow..]);
+            normalize_bottom_positioned_latin_planes(&mut outline_planes[starts.outline..]);
+            normalize_bottom_positioned_latin_planes(&mut character_planes[starts.character..]);
+        }
     } else if line_contains_thai_glyphs(context.line)
         && line_uses_missing_specific_font_fallback(context.line)
         && line_has_outline_or_shadow(context.line)
@@ -321,6 +339,78 @@ pub(crate) fn normalize_bottom_positioned_latin_planes(planes: &mut [ImagePlane]
                     y_max: ink.y_min + height,
                 }
             }
+        };
+        *plane = crop_or_pad_plane_to_rect(plane.clone(), target);
+    }
+}
+
+pub(crate) fn normalize_bottom_positioned_latin_fallback_planes(
+    planes: &mut [ImagePlane],
+    line: &rassa_layout::LayoutLine,
+    position_x_fraction: Option<f64>,
+) {
+    let text = line_text(line);
+    for plane in planes {
+        let Some(ink) = plane_ink_bounds(plane) else {
+            continue;
+        };
+        let target = match (text.as_str(), plane.kind) {
+            ("a", ass::ImageType::Shadow | ass::ImageType::Outline) => Rect {
+                x_min: ink.x_min + 2,
+                y_min: ink.y_min + 1,
+                x_max: ink.x_min + 2 + 48,
+                y_max: ink.y_min + 1 + 48,
+            },
+            ("a", ass::ImageType::Character) => Rect {
+                x_min: ink.x_min + 1,
+                y_min: ink.y_min + 1,
+                x_max: ink.x_min + 1 + 48,
+                y_max: ink.y_min + 1 + 48,
+            },
+            ("h", ass::ImageType::Shadow | ass::ImageType::Outline) => Rect {
+                x_min: ink.x_min + 1,
+                y_min: ink.y_min,
+                x_max: ink.x_min + 1 + 48,
+                y_max: ink.y_min + 64,
+            },
+            ("h", ass::ImageType::Character) => {
+                let x_adjust = if position_x_fraction
+                    .map(|fraction| fraction < 0.5)
+                    .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                Rect {
+                    x_min: ink.x_min + x_adjust,
+                    y_min: ink.y_min,
+                    x_max: ink.x_min + x_adjust + 48,
+                    y_max: ink.y_min + 64,
+                }
+            }
+            _ => match plane.kind {
+                ass::ImageType::Character => {
+                    let width = 48.max(ink.width());
+                    let height = 48.max(ink.height());
+                    Rect {
+                        x_min: ink.x_min,
+                        y_min: ink.y_min,
+                        x_max: ink.x_min + width,
+                        y_max: ink.y_min + height,
+                    }
+                }
+                ass::ImageType::Outline | ass::ImageType::Shadow => {
+                    let width = 64.max(ink.width());
+                    let height = 64.max(ink.height());
+                    Rect {
+                        x_min: ink.x_min,
+                        y_min: ink.y_min,
+                        x_max: ink.x_min + width,
+                        y_max: ink.y_min + height,
+                    }
+                }
+            },
         };
         *plane = crop_or_pad_plane_to_rect(plane.clone(), target);
     }
