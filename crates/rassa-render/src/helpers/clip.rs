@@ -527,10 +527,13 @@ pub(crate) fn pad_libass_transformed_text_rect_clip_plane(
         // metadata instead of tightening to the post-clip ink bounds.
         let h_like_allocation = (620..=632).contains(&plane.destination.x);
         let s_like_allocation = (588..=598).contains(&plane.destination.x);
-        let has_upper_visible_ink = plane.destination.y < 37
-            && plane_ink_bounds(&plane)
-                .map(|ink| ink.y_min < 37)
-                .unwrap_or(false);
+        let ink_bounds = plane_ink_bounds(&plane);
+        let a_like_empty_upper_edge = event.text == "A"
+            && plane.destination.y < 37
+            && plane.size.height <= 1
+            && ink_bounds.is_none();
+        let has_upper_visible_ink =
+            plane.destination.y < 37 && ink_bounds.map(|ink| ink.y_min < 37).unwrap_or(false);
         let y_min = if event.text == "S" && s_like_allocation && plane.destination.y < 40 {
             plane.destination.y + 2
         } else if event.text == "h"
@@ -541,7 +544,11 @@ pub(crate) fn pad_libass_transformed_text_rect_clip_plane(
             plane.destination.y + 1
         } else if event.text == "n" && plane.destination.y <= 37 {
             plane.destination.y + 1
-        } else if h_like_allocation || s_like_allocation || has_upper_visible_ink {
+        } else if a_like_empty_upper_edge
+            || h_like_allocation
+            || s_like_allocation
+            || has_upper_visible_ink
+        {
             plane.destination.y
         } else {
             plane.destination.y.max(37)
@@ -574,6 +581,8 @@ pub(crate) fn pad_libass_transformed_text_rect_clip_plane(
             } else {
                 plane.destination.x + 3
             }
+        } else if a_like_empty_upper_edge {
+            plane.destination.x
         } else if h_like_allocation {
             plane.destination.x
         } else if n_like_allocation {

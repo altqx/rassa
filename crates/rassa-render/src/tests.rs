@@ -1100,6 +1100,21 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_
         )
     };
 
+    assert_rect_near(
+        render_text_plane_bounds_at(
+            &script(
+                "\\clip(659.3,24.6,1260.8,37.9)",
+                "A",
+                "1072.3",
+                "57",
+                "982.3",
+            ),
+            475,
+        ),
+        rect_xywh(1043, 36, 56, 1),
+        0,
+        "02.ass @ 21:48.405 line 574 upper A thin-clip slice should retain libass transparent ASS_Image allocation",
+    );
     assert_eq!(
         render_text_plane_bounds_at(
             &script(
