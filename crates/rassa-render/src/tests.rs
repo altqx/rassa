@@ -1075,6 +1075,77 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_
 }
 
 #[test]
+fn current_02ass_early_active_projective_thin_clip_edges_match_libass_allocation() {
+    if !baseline_fontconfig_family_contains("OFL Sorts Mill Goudy TT", "Liberation") {
+        return;
+    }
+
+    let script = |clip: &str, text: &str, move_x: &str, move_y: &str, org_x: &str| {
+        format!(
+            r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_x},65)\org({org_x},-25)\t(66.428571428571,132.85714285714,\frz4)\t(132.85714285714,199.28571428571,\frz-4)\t(199.28571428571,265.71428571429,\frz4\t(265.71428571429,332.14285714286,\frz-4\t(332.14285714286,398.57142857143,\frz4\t(398.57142857143,465,\frz-4\t(465,531.42857142857,\frz4\t(1062.8571428571,597.85714285714,\frz-4\t(597.85714285714,664.28571428571,\frz4\t(664.28571428571,730.71428571429,\frz-4\t(730.71428571429,797.14285714286,\frz4\t(797.14285714286,863.57142857143,\frz-4\t(863.57142857143,930,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,930,\fs70\frz0){clip}\c&H5DC1FA&}}{text}
+"#
+        )
+    };
+
+    assert_eq!(
+        render_text_plane_bounds_at(
+            &script(
+                "\\clip(659.3,92.2,1260.8,106.36666666667)",
+                "A",
+                "1072.3",
+                "57",
+                "982.3",
+            ),
+            475,
+        ),
+        None,
+        "02.ass @ 21:48.405 line 600 lower A thin-clip slice should be dropped like libass",
+    );
+    assert_eq!(
+        render_text_plane_bounds_at(
+            &script(
+                "\\clip(659.3,94.8,1260.8,109)",
+                "A",
+                "1072.3",
+                "57",
+                "982.3",
+            ),
+            475,
+        ),
+        None,
+        "02.ass @ 21:48.405 line 601 lower A thin-clip slice should be dropped like libass",
+    );
+    assert_rect_near(
+        render_text_plane_bounds_at(
+            &script(
+                "\\clip(659.3,94.8,1260.8,109)",
+                "h",
+                "1106.8",
+                "73",
+                "1016.8",
+            ),
+            475,
+        ),
+        rect_xywh(1086, 94, 40, 15),
+        0,
+        "02.ass @ 21:48.405 line 636 lower h thin-clip slice should retain libass ASS_Image allocation",
+    );
+}
+
+#[test]
 fn current_02ass_late_y_thin_clip_slices_match_libass_allocation() {
     let script = |clip: &str, color_tag: &str| {
         format!(

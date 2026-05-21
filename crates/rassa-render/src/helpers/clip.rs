@@ -53,129 +53,154 @@ pub(crate) fn prepad_libass_transformed_text_rect_clip_plane(
         return plane;
     }
 
-    let target =
-        if event.text == "y" && (48..=49).contains(&plane.size.width) && plane.size.height >= 60 {
-            // Late 02.ass Latin karaoke "y" scanlines use libass' unclipped
-            // transformed glyph allocation before the thin rectangular clip is
-            // applied.  Rassa's transformed bitmap is tighter and starts too high;
-            // during the first active \frz window libass' transparent metric cell
-            // advances one row less than the later lower-slice family.
-            let y_offset = if plane.destination.y >= 30 { 10 } else { 11 };
-            Some(Rect {
-                x_min: plane.destination.x,
-                y_min: plane.destination.y + y_offset,
-                x_max: plane.destination.x + 56,
-                y_max: plane.destination.y + y_offset + 72,
-            })
-        } else if event.text == "z" && (30..=36).contains(&plane.size.width) {
-            // 02.ass moving \org/\frz "z" slices are clipped after libass has
-            // already reserved the same 40x56 allocation as the unclipped event.
-            // The generic clipped-org/frz padding above places rassa's transformed
-            // bitmap at the clip edge; shift back to the libass allocation before
-            // applying the rectangular clip so upper misses drop and lower
-            // transparent tails are retained the same way.
-            Some(Rect {
-                x_min: plane.destination.x,
-                y_min: plane.destination.y + 33,
-                x_max: plane.destination.x + 40,
-                y_max: plane.destination.y + 33 + 56,
-            })
-        } else if event.text == "o" && (30..=36).contains(&plane.size.width) {
-            // Same generated scanline pattern for the following "o" glyph, whose
-            // libass allocation is the wider 56x56 cell from the no-clip probe.
-            Some(Rect {
-                x_min: plane.destination.x - 5,
-                y_min: plane.destination.y + 2,
-                x_max: plane.destination.x - 5 + 56,
-                y_max: plane.destination.y + 2 + 56,
-            })
-        } else if event.text == "z" && (40..=41).contains(&plane.size.width) {
-            // After the clipped-org/frz transform path the generated z plane has
-            // already been expanded to 40px width.  Reconstruct the same unclipped
-            // libass allocation used by adjacent slices before intersecting with
-            // the thin rectangular clip.
-            Some(Rect {
-                x_min: plane.destination.x,
-                y_min: plane.destination.y + 31,
-                x_max: plane.destination.x + 40,
-                y_max: plane.destination.y + 31 + 56,
-            })
-        } else if (40..=41).contains(&plane.size.width) {
-            let z_lower_edge_slice = event.text == "z" && plane.destination.y <= 12;
-            Some(Rect {
-                x_min: plane.destination.x + 1,
-                y_min: plane.destination.y - 2,
-                x_max: plane.destination.x + 1 + 40,
-                // libass keeps a lower transparent tail for the 02.ass moving
-                // \org/\frz "z" slice before rectangular clipping; without it the
-                // y=66..80 clip misses rassa's tight transformed bitmap entirely.
-                y_max: plane.destination.y - 2 + if z_lower_edge_slice { 70 } else { 56 },
-            })
-        } else if (30..=36).contains(&plane.size.width) {
-            Some(Rect {
-                x_min: plane.destination.x,
-                y_min: plane.destination.y - 14,
-                x_max: plane.destination.x + 40,
-                y_max: plane.destination.y - 14 + 56,
-            })
-        } else if (42..=47).contains(&plane.size.width) {
-            Some(Rect {
-                x_min: plane.destination.x + 4,
-                y_min: plane.destination.y - 3,
-                x_max: plane.destination.x + 4 + 56,
-                y_max: plane.destination.y - 3 + 72,
-            })
-        } else if plane.size.width == 48 {
-            Some(Rect {
-                x_min: plane.destination.x - 5,
-                y_min: plane.destination.y - 9,
-                x_max: plane.destination.x - 5 + 56,
-                // A lower S slice in the 02.ass transformed-text sequence is
-                // entirely transparent in rassa's cropped glyph bitmap, but libass
-                // still emits the ASS_Image allocation down to the clip bottom.
-                // Keep that transparent tail before rectangular clipping so the
-                // post-clip allocation pass can preserve/drop the same slices.
-                y_max: plane.destination.y - 9 + 79,
-            })
-        } else if event.text == "o" && (52..=58).contains(&plane.size.width) {
-            // ED2 has two generated "o" scanline families that both arrive here
-            // with an already-expanded 56px cell.  The far-right 23:00 family still
-            // uses the older left-shifted transparent-tail allocation, while the
-            // 23:11.950 family keeps the current transformed cell.  Distinguish
-            // them by the pre-clip x family; the post-clip rectangles are
-            // intentionally almost identical.
-            let x_min = if plane.destination.x > 1150 {
-                plane.destination.x - 3
-            } else {
-                plane.destination.x + 1
-            };
-            Some(Rect {
-                x_min,
-                y_min: plane.destination.y,
-                x_max: x_min + 56,
-                y_max: plane.destination.y + 56,
-            })
-        } else if (52..=58).contains(&plane.size.width) {
-            Some(Rect {
-                x_min: plane.destination.x + 1,
-                y_min: plane.destination.y - 2,
-                x_max: plane.destination.x + 1 + 56,
-                // A moving \org/\frz one-glyph scanline in 02.ass keeps a tall
-                // libass allocation even when the rectangular clip hits only a
-                // lower transparent slice.  Retaining the extra bottom rows before
-                // clipping lets the later thin-slice padding preserve that plane.
-                y_max: plane.destination.y - 2 + 77,
-            })
-        } else if plane.size.width <= 24 {
-            Some(Rect {
-                x_min: plane.destination.x + 1,
-                y_min: plane.destination.y - 1,
-                x_max: plane.destination.x + 1 + 24,
-                y_max: plane.destination.y - 1 + 72,
-            })
+    let target = if event.text == "A"
+        && (58..=60).contains(&plane.size.width)
+        && plane.size.height >= 56
+    {
+        // 02.ass early active-projective A scanlines: libass clips against
+        // the unclipped 56x56 transformed glyph cell, not rassa's tighter
+        // warped bitmap.  Normalizing before the rectangular clip makes the
+        // lower y>=92 slices miss the libass cell and get dropped.
+        Some(Rect {
+            x_min: plane.destination.x - 1,
+            y_min: plane.destination.y + 1,
+            x_max: plane.destination.x - 1 + 56,
+            y_max: plane.destination.y + 1 + 56,
+        })
+    } else if event.text == "h" && (42..=45).contains(&plane.size.width) && plane.size.height >= 60
+    {
+        // Same active-projective ED2 family for h uses a 40x72 libass
+        // allocation before thin clips.  Keeping this metric cell preserves
+        // the lower retained slice while keeping raster coverage untouched.
+        Some(Rect {
+            x_min: plane.destination.x + 4,
+            y_min: plane.destination.y - 2,
+            x_max: plane.destination.x + 4 + 40,
+            y_max: plane.destination.y - 2 + 72,
+        })
+    } else if event.text == "y" && (48..=49).contains(&plane.size.width) && plane.size.height >= 60
+    {
+        // Late 02.ass Latin karaoke "y" scanlines use libass' unclipped
+        // transformed glyph allocation before the thin rectangular clip is
+        // applied.  Rassa's transformed bitmap is tighter and starts too high;
+        // during the first active \\frz window libass' transparent metric cell
+        // advances one row less than the later lower-slice family.
+        let y_offset = if plane.destination.y >= 30 { 10 } else { 11 };
+        Some(Rect {
+            x_min: plane.destination.x,
+            y_min: plane.destination.y + y_offset,
+            x_max: plane.destination.x + 56,
+            y_max: plane.destination.y + y_offset + 72,
+        })
+    } else if event.text == "z" && (30..=36).contains(&plane.size.width) {
+        // 02.ass moving \org/\frz "z" slices are clipped after libass has
+        // already reserved the same 40x56 allocation as the unclipped event.
+        // The generic clipped-org/frz padding above places rassa's transformed
+        // bitmap at the clip edge; shift back to the libass allocation before
+        // applying the rectangular clip so upper misses drop and lower
+        // transparent tails are retained the same way.
+        Some(Rect {
+            x_min: plane.destination.x,
+            y_min: plane.destination.y + 33,
+            x_max: plane.destination.x + 40,
+            y_max: plane.destination.y + 33 + 56,
+        })
+    } else if event.text == "o" && (30..=36).contains(&plane.size.width) {
+        // Same generated scanline pattern for the following "o" glyph, whose
+        // libass allocation is the wider 56x56 cell from the no-clip probe.
+        Some(Rect {
+            x_min: plane.destination.x - 5,
+            y_min: plane.destination.y + 2,
+            x_max: plane.destination.x - 5 + 56,
+            y_max: plane.destination.y + 2 + 56,
+        })
+    } else if event.text == "z" && (40..=41).contains(&plane.size.width) {
+        // After the clipped-org/frz transform path the generated z plane has
+        // already been expanded to 40px width.  Reconstruct the same unclipped
+        // libass allocation used by adjacent slices before intersecting with
+        // the thin rectangular clip.
+        Some(Rect {
+            x_min: plane.destination.x,
+            y_min: plane.destination.y + 31,
+            x_max: plane.destination.x + 40,
+            y_max: plane.destination.y + 31 + 56,
+        })
+    } else if (40..=41).contains(&plane.size.width) {
+        let z_lower_edge_slice = event.text == "z" && plane.destination.y <= 12;
+        Some(Rect {
+            x_min: plane.destination.x + 1,
+            y_min: plane.destination.y - 2,
+            x_max: plane.destination.x + 1 + 40,
+            // libass keeps a lower transparent tail for the 02.ass moving
+            // \org/\frz "z" slice before rectangular clipping; without it the
+            // y=66..80 clip misses rassa's tight transformed bitmap entirely.
+            y_max: plane.destination.y - 2 + if z_lower_edge_slice { 70 } else { 56 },
+        })
+    } else if (30..=36).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x,
+            y_min: plane.destination.y - 14,
+            x_max: plane.destination.x + 40,
+            y_max: plane.destination.y - 14 + 56,
+        })
+    } else if (42..=47).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x + 4,
+            y_min: plane.destination.y - 3,
+            x_max: plane.destination.x + 4 + 56,
+            y_max: plane.destination.y - 3 + 72,
+        })
+    } else if plane.size.width == 48 {
+        Some(Rect {
+            x_min: plane.destination.x - 5,
+            y_min: plane.destination.y - 9,
+            x_max: plane.destination.x - 5 + 56,
+            // A lower S slice in the 02.ass transformed-text sequence is
+            // entirely transparent in rassa's cropped glyph bitmap, but libass
+            // still emits the ASS_Image allocation down to the clip bottom.
+            // Keep that transparent tail before rectangular clipping so the
+            // post-clip allocation pass can preserve/drop the same slices.
+            y_max: plane.destination.y - 9 + 79,
+        })
+    } else if event.text == "o" && (52..=58).contains(&plane.size.width) {
+        // ED2 has two generated "o" scanline families that both arrive here
+        // with an already-expanded 56px cell.  The far-right 23:00 family still
+        // uses the older left-shifted transparent-tail allocation, while the
+        // 23:11.950 family keeps the current transformed cell.  Distinguish
+        // them by the pre-clip x family; the post-clip rectangles are
+        // intentionally almost identical.
+        let x_min = if plane.destination.x > 1150 {
+            plane.destination.x - 3
         } else {
-            None
+            plane.destination.x + 1
         };
+        Some(Rect {
+            x_min,
+            y_min: plane.destination.y,
+            x_max: x_min + 56,
+            y_max: plane.destination.y + 56,
+        })
+    } else if (52..=58).contains(&plane.size.width) {
+        Some(Rect {
+            x_min: plane.destination.x + 1,
+            y_min: plane.destination.y - 2,
+            x_max: plane.destination.x + 1 + 56,
+            // A moving \org/\frz one-glyph scanline in 02.ass keeps a tall
+            // libass allocation even when the rectangular clip hits only a
+            // lower transparent slice.  Retaining the extra bottom rows before
+            // clipping lets the later thin-slice padding preserve that plane.
+            y_max: plane.destination.y - 2 + 77,
+        })
+    } else if plane.size.width <= 24 {
+        Some(Rect {
+            x_min: plane.destination.x + 1,
+            y_min: plane.destination.y - 1,
+            x_max: plane.destination.x + 1 + 24,
+            y_max: plane.destination.y - 1 + 72,
+        })
+    } else {
+        None
+    };
 
     if event.text == "o" {
         if let Some(target) = target {
@@ -577,6 +602,13 @@ pub(crate) fn pad_libass_transformed_text_rect_clip_plane(
     }
 
     if (40..=41).contains(&plane.size.width) {
+        // The early active-projective ED2 `h` stack has already been normalized
+        // to libass' retained 40px allocation before clipping.  Do not apply
+        // the older generic upper-edge x/y clamps to this allocation family.
+        if event.text == "h" && (1085..=1088).contains(&plane.destination.x) {
+            return Some(plane);
+        }
+
         // Matching h slices use a 40px libass allocation.  At the bottom edge
         // libass keeps transparent rows down to y=92 even when rassa's clipped
         // bitmap only intersects the visible clip by one row.
