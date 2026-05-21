@@ -2257,6 +2257,78 @@ fn current_02ass_active_move_fs_blur_single_t_matches_libass_allocation() {
 }
 
 #[test]
+fn current_02ass_active_move_fs_blur_upper_a_matches_libass_allocation() {
+    let script = format!(
+        "{}Dialogue: 5,0:00:00.00,0:00:03.12,ED2,,0,0,0,fx,{{\\move(1171.7,98,1151.7,65,0,200)\\b0\\bord3.5\\blur1.2\\fs50\\t(0,400,\\fs70\\blur1.5)\\an5\\fad(200,0)}}A\n",
+        current_02ass_ed2_header()
+    );
+    let track = parse_script_text(&script).expect("02.ass active fs/blur A probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 2665);
+
+    assert_eq!(
+        planes.len(),
+        3,
+        "02.ass line 639 single A fixture should emit shadow, outline, and character planes"
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Shadow),
+        rect_xywh(1126, 39, 72, 72),
+        0,
+        "02.ass @ 1308405 line 639 active fs/blur A shadow allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Outline),
+        rect_xywh(1123, 36, 72, 72),
+        0,
+        "02.ass @ 1308405 line 639 active fs/blur A outline allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Character),
+        rect_xywh(1130, 43, 48, 48),
+        0,
+        "02.ass @ 1308405 line 639 active fs/blur A character allocation should match libass",
+    );
+}
+
+#[test]
+fn current_02ass_active_move_fs_blur_upper_h_matches_libass_allocation() {
+    let script = format!(
+        "{}Dialogue: 5,0:00:00.00,0:00:03.12,ED2,,0,0,0,fx,{{\\move(1206.2,32,1186.2,65,0,200)\\b0\\bord3.5\\blur1.2\\fs50\\t(0,400,\\fs70\\blur1.5)\\an5\\fad(200,0)}}h\n",
+        current_02ass_ed2_header()
+    );
+    let track = parse_script_text(&script).expect("02.ass active fs/blur h probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 2665);
+
+    assert_eq!(
+        planes.len(),
+        3,
+        "02.ass line 674 single h fixture should emit shadow, outline, and character planes"
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Shadow),
+        rect_xywh(1168, 36, 56, 72),
+        0,
+        "02.ass @ 1308405 line 674 active fs/blur h shadow allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Outline),
+        rect_xywh(1165, 33, 56, 72),
+        0,
+        "02.ass @ 1308405 line 674 active fs/blur h outline allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Character),
+        rect_xywh(1173, 41, 32, 48),
+        0,
+        "02.ass @ 1308405 line 674 active fs/blur h character allocation should match libass",
+    );
+}
+
+#[test]
 fn current_02ass_h_thin_clip_slices_keep_libass_allocation() {
     let script = |clip: &str| {
         format!(
@@ -3709,6 +3781,27 @@ fn current_02ass_static_top_center_blurred_latin_glyphs_match_libass_allocation(
             rect_xywh(1046, 53, 32, 48),
         ),
         (
+            'g',
+            984.1,
+            rect_xywh(965, 48, 56, 72),
+            rect_xywh(962, 45, 56, 72),
+            rect_xywh(969, 53, 32, 48),
+        ),
+        (
+            'I',
+            727.1,
+            rect_xywh(719, 39, 24, 72),
+            rect_xywh(716, 36, 24, 72),
+            rect_xywh(724, 43, 16, 48),
+        ),
+        (
+            '\'',
+            741.5,
+            rect_xywh(734, 39, 24, 40),
+            rect_xywh(731, 36, 24, 40),
+            rect_xywh(738, 43, 16, 16),
+        ),
+        (
             'i',
             664.8,
             rect_xywh(657, 36, 24, 72),
@@ -3728,6 +3821,13 @@ fn current_02ass_static_top_center_blurred_latin_glyphs_match_libass_allocation(
             rect_xywh(625, 36, 56, 72),
             rect_xywh(622, 33, 56, 72),
             rect_xywh(630, 41, 32, 48),
+        ),
+        (
+            'l',
+            1035.1,
+            rect_xywh(1027, 36, 24, 72),
+            rect_xywh(1024, 33, 24, 72),
+            rect_xywh(1032, 41, 16, 48),
         ),
         (
             'i',

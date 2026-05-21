@@ -422,7 +422,8 @@ pub(crate) fn pads_positioned_center_animated_text_allocation(
             || matches!(
                 line_single_text_char(line),
                 Some(
-                    'S' | 'a'
+                    'A' | 'S'
+                        | 'a'
                         | 'b'
                         | 'd'
                         | 'e'
@@ -632,8 +633,18 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
             (Some('i'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 58) => {
                 Some((0, 2, 24, 56))
             }
+            (Some('h'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, 55)
+                if has_active_transform && has_outline_or_shadow =>
+            {
+                Some((0, -7, 56, 72))
+            }
             (Some('t'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 55) => {
                 Some((0, 3, 40, 56))
+            }
+            (Some('A'), ass::ImageType::Shadow | ass::ImageType::Outline, 64, 53)
+                if has_active_transform && has_outline_or_shadow =>
+            {
+                Some((0, -6, 72, 72))
             }
             (Some('S'), ass::ImageType::Shadow | ass::ImageType::Outline, 64, 64) => {
                 Some((1, 3, 56, 72))
@@ -662,6 +673,11 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
             (Some('y'), ass::ImageType::Shadow | ass::ImageType::Outline, 64, 63) => {
                 Some((0, 4, 56, 72))
             }
+            (Some('A'), ass::ImageType::Character, 48, 41)
+                if has_active_transform && has_outline_or_shadow =>
+            {
+                Some((-1, -7, 48, 48))
+            }
             (Some('S'), ass::ImageType::Character, 48, 48) => Some((0, 2, 48, 48)),
             (Some('O'), ass::ImageType::Character, 48, 48) => Some((0, 2, 48, 48)),
             (Some('a'), ass::ImageType::Character, 48, 48) => {
@@ -680,6 +696,11 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
             }
             (Some('d'), ass::ImageType::Shadow | ass::ImageType::Outline, 56, 56) => {
                 Some((if half_or_right_position { -1 } else { 1 }, -12, 56, 72))
+            }
+            (Some('g'), ass::ImageType::Shadow | ass::ImageType::Outline, 48, height)
+                if height >= 60 && !has_active_transform =>
+            {
+                Some((1, 3, 56, 72))
             }
             (Some('h'), ass::ImageType::Shadow, 56, 56)
                 if has_active_transform && has_outline_or_shadow =>
@@ -739,8 +760,17 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
                 };
                 Some((x_offset, -23, 56, 56))
             }
+            (Some('I'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 64) => {
+                Some((1, 4, 24, 72))
+            }
+            (Some('\''), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 32) => {
+                Some((0, 4, 24, 40))
+            }
             (Some('i'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 64) => {
                 Some((i32::from(left_half_position), 3, 24, 72))
+            }
+            (Some('l'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 64) => {
+                Some((0, 3, 24, 72))
             }
             (Some('j'), ass::ImageType::Shadow | ass::ImageType::Outline, 32, 75) => {
                 Some((0, 3, 40, 88))
@@ -770,6 +800,11 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
             (Some('h'), ass::ImageType::Character, 32, 48) => {
                 Some((-i32::from(half_or_right_position), 3, 32, 48))
             }
+            (Some('h'), ass::ImageType::Character, 32, 43)
+                if has_active_transform && has_outline_or_shadow =>
+            {
+                Some((0, -7, 32, 48))
+            }
             // 02.ass ED2 line 18512: borderless/shadowless single `t` with
             // active non-projective `\t(\fs...,\blur...)` is allocated from
             // libass's animated metric cell, not the currently lit ink crop.
@@ -782,6 +817,11 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
             (Some('e'), ass::ImageType::Character, 32, 48) => {
                 Some((if half_or_right_position { -1 } else { 0 }, 3, 32, 48))
             }
+            (Some('g'), ass::ImageType::Character, 32, 51) if !has_active_transform => {
+                Some((0, 3, 32, 48))
+            }
+            (Some('I'), ass::ImageType::Character, 16, 48) => Some((1, 3, 16, 48)),
+            (Some('\''), ass::ImageType::Character, 16, 16) => Some((-1, 3, 16, 16)),
             (Some('i'), ass::ImageType::Character, 16, 48) => {
                 let x_offset = if (0.5..0.75).contains(&fraction) {
                     -1
@@ -790,6 +830,7 @@ pub(crate) fn pad_libass_positioned_center_animated_text_plane(
                 };
                 Some((x_offset, 3, 16, 48))
             }
+            (Some('l'), ass::ImageType::Character, 16, 48) => Some((0, 3, 16, 48)),
             (Some('j'), ass::ImageType::Character, 16, 63) => Some((0, 3, 16, 64)),
             (Some('k'), ass::ImageType::Character, 32, 48) => Some((0, 3, 32, 48)),
             (Some('n'), ass::ImageType::Character, 32, 48) => Some((
