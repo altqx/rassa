@@ -484,7 +484,7 @@ pub(crate) fn line_contains_only_ascii_text(line: &rassa_layout::LayoutLine) -> 
             continue;
         }
         has_text = true;
-        if !run.text.chars().all(|character| character.is_ascii()) {
+        if !run.text.is_ascii() {
             return false;
         }
     }
@@ -528,6 +528,7 @@ pub(crate) struct RunTransformContext<'a> {
     pub(crate) blur: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn normalize_libass_animated_identity_drawing_planes(
     shadow_planes: &mut [ImagePlane],
     outline_planes: &mut [ImagePlane],
@@ -837,9 +838,7 @@ pub(crate) fn pad_libass_rotated_drawing_plane(
             } else if late_wave_small_positive_z_rotation && plane.destination.y >= 66 {
                 (-1, 2)
             } else if small_positive_z_rotation {
-                let y_offset = if early_top_small_positive_z_rotation {
-                    1
-                } else if plane.destination.y >= 66 {
+                let y_offset = if early_top_small_positive_z_rotation || plane.destination.y >= 66 {
                     1
                 } else {
                     2
@@ -993,26 +992,23 @@ pub(crate) fn pad_libass_rotated_drawing_plane(
                 let y_offset = if plane.destination.y >= 53 { 10 } else { 11 };
                 (-3, y_offset)
             } else if negative_z_rotation || mid_positive_z_rotation {
-                let y_offset = if mid_positive_z_rotation
+                let mid_positive_near_top_five = (mid_positive_z_rotation
                     && transform.rotation_z > 15.0
                     && plane.destination.x < 900
                     && plane.destination.y >= 40
-                    && plane.destination.y < 50
-                {
-                    5
-                } else if mid_positive_z_rotation
-                    && transform.rotation_z > 15.5
-                    && plane.destination.x < 1000
-                    && plane.destination.y >= 40
-                    && plane.destination.y < 50
-                {
-                    5
-                } else if (late_wave_mid_positive_z_rotation
-                    && plane.size.height <= 47
-                    && plane.destination.y >= 51)
+                    && plane.destination.y < 50)
                     || (mid_positive_z_rotation
+                        && transform.rotation_z > 15.5
                         && plane.destination.x < 1000
-                        && plane.destination.y >= 40)
+                        && plane.destination.y >= 40
+                        && plane.destination.y < 50);
+                let y_offset = if !mid_positive_near_top_five
+                    && ((late_wave_mid_positive_z_rotation
+                        && plane.size.height <= 47
+                        && plane.destination.y >= 51)
+                        || (mid_positive_z_rotation
+                            && plane.destination.x < 1000
+                            && plane.destination.y >= 40))
                 {
                     6
                 } else {
@@ -1040,9 +1036,7 @@ pub(crate) fn pad_libass_rotated_drawing_plane(
             if (34..=36).contains(&plane.size.width) && (40..=44).contains(&plane.size.height) =>
         {
             let (x_offset, y_offset) = if small_positive_z_rotation {
-                let y_offset = if early_top_small_positive_z_rotation {
-                    2
-                } else if plane.destination.y >= 61 {
+                let y_offset = if early_top_small_positive_z_rotation || plane.destination.y >= 61 {
                     2
                 } else {
                     3
@@ -1066,15 +1060,13 @@ pub(crate) fn pad_libass_rotated_drawing_plane(
                     && plane.destination.y < 20
                 {
                     (0, 2)
-                } else if negative_z_rotation
+                } else if (negative_z_rotation
                     && transform.rotation_z < -4.0
                     && plane.destination.x < 900
-                    && plane.destination.y >= 20
-                {
-                    (0, 1)
-                } else if negative_z_rotation
-                    && plane.destination.x >= 1400
-                    && plane.destination.y < 20
+                    && plane.destination.y >= 20)
+                    || (negative_z_rotation
+                        && plane.destination.x >= 1400
+                        && plane.destination.y < 20)
                 {
                     (0, 1)
                 } else if plane.destination.y < 20 {
@@ -1182,24 +1174,21 @@ pub(crate) fn pad_libass_rotated_drawing_plane(
                 let y_offset = if plane.destination.y >= 55 { 7 } else { 8 };
                 (-3, y_offset)
             } else if negative_z_rotation || mid_positive_z_rotation {
-                let y_offset = if mid_positive_z_rotation
+                let mid_positive_near_top_four = (mid_positive_z_rotation
                     && transform.rotation_z > 15.0
                     && plane.destination.x < 900
                     && plane.destination.y >= 40
-                    && plane.destination.y < 50
-                {
-                    4
-                } else if mid_positive_z_rotation
-                    && transform.rotation_z > 15.5
-                    && plane.destination.x < 1000
-                    && plane.destination.y >= 40
-                    && plane.destination.y < 50
-                {
-                    4
-                } else if (late_wave_mid_positive_z_rotation && plane.destination.y >= 51)
+                    && plane.destination.y < 50)
                     || (mid_positive_z_rotation
+                        && transform.rotation_z > 15.5
                         && plane.destination.x < 1000
-                        && plane.destination.y >= 40)
+                        && plane.destination.y >= 40
+                        && plane.destination.y < 50);
+                let y_offset = if !mid_positive_near_top_four
+                    && ((late_wave_mid_positive_z_rotation && plane.destination.y >= 51)
+                        || (mid_positive_z_rotation
+                            && plane.destination.x < 1000
+                            && plane.destination.y >= 40))
                 {
                     5
                 } else {
@@ -1226,23 +1215,22 @@ pub(crate) fn pad_libass_rotated_drawing_plane(
         ass::ImageType::Outline
             if (36..=38).contains(&plane.size.width) && (44..=47).contains(&plane.size.height) =>
         {
-            let (x_offset, y_offset) =
-                if late_wave_small_positive_z_rotation && plane.destination.y >= 58 {
-                    let x_offset = if plane.destination.y >= 60 { -1 } else { 0 };
-                    (x_offset, 3)
-                } else if small_positive_z_rotation {
-                    let y_offset = if early_top_small_positive_z_rotation {
-                        1
-                    } else if plane.destination.y >= 61 {
-                        1
-                    } else {
-                        2
-                    };
-                    (0, y_offset)
+            let (x_offset, y_offset) = if late_wave_small_positive_z_rotation
+                && plane.destination.y >= 58
+            {
+                let x_offset = if plane.destination.y >= 60 { -1 } else { 0 };
+                (x_offset, 3)
+            } else if small_positive_z_rotation {
+                let y_offset = if early_top_small_positive_z_rotation || plane.destination.y >= 61 {
+                    1
                 } else {
-                    let y_offset = if plane.destination.y < 20 { 1 } else { 0 };
-                    (1, y_offset)
+                    2
                 };
+                (0, y_offset)
+            } else {
+                let y_offset = if plane.destination.y < 20 { 1 } else { 0 };
+                (1, y_offset)
+            };
             Some(Rect {
                 x_min: plane.destination.x + x_offset,
                 y_min: plane.destination.y + y_offset,

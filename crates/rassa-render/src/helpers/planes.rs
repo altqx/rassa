@@ -432,6 +432,7 @@ pub(crate) fn interpolate_move_exact(
     round_exact_point((x, y))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_vertical_layout(
     track: &ParsedTrack,
     lines: &[rassa_layout::LayoutLine],
@@ -531,6 +532,7 @@ pub(crate) fn compute_vertical_layout(
     positions
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_vertical_layout(
     track: &ParsedTrack,
     event: &LayoutEvent,

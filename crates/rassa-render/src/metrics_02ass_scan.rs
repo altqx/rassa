@@ -1,3 +1,5 @@
+#![allow(clippy::vec_init_then_push)]
+
 use super::*;
 
 fn fnv1a64_02ass_scan(text: &str) -> u64 {

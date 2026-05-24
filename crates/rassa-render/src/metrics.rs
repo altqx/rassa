@@ -1,5 +1,21 @@
 use super::*;
 
+type ScanPlaneKey = (
+    i64,
+    i64,
+    u64,
+    ass::ImageType,
+    u32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FontVerticalMetrics {
     pub(crate) ascender_26_6: i32,
@@ -468,6 +484,7 @@ pub(crate) fn line_text(line: &rassa_layout::LayoutLine) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pad_libass_positioned_center_animated_text_line(
     shadow_planes: &mut [ImagePlane],
     outline_planes: &mut [ImagePlane],
@@ -7442,23 +7459,7 @@ fn normalize_02ass_1318835_scan_plane_for_event(
     ))
 }
 
-fn should_drop_02ass_1318835_scan_plane(
-    key: (
-        i64,
-        i64,
-        u64,
-        ass::ImageType,
-        u32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-    ),
-) -> bool {
+fn should_drop_02ass_1318835_scan_plane(key: ScanPlaneKey) -> bool {
     matches!(
         key,
         // 02.ass @ 1318835 line 1232
@@ -15022,23 +15023,7 @@ fn normalize_02ass_1319640_scan_plane_for_event(
     ))
 }
 
-fn should_drop_02ass_1319640_scan_plane(
-    key: (
-        i64,
-        i64,
-        u64,
-        ass::ImageType,
-        u32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-    ),
-) -> bool {
+fn should_drop_02ass_1319640_scan_plane(key: ScanPlaneKey) -> bool {
     matches!(
         key,
         // 02.ass @ 1319640 line 1509
@@ -24139,23 +24124,7 @@ fn normalize_02ass_1376360_scan_plane_for_event(
     Some(plane)
 }
 
-fn should_drop_02ass_1376360_scan_plane(
-    key: (
-        i64,
-        i64,
-        u64,
-        ass::ImageType,
-        u32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-    ),
-) -> bool {
+fn should_drop_02ass_1376360_scan_plane(key: ScanPlaneKey) -> bool {
     matches!(
         key,
         // 02.ass @ 1376360 line 17919
