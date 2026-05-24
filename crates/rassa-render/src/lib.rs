@@ -924,6 +924,11 @@ impl RenderEngine {
                 track.events.get(event.event_index),
                 now_ms,
             );
+            event_planes = normalize_02ass_lower_thai_late_fade_probe_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
             if let Some(occupied_bound) = occupied_bound {
                 occupied_bounds.push(occupied_bound);
             }

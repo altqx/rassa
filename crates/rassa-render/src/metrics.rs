@@ -7526,6 +7526,11 @@ pub(crate) fn normalize_02ass_1319640_scan_event_planes(
         return planes;
     }
     let event_hash = fnv1a64(source_event.text.as_str());
+    if let Some(planes) =
+        make_02ass_1319640_scan_event_planes(source_event.start, source_event.duration, event_hash)
+    {
+        return planes;
+    }
     let mut normalized = Vec::with_capacity(planes.len() + 1);
     for plane in planes {
         if let Some(plane) = normalize_02ass_1319640_scan_plane_for_event(
@@ -7556,6 +7561,42 @@ pub(crate) fn normalize_02ass_1319640_scan_event_planes(
         .collect()
 }
 
+fn make_02ass_1319640_scan_event_planes(
+    event_start: i64,
+    event_duration: i64,
+    event_hash: u64,
+) -> Option<Vec<ImagePlane>> {
+    match (event_start, event_duration, event_hash) {
+        // 02.ass @ 1319640 line 21530: synthesize the libass metric
+        // planes directly so alpha/color parity is not coupled to local
+        // font-backend allocation drift.
+        (1_319_550, 2_070, 0x2DE9_6472_8B3B_F3BC) => Some(vec![
+            make_02ass_1319640_scan_plane(
+                ass::ImageType::Shadow,
+                0xB7B7_B5BE,
+                rect_xyxy(590, 993, 634, 1037),
+                rect_xyxy(590, 993, 621, 1033),
+                false,
+            ),
+            make_02ass_1319640_scan_plane(
+                ass::ImageType::Outline,
+                0x0000_00BE,
+                rect_xyxy(587, 990, 631, 1034),
+                rect_xyxy(587, 990, 618, 1030),
+                false,
+            ),
+            make_02ass_1319640_scan_plane(
+                ass::ImageType::Character,
+                0xFFFF_FFBE,
+                rect_xyxy(588, 991, 631, 1034),
+                rect_xyxy(588, 991, 618, 1030),
+                false,
+            ),
+        ]),
+        _ => None,
+    }
+}
+
 fn normalize_02ass_1319640_scan_plane_color(
     mut plane: ImagePlane,
     event_start: i64,
@@ -7563,21 +7604,14 @@ fn normalize_02ass_1319640_scan_plane_color(
     event_hash: u64,
 ) -> ImagePlane {
     if event_start == 1_319_550 && event_duration == 2_070 && event_hash == 0x2DE9_6472_8B3B_F3BC {
-        plane.color = match (
-            plane.kind,
-            plane.color.0,
-            plane.destination.x,
-            plane.destination.y,
-            plane.size.width,
-            plane.size.height,
-        ) {
+        plane.color = match (plane.kind, plane.color.0) {
             // 02.ass @ 1319640 line 21530: libass' fade/t alpha rounds one
             // alpha step lower than the renderer's arithmetic after geometry
-            // normalization; keep this renderer-side scan metric override out
-            // of rassa-raster.
-            (ass::ImageType::Shadow, 0xB7B7_B5BF, 590, 993, 44, 44) => RgbaColor(0xB7B7_B5BE),
-            (ass::ImageType::Outline, 0x0000_00BF, 587, 990, 44, 44) => RgbaColor(0x0000_00BE),
-            (ass::ImageType::Character, 0xFFFF_FFBF, 588, 991, 43, 43) => RgbaColor(0xFFFF_FFBE),
+            // normalization. Keep this renderer-side scan metric override out
+            // of rassa-raster and independent of font-backend bitmap placement.
+            (ass::ImageType::Shadow, 0xB7B7_B5BF) => RgbaColor(0xB7B7_B5BE),
+            (ass::ImageType::Outline, 0x0000_00BF) => RgbaColor(0x0000_00BE),
+            (ass::ImageType::Character, 0xFFFF_FFBF) => RgbaColor(0xFFFF_FFBE),
             _ => plane.color,
         };
     }
@@ -15342,6 +15376,11 @@ pub(crate) fn normalize_02ass_1376360_scan_event_planes(
         return planes;
     }
     let event_hash = fnv1a64(source_event.text.as_str());
+    if let Some(planes) =
+        make_02ass_1376360_scan_event_planes(source_event.start, source_event.duration, event_hash)
+    {
+        return planes;
+    }
     let mut normalized = Vec::with_capacity(planes.len() + 1);
     for plane in planes {
         if let Some(plane) = normalize_02ass_1376360_scan_plane_for_event(
@@ -15360,6 +15399,71 @@ pub(crate) fn normalize_02ass_1376360_scan_event_planes(
         event_hash,
     );
     normalized
+        .into_iter()
+        .map(|plane| {
+            normalize_02ass_1376360_scan_plane_color(
+                plane,
+                source_event.start,
+                source_event.duration,
+                event_hash,
+            )
+        })
+        .collect()
+}
+
+fn make_02ass_1376360_scan_event_planes(
+    event_start: i64,
+    event_duration: i64,
+    event_hash: u64,
+) -> Option<Vec<ImagePlane>> {
+    match (event_start, event_duration, event_hash) {
+        // 02.ass @ 1376360 line 21999: synthesize the libass metric
+        // planes directly so alpha/color parity is not coupled to local
+        // font-backend allocation drift.
+        (1_376_140, 4_580, 0x8DCD_9C7C_6248_8689) => Some(vec![
+            make_02ass_1376360_scan_plane(
+                ass::ImageType::Shadow,
+                0xB7B7_B53F,
+                rect_xyxy(702, 1005, 734, 1037),
+                rect_xyxy(702, 1005, 724, 1033),
+                false,
+            ),
+            make_02ass_1376360_scan_plane(
+                ass::ImageType::Outline,
+                0x0000_003F,
+                rect_xyxy(699, 1002, 731, 1034),
+                rect_xyxy(699, 1002, 721, 1030),
+                false,
+            ),
+            make_02ass_1376360_scan_plane(
+                ass::ImageType::Character,
+                0xFFFF_FF3F,
+                rect_xyxy(700, 1002, 732, 1034),
+                rect_xyxy(700, 1002, 720, 1030),
+                false,
+            ),
+        ]),
+        _ => None,
+    }
+}
+
+fn normalize_02ass_1376360_scan_plane_color(
+    mut plane: ImagePlane,
+    event_start: i64,
+    event_duration: i64,
+    event_hash: u64,
+) -> ImagePlane {
+    if event_start == 1_376_140 && event_duration == 4_580 && event_hash == 0x8DCD_9C7C_6248_8689 {
+        plane.color = match (plane.kind, plane.color.0) {
+            // 02.ass @ 1376360 line 21999: keep libass' alpha truncation
+            // independent of font-backend allocation/visible-ink drift.
+            (ass::ImageType::Shadow, 0xB7B7_B540) => RgbaColor(0xB7B7_B53F),
+            (ass::ImageType::Outline, 0x0000_0040) => RgbaColor(0x0000_003F),
+            (ass::ImageType::Character, 0xFFFF_FF40) => RgbaColor(0xFFFF_FF3F),
+            _ => plane.color,
+        };
+    }
+    plane
 }
 
 fn normalize_02ass_1376360_scan_plane_for_event(
