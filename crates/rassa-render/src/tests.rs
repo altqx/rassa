@@ -2223,6 +2223,102 @@ fn current_02ass_late_move_org_frz_blurred_glyphs_match_libass_allocation() {
 }
 
 #[test]
+fn current_02ass_1391950_line_21383_start_frame_visible_bounds_match_libass_scan() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 7,0:23:11.95,0:23:12.36,ED2,,0,0,0,fx,{\move(1062.2,73,1062.2,65)\org(972.2,-25)\t(29.285714285714,58.571428571429,\frz4)\t(58.571428571429,87.857142857143,\frz-4)\t(87.857142857143,117.14285714286,\frz4\t(117.14285714286,146.42857142857,\frz-4\t(146.42857142857,175.71428571429,\frz4\t(175.71428571429,205,\frz-4\t(205,234.28571428571,\frz4\t(468.57142857143,263.57142857143,\frz-4\t(263.57142857143,292.85714285714,\frz4\t(292.85714285714,322.14285714286,\frz-4\t(322.14285714286,351.42857142857,\frz4\t(351.42857142857,380.71428571429,\frz-4\t(380.71428571429,410,\frz0)))))))))))\b0\bord3.5\blur1.5\fs80\an5\c&HFFFFFF&\3c&HFFFFFF&\t(0,410,\fs70\frz0)\1a&H70&}o
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1391950 line 21383 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_391_950);
+
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Shadow),
+        rect_xywh(1040, 54, 56, 72),
+        0,
+        "02.ass @ 1391950 line 21383 shadow allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Outline),
+        rect_xywh(1037, 51, 56, 72),
+        0,
+        "02.ass @ 1391950 line 21383 outline allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Character),
+        rect_xywh(1045, 59, 48, 48),
+        0,
+        "02.ass @ 1391950 line 21383 character allocation should match libass",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Shadow),
+        rect_xyxy(1041, 55, 1089, 109),
+        0,
+        "02.ass @ 1391950 line 21383 shadow visible bounds should match libass scan",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Outline),
+        rect_xyxy(1038, 52, 1086, 106),
+        0,
+        "02.ass @ 1391950 line 21383 outline visible bounds should match libass scan",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Character),
+        rect_xyxy(1045, 59, 1080, 99),
+        0,
+        "02.ass @ 1391950 line 21383 character visible bounds should match libass scan",
+    );
+}
+
+#[test]
+fn current_02ass_1392000_line_21348_visible_bounds_match_libass_scan() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 7,0:23:11.95,0:23:12.36,ED2,,0,0,0,fx,{\move(1036.5,57,1036.5,65)\org(946.5,-25)\t(29.285714285714,58.571428571429,\frz4)\t(58.571428571429,87.857142857143,\frz-4)\t(87.857142857143,117.14285714286,\frz4\t(117.14285714286,146.42857142857,\frz-4\t(146.42857142857,175.71428571429,\frz4\t(175.71428571429,205,\frz-4\t(205,234.28571428571,\frz4\t(468.57142857143,263.57142857143,\frz-4\t(263.57142857143,292.85714285714,\frz4\t(292.85714285714,322.14285714286,\frz-4\t(322.14285714286,351.42857142857,\frz4\t(351.42857142857,380.71428571429,\frz-4\t(380.71428571429,410,\frz0)))))))))))\b0\bord3.5\blur1.5\fs80\an5\c&HFFFFFF&\3c&HFFFFFF&\t(0,410,\fs70\frz0)\1a&H70&}y
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1392000 line 21348 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_392_000);
+
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Shadow),
+        rect_xywh(1017, 35, 56, 72),
+        0,
+        "02.ass @ 1392000 line 21348 shadow allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Outline),
+        rect_xywh(1014, 32, 56, 72),
+        0,
+        "02.ass @ 1392000 line 21348 outline allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Character),
+        rect_xywh(1022, 40, 48, 64),
+        0,
+        "02.ass @ 1392000 line 21348 character allocation should match libass",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Shadow),
+        rect_xyxy(1018, 36, 1068, 104),
+        0,
+        "02.ass @ 1392000 line 21348 shadow visible bounds should match libass scan",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Outline),
+        rect_xyxy(1015, 33, 1065, 101),
+        0,
+        "02.ass @ 1392000 line 21348 outline visible bounds should match libass scan",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Character),
+        rect_xyxy(1022, 40, 1058, 94),
+        0,
+        "02.ass @ 1392000 line 21348 character visible bounds should match libass scan",
+    );
+}
+
+#[test]
 fn current_02ass_225634_move_org_frz_blurred_latin_glyphs_match_libass_allocation() {
     struct Case {
         text: char,
@@ -2403,6 +2499,352 @@ fn current_02ass_active_move_fs_blur_upper_h_matches_libass_allocation() {
         rect_xywh(1173, 41, 32, 48),
         0,
         "02.ass @ 1308405 line 674 active fs/blur h character allocation should match libass",
+    );
+}
+
+#[test]
+fn current_02ass_1318835_line_1503_move_fs_blur_g_matches_libass_scan_metrics() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 5,0:21:58.13,0:21:59.25,ED2,,0,0,0,fx,{\move(1251.6,98,1231.6,65,0,200)\b0\bord3.5\blur1.2\fs50\t(0,400,\fs70\blur1.5)\an5\fad(200,0)}g
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1318835 line 1503 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_318_835);
+
+    assert_eq!(
+        planes.len(),
+        3,
+        "02.ass @ 1318835 line 1503 should emit shadow, outline, and character planes"
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Shadow),
+        rect_xywh(1212, 48, 56, 72),
+        0,
+        "02.ass @ 1318835 line 1503 shadow allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Outline),
+        rect_xywh(1209, 45, 56, 72),
+        0,
+        "02.ass @ 1318835 line 1503 outline allocation should match libass",
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Character),
+        rect_xywh(1216, 53, 32, 48),
+        0,
+        "02.ass @ 1318835 line 1503 character allocation should match libass",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Shadow),
+        Rect {
+            x_min: 1212,
+            y_min: 49,
+            x_max: 1255,
+            y_max: 110,
+        },
+        0,
+        "02.ass @ 1318835 line 1503 shadow visible ink should match libass",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Outline),
+        Rect {
+            x_min: 1209,
+            y_min: 46,
+            x_max: 1252,
+            y_max: 107,
+        },
+        0,
+        "02.ass @ 1318835 line 1503 outline visible ink should match libass",
+    );
+    assert_rect_near(
+        kind_visible_bounds(&planes, ass::ImageType::Character),
+        Rect {
+            x_min: 1216,
+            y_min: 53,
+            x_max: 1246,
+            y_max: 100,
+        },
+        0,
+        "02.ass @ 1318835 line 1503 character visible ink should match libass",
+    );
+}
+
+#[test]
+fn current_02ass_1318835_line_1290_transparent_clip_tail_keeps_libass_empty_plane() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 8,0:21:58.78,0:21:58.91,ED2,,0,0,0,fx,{\move(1047.9,57,1047.9,65)\org(957.9,-25)\t(9.2857142857143,18.571428571429,\frz4)\t(18.571428571429,27.857142857143,\frz-4)\t(27.857142857143,37.142857142857,\frz4\t(37.142857142857,46.428571428571,\frz-4\t(46.428571428571,55.714285714286,\frz4\t(55.714285714286,65,\frz-4\t(65,74.285714285714,\frz4\t(148.57142857143,83.571428571429,\frz-4\t(83.571428571429,92.857142857143,\frz4\t(92.857142857143,102.14285714286,\frz-4\t(102.14285714286,111.42857142857,\frz4\t(111.42857142857,120.71428571429,\frz-4\t(120.71428571429,130,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,130,\fs70\frz0)\clip(570.6,94.8,1349.4,109)\c&H5DC1FA&}u
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1318835 line 1290 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_318_835);
+
+    assert_eq!(
+        planes.len(),
+        1,
+        "02.ass @ 1318835 line 1290 transparent clipped tail should still emit libass' empty ASS_Image"
+    );
+    let plane = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 1290 should have a character plane");
+    assert_eq!(plane.color.0, 0xFAC1_5D00);
+    assert_eq!(plane.destination, Point { x: 1032, y: 94 });
+    assert_eq!(
+        plane.size,
+        Size {
+            width: 40,
+            height: 1
+        }
+    );
+    assert!(
+        plane.bitmap.iter().all(|pixel| *pixel == 0),
+        "line 1290 libass plane is transparent; keep lit=0/sum=0 diagnostic convention"
+    );
+    assert_rect_near(
+        kind_bounds(&planes, ass::ImageType::Character),
+        rect_xywh(1032, 94, 40, 1),
+        0,
+        "02.ass @ 1318835 line 1290 empty character allocation should match libass",
+    );
+    assert!(
+        kind_visible_bounds(&planes, ass::ImageType::Character).is_none(),
+        "transparent libass tail plane should not seed visible ink in real plane data"
+    );
+}
+
+#[test]
+fn current_02ass_1319640_line_1605_transparent_clip_tail_keeps_libass_empty_plane() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 8,0:21:59.25,0:21:59.71,ED2,,0,0,0,fx,{\move(1266.7,73,1266.7,65)\org(1176.7,-25)\t(32.857142857143,65.714285714286,\frz4)\t(65.714285714286,98.571428571429,\frz-4)\t(98.571428571429,131.42857142857,\frz4\t(131.42857142857,164.28571428571,\frz-4\t(164.28571428571,197.14285714286,\frz4\t(197.14285714286,230,\frz-4\t(230,262.85714285714,\frz4\t(525.71428571429,295.71428571429,\frz-4\t(295.71428571429,328.57142857143,\frz4\t(328.57142857143,361.42857142857,\frz-4\t(361.42857142857,394.28571428571,\frz4\t(394.28571428571,427.14285714286,\frz-4\t(427.14285714286,460,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,460,\fs70\frz0)\clip(570.6,94.8,1349.4,109)\c&H5DC1FA&}r
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1319640 line 1605 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_319_640);
+
+    assert_eq!(
+        planes.len(),
+        1,
+        "02.ass @ 1319640 line 1605 transparent clipped tail should still emit libass' empty ASS_Image"
+    );
+    let plane = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 1605 should have a character plane");
+    assert_eq!(plane.color.0, 0xFAC1_5D00);
+    assert_eq!(plane.destination, Point { x: 1257, y: 94 });
+    assert_eq!(
+        plane.size,
+        Size {
+            width: 40,
+            height: 11,
+        }
+    );
+    assert!(
+        plane.bitmap.iter().all(|pixel| *pixel == 0),
+        "line 1605 libass plane is transparent; keep lit=0/sum=0 diagnostic convention"
+    );
+    assert!(
+        kind_visible_bounds(&planes, ass::ImageType::Character).is_none(),
+        "transparent libass tail plane should not seed visible ink in real plane data"
+    );
+}
+
+#[test]
+fn current_02ass_1319640_line_1582_upper_clip_slice_drops_like_libass() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 8,0:21:59.25,0:21:59.71,ED2,,0,0,0,fx,{\move(1266.7,73,1266.7,65)\org(1176.7,-25)\t(32.857142857143,65.714285714286,\frz4)\t(65.714285714286,98.571428571429,\frz-4)\t(98.571428571429,131.42857142857,\frz4\t(131.42857142857,164.28571428571,\frz-4\t(164.28571428571,197.14285714286,\frz4\t(197.14285714286,230,\frz-4\t(230,262.85714285714,\frz4\t(525.71428571429,295.71428571429,\frz-4\t(295.71428571429,328.57142857143,\frz4\t(328.57142857143,361.42857142857,\frz-4\t(361.42857142857,394.28571428571,\frz4\t(394.28571428571,427.14285714286,\frz-4\t(427.14285714286,460,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,460,\fs70\frz0)\clip(570.6,35,1349.4,48.433333333333)\c&HD9F0FD&}r
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1319640 line 1582 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_319_640);
+
+    assert!(
+        planes.is_empty(),
+        "02.ass @ 1319640 line 1582 upper clipped slice should be dropped like libass"
+    );
+}
+
+#[test]
+fn current_02ass_1319640_line_21530_fade_alpha_matches_libass_colors() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 0,0:21:59.55,0:22:01.62,ED TH2,,0,0,0,fx,{\an2\pos(601.3,1050)\bord0.7\shad3\blur0\c&HFFFFFF&\3c&H000000&\4c&HB5B7B7&\fad(200,400)\alpha&HFF&\t(0,160,\alpha&H00&)\t(1570,\alpha&HFF&)}หั
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1319640 line 21530 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_319_640);
+
+    assert_eq!(
+        planes.len(),
+        3,
+        "02.ass @ 1319640 line 21530 should emit shadow, outline, and character planes"
+    );
+    let shadow = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Shadow)
+        .expect("line 21530 should have a shadow plane");
+    let outline = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Outline)
+        .expect("line 21530 should have an outline plane");
+    let character = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 21530 should have a character plane");
+    assert_eq!(shadow.color.0, 0xB7B7_B5BE);
+    assert_eq!(outline.color.0, 0x0000_00BE);
+    assert_eq!(character.color.0, 0xFFFF_FFBE);
+}
+
+#[test]
+fn current_02ass_1376360_line_18053_transparent_clip_tail_keeps_libass_empty_plane() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 8,0:22:56.34,0:22:56.88,ED2,,0,0,0,fx,{\move(686.4,57,686.4,65)\org(596.4,-25)\t(38.571428571429,77.142857142857,\frz4)\t(77.142857142857,115.71428571429,\frz-4)\t(115.71428571429,154.28571428571,\frz4\t(154.28571428571,192.85714285714,\frz-4\t(192.85714285714,231.42857142857,\frz4\t(231.42857142857,270,\frz-4\t(270,308.57142857143,\frz4\t(617.14285714286,347.14285714286,\frz-4\t(347.14285714286,385.71428571429,\frz4\t(385.71428571429,424.28571428571,\frz-4\t(424.28571428571,462.85714285714,\frz4\t(462.85714285714,501.42857142857,\frz-4\t(501.42857142857,540,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,540,\fs70\frz0)\clip(539.1,94.8,1380.9,109)\c&H5DC1FA&}n
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1376360 line 18053 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_376_360);
+
+    assert_eq!(
+        planes.len(),
+        1,
+        "02.ass @ 1376360 line 18053 transparent clipped tail should still emit libass' empty ASS_Image"
+    );
+    let plane = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 18053 should have a character plane");
+    assert_eq!(plane.color.0, 0xFAC1_5D00);
+    assert_eq!(plane.destination, Point { x: 667, y: 94 });
+    assert_eq!(
+        plane.size,
+        Size {
+            width: 40,
+            height: 1,
+        }
+    );
+    assert!(
+        plane.bitmap.iter().all(|pixel| *pixel == 0),
+        "line 18053 libass plane is transparent; keep lit=0/sum=0 diagnostic convention"
+    );
+}
+
+#[test]
+fn current_02ass_1376360_line_18026_upper_clip_slice_drops_like_libass() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 8,0:22:56.34,0:22:56.88,ED2,,0,0,0,fx,{\move(686.4,57,686.4,65)\org(596.4,-25)\t(38.571428571429,77.142857142857,\frz4)\t(77.142857142857,115.71428571429,\frz-4)\t(115.71428571429,154.28571428571,\frz4\t(154.28571428571,192.85714285714,\frz-4\t(192.85714285714,231.42857142857,\frz4\t(231.42857142857,270,\frz-4\t(270,308.57142857143,\frz4\t(617.14285714286,347.14285714286,\frz-4\t(347.14285714286,385.71428571429,\frz4\t(385.71428571429,424.28571428571,\frz-4\t(424.28571428571,462.85714285714,\frz4\t(462.85714285714,501.42857142857,\frz-4\t(501.42857142857,540,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,540,\fs70\frz0)\clip(539.1,24.6,1380.9,37.9)\c&HEEF8FE&}n
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1376360 line 18026 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_376_360);
+
+    assert!(
+        planes.is_empty(),
+        "02.ass @ 1376360 line 18026 upper clipped slice should be dropped like libass"
+    );
+}
+
+#[test]
+fn current_02ass_1376360_line_21999_fade_alpha_matches_libass_colors() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 0,0:22:56.14,0:23:00.72,ED TH2,,0,0,0,fx,{\an2\pos(710.5,1050)\bord0.7\shad3\blur0\c&HFFFFFF&\3c&H000000&\4c&HB5B7B7&\fad(200,400)\alpha&HFF&\t(100,260,\alpha&H00&)\t(4180,\alpha&HFF&)}า
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1376360 line 21999 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_376_360);
+
+    assert_eq!(
+        planes.len(),
+        3,
+        "02.ass @ 1376360 line 21999 should emit shadow, outline, and character planes"
+    );
+    let shadow = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Shadow)
+        .expect("line 21999 should have a shadow plane");
+    let outline = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Outline)
+        .expect("line 21999 should have an outline plane");
+    let character = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 21999 should have a character plane");
+    assert_eq!(shadow.color.0, 0xB7B7_B53F);
+    assert_eq!(outline.color.0, 0x0000_003F);
+    assert_eq!(character.color.0, 0xFFFF_FF3F);
+}
+
+#[test]
+fn current_02ass_1376500_line_22007_fade_alpha_matches_libass_colors() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 0,0:22:56.14,0:23:00.72,ED TH2,,0,0,0,fx,{\an2\pos(890.8,1050)\bord0.7\shad3\blur0\c&HFFFFFF&\3c&H000000&\4c&HB5B7B7&\fad(200,400)\alpha&HFF&\t(260,420,\alpha&H00&)\t(4340,\alpha&HFF&)}ท
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1376500 line 22007 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_376_500);
+
+    assert_eq!(
+        planes.len(),
+        3,
+        "02.ass @ 1376500 line 22007 should emit shadow, outline, and character planes"
+    );
+    let shadow = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Shadow)
+        .expect("line 22007 should have a shadow plane");
+    let outline = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Outline)
+        .expect("line 22007 should have an outline plane");
+    let character = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 22007 should have a character plane");
+    assert_eq!(shadow.color.0, 0xB7B7_B55F);
+    assert_eq!(outline.color.0, 0x0000_005F);
+    assert_eq!(character.color.0, 0xFFFF_FF5F);
+}
+
+#[test]
+fn current_02ass_1390000_line_21053_transparent_clip_tail_keeps_libass_empty_plane() {
+    let mut script = String::from(current_02ass_ed2_header());
+    script.push_str(r#"Dialogue: 8,0:23:09.73,0:23:10.14,ED2,,0,0,0,fx,{\move(1128.9,57,1128.9,65)\org(1038.9,-25)\t(29.285714285714,58.571428571429,\frz4)\t(58.571428571429,87.857142857143,\frz-4)\t(87.857142857143,117.14285714286,\frz4\t(117.14285714286,146.42857142857,\frz-4\t(146.42857142857,175.71428571429,\frz4\t(175.71428571429,205,\frz-4\t(205,234.28571428571,\frz4\t(468.57142857143,263.57142857143,\frz-4\t(263.57142857143,292.85714285714,\frz4\t(292.85714285714,322.14285714286,\frz-4\t(322.14285714286,351.42857142857,\frz4\t(351.42857142857,380.71428571429,\frz-4\t(380.71428571429,410,\frz0)))))))))))\b0\bord0\blur0.2\shad0\an5\fs80\t(0,410,\fs70\frz0)\clip(655.6,94.8,1264.4,109)\c&H5DC1FA&}n
+"#);
+    let track = parse_script_text(&script).expect("02.ass 1390000 line 21053 probe should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 1_390_000);
+
+    assert_eq!(
+        planes.len(),
+        1,
+        "02.ass @ 1390000 line 21053 transparent clipped tail should still emit libass' empty ASS_Image"
+    );
+    let plane = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("line 21053 should have a character plane");
+    assert_eq!(plane.color.0, 0xFAC1_5D00);
+    assert_eq!(plane.destination, Point { x: 1112, y: 94 });
+    assert_eq!(
+        plane.size,
+        Size {
+            width: 40,
+            height: 5,
+        }
+    );
+    assert!(
+        plane.bitmap.iter().all(|pixel| *pixel == 0),
+        "line 21053 libass plane is transparent; keep lit=0/sum=0 diagnostic convention"
     );
 }
 
@@ -3356,6 +3798,102 @@ fn current_02ass_late_p1_drawing_wave_matches_libass_allocation() {
 
     for case in cases {
         assert_current_02ass_p1_drawing_case(case);
+    }
+}
+
+#[test]
+fn current_02ass_p1_drawing_wave_at_1308405_matches_libass_allocation() {
+    let cases = [
+        (
+            Current02AssP1DrawingCase {
+                name: "line 75 @ 1308405 upper negative p1",
+                duration_cs: "01.83",
+                override_prefix: "\\c&H42E6FF&\\move(1106.9,85,1132.9,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+                now_ms: 475,
+                shadow: rect_xywh(1095, 52, 40, 40),
+                outline: rect_xywh(1094, 51, 40, 40),
+                character: rect_xywh(1099, 56, 32, 32),
+            },
+            "Ah",
+        ),
+        (
+            Current02AssP1DrawingCase {
+                name: "line 73 @ 1308405 upper positive p1",
+                duration_cs: "01.59",
+                override_prefix: "\\c&H42E6FF&\\move(1027,85,1066,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz15)\\fad(0,400)",
+                now_ms: 1165,
+                shadow: rect_xywh(1036, 23, 40, 40),
+                outline: rect_xywh(1035, 22, 40, 40),
+                character: rect_xywh(1040, 27, 32, 32),
+            },
+            "girl",
+        ),
+        (
+            Current02AssP1DrawingCase {
+                name: "line 76 @ 1308405 lower negative p1",
+                duration_cs: "01.83",
+                override_prefix: "\\c&HAA58FF&\\move(1066.9,85,941.9,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+                now_ms: 475,
+                shadow: rect_xywh(1016, 57, 40, 40),
+                outline: rect_xywh(1015, 56, 40, 40),
+                character: rect_xywh(1020, 61, 32, 32),
+            },
+            "Ah",
+        ),
+    ];
+
+    for (case, suffix) in cases {
+        assert_current_02ass_p1_drawing_case_with_suffix(case, suffix);
+    }
+}
+
+#[test]
+fn current_02ass_p1_drawing_wave_at_1308405_visible_bounds_match_libass() {
+    let cases = [
+        Current02AssP1DrawingVisibleCase {
+            name: "line 75 @ 1308405 upper negative p1",
+            duration_cs: "01.83",
+            override_prefix: "\\c&H42E6FF&\\move(1106.9,85,1132.9,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 475,
+            suffix: "Ah",
+            shadow: rect_xywh(1098, 54, 33, 32),
+            outline: rect_xywh(1097, 53, 33, 32),
+            character: rect_xywh(1099, 56, 28, 26),
+        },
+        Current02AssP1DrawingVisibleCase {
+            name: "line 73 @ 1308405 upper positive p1",
+            duration_cs: "01.59",
+            override_prefix: "\\c&H42E6FF&\\move(1027,85,1066,25)\\bord1\\blur0.8\\shad1\\fscy30\\fscx30\\an5\\p1\\t(\\frz90)\\t(\\frz15)\\fad(0,400)",
+            now_ms: 1165,
+            suffix: "girl",
+            shadow: rect_xywh(1039, 26, 34, 31),
+            outline: rect_xywh(1038, 25, 34, 31),
+            character: rect_xywh(1041, 27, 28, 26),
+        },
+        Current02AssP1DrawingVisibleCase {
+            name: "line 76 @ 1308405 lower negative p1",
+            duration_cs: "01.83",
+            override_prefix: "\\c&HAA58FF&\\move(1066.9,85,941.9,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz-15)\\fad(0,400)",
+            now_ms: 475,
+            suffix: "Ah",
+            shadow: rect_xywh(1018, 60, 33, 31),
+            outline: rect_xywh(1017, 59, 33, 31),
+            character: rect_xywh(1020, 61, 28, 26),
+        },
+        Current02AssP1DrawingVisibleCase {
+            name: "line 74 @ 1308405 lower positive p1",
+            duration_cs: "01.59",
+            override_prefix: "\\c&HAA58FF&\\move(987,85,927,45)\\fscy30\\fscx30\\bord1\\blur0.8\\shad1\\an5\\p1\\t(\\frz90)\\t(\\frz15)\\fad(0,400)",
+            now_ms: 1165,
+            suffix: "girl",
+            shadow: rect_xywh(926, 40, 34, 32),
+            outline: rect_xywh(925, 39, 34, 32),
+            character: rect_xywh(928, 42, 28, 26),
+        },
+    ];
+
+    for case in cases {
+        assert_current_02ass_p1_drawing_visible_case(case);
     }
 }
 

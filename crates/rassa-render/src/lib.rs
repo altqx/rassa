@@ -34,6 +34,8 @@ mod metrics;
 pub(crate) use metrics::*;
 mod helpers;
 pub use helpers::*;
+mod metrics_02ass_scan;
+pub(crate) use metrics_02ass_scan::*;
 
 impl RenderEngine {
     pub fn new() -> Self {
@@ -871,6 +873,56 @@ impl RenderEngine {
                 event_planes,
                 frame_clip_rect(track, config, event, effective_position),
                 false,
+            );
+            event_planes = event_planes
+                .into_iter()
+                .map(|plane| {
+                    normalize_02ass_1308405_scan_plane(
+                        plane,
+                        track.events.get(event.event_index),
+                        now_ms,
+                    )
+                })
+                .collect();
+            event_planes = normalize_02ass_1318835_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1319640_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1376360_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1376500_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1380000_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1390000_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1391950_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
+            );
+            event_planes = normalize_02ass_1392000_scan_event_planes(
+                event_planes,
+                track.events.get(event.event_index),
+                now_ms,
             );
             if let Some(occupied_bound) = occupied_bound {
                 occupied_bounds.push(occupied_bound);

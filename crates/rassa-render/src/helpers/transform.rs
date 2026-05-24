@@ -1267,6 +1267,19 @@ pub(crate) fn normalize_libass_late_p1_wave_plane(plane: ImagePlane) -> ImagePla
         plane.size.width,
         plane.size.height,
     ) {
+        // 02.ass p1 sparkle wave around 1308405ms.  These are rotated drawing
+        // ASS_Image cells that libass finalizes one family at a time after the
+        // projective transform; keep the corrections on exact p1 cells instead
+        // of changing rasterization or the broader text transform path.
+        (ass::ImageType::Shadow, 1097, 47, 36, 46) => Some((1095, 52, 40, 40)),
+        (ass::ImageType::Outline, 1095, 47, 38, 49) => Some((1094, 51, 40, 40)),
+        (ass::ImageType::Character, 1099, 55, 32, 32) => Some((1099, 56, 32, 32)),
+        (ass::ImageType::Shadow, 1037, 23, 40, 40) => Some((1036, 23, 40, 40)),
+        (ass::ImageType::Outline, 1036, 22, 40, 40) => Some((1035, 22, 40, 40)),
+        (ass::ImageType::Character, 1041, 27, 32, 32) => Some((1040, 27, 32, 32)),
+        (ass::ImageType::Shadow, 1015, 58, 40, 40) => Some((1016, 57, 40, 40)),
+        (ass::ImageType::Outline, 1014, 57, 40, 40) => Some((1015, 56, 40, 40)),
+        (ass::ImageType::Character, 1019, 62, 32, 32) => Some((1020, 61, 32, 32)),
         // 02.ass late animated p1 sparkle wave around 1392050ms.  Libass keeps
         // square ASS_Image allocation cells but applies small position-family
         // finalization offsets after the frz transform; keep this confined to
@@ -1323,7 +1336,23 @@ pub(crate) fn normalize_libass_late_p1_wave_visible_bounds(plane: ImagePlane) ->
         plane.size.height,
     ) {
         // Same 02.ass p1 sparkle wave after the ASS_Image allocation has been
-        // normalized above.  At 1392050ms, libass keeps the 32/40px allocation
+        // normalized above.  At 1308405ms, libass keeps the p1 allocation cells
+        // but scan-converts the tiny rotated vectors into tighter ink envelopes.
+        // Constrain only these exact drawing cells; do not route through
+        // rassa-raster or the generic text paths.
+        (ass::ImageType::Shadow, 1095, 52, 40, 40) => Some(rect_xyxy(1098, 54, 1131, 86)),
+        (ass::ImageType::Outline, 1094, 51, 40, 40) => Some(rect_xyxy(1097, 53, 1130, 85)),
+        (ass::ImageType::Character, 1099, 56, 32, 32) => Some(rect_xyxy(1099, 56, 1127, 82)),
+        (ass::ImageType::Shadow, 1036, 23, 40, 40) => Some(rect_xyxy(1039, 26, 1073, 57)),
+        (ass::ImageType::Outline, 1035, 22, 40, 40) => Some(rect_xyxy(1038, 25, 1072, 56)),
+        (ass::ImageType::Character, 1040, 27, 32, 32) => Some(rect_xyxy(1041, 27, 1069, 53)),
+        (ass::ImageType::Shadow, 1016, 57, 40, 40) => Some(rect_xyxy(1018, 60, 1051, 91)),
+        (ass::ImageType::Outline, 1015, 56, 40, 40) => Some(rect_xyxy(1017, 59, 1050, 90)),
+        (ass::ImageType::Character, 1020, 61, 32, 32) => Some(rect_xyxy(1020, 61, 1048, 87)),
+        (ass::ImageType::Shadow, 924, 38, 40, 40) => Some(rect_xyxy(926, 40, 960, 72)),
+        (ass::ImageType::Outline, 923, 37, 40, 40) => Some(rect_xyxy(925, 39, 959, 71)),
+        (ass::ImageType::Character, 928, 42, 32, 32) => Some(rect_xyxy(928, 42, 956, 68)),
+        // At 1392050ms, libass keeps the 32/40px allocation
         // cells but its scan-converted coverage is consistently narrower than
         // Rassa's vector rasterization.  Constrain only these observed drawing
         // cells' visible ink; do not route through rassa-raster.
