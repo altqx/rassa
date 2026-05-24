@@ -9645,6 +9645,32 @@ pub(crate) fn normalize_02ass_1380000_scan_event_planes(
             ));
             planes
         }
+        // 02.ass @1380000 line 22009 (r=3 l=3)
+        (1376140, 4580, 0x917385797244396E) => {
+            let mut planes = Vec::new();
+            planes.push(make_02ass_scan_plane(
+                ass::ImageType::Shadow,
+                0xB7B7B500,
+                rect_xyxy(928, 1005, 944, 1037),
+                rect_xyxy(928, 1005, 941, 1034),
+                false,
+            ));
+            planes.push(make_02ass_scan_plane(
+                ass::ImageType::Outline,
+                0x00000000,
+                rect_xyxy(925, 1002, 941, 1034),
+                rect_xyxy(925, 1002, 938, 1031),
+                false,
+            ));
+            planes.push(make_02ass_scan_plane(
+                ass::ImageType::Character,
+                0xFFFFFF00,
+                rect_xyxy(926, 1002, 942, 1034),
+                rect_xyxy(926, 1002, 937, 1030),
+                false,
+            ));
+            planes
+        }
         // 02.ass @1380000 line 22010 (r=3 l=3)
         (1376140, 4580, 0xC8A5802E1A8C9E22) => {
             let mut planes = Vec::new();
