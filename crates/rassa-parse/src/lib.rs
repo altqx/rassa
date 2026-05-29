@@ -495,7 +495,7 @@ pub fn parse_script_text(text: &str) -> RassaResult<ParsedTrack> {
                             track.style_format = style_format.join(", ");
                         }
                     }
-                    if let Some(style) = parse_style_line(value, &style_format) {
+                    if let Some(style) = parse_style_line(value, &style_format, track.track_type) {
                         track.styles.push(style);
                     }
                 }
@@ -638,6 +638,7 @@ pub fn parse_dialogue_text_with_wrap_style(
     let mut karaoke_cursor_ms = 0;
     let mut drawing_scale = 0;
     let mut current_transforms = Vec::new();
+    let inherited_wrap_style = current_wrap_style;
     let mut characters = text.chars().peekable();
 
     while let Some(character) = characters.next() {
@@ -663,6 +664,7 @@ pub fn parse_dialogue_text_with_wrap_style(
                     &mut drawing_scale,
                     &mut current_transforms,
                     &mut current_wrap_style,
+                    inherited_wrap_style,
                 );
             }
             '\\' => match characters.peek().copied() {
@@ -684,9 +686,7 @@ pub fn parse_dialogue_text_with_wrap_style(
                 }
                 Some('n') => {
                     characters.next();
-                    if drawing_scale > 0 || current_wrap_style != 2 {
-                        buffer.push(' ');
-                    } else {
+                    if drawing_scale == 0 && matches!(current_wrap_style, 1 | 3) {
                         flush_span(
                             &mut buffer,
                             &current_style,
@@ -696,6 +696,8 @@ pub fn parse_dialogue_text_with_wrap_style(
                             &mut active_line,
                         );
                         push_line(&mut parsed, &mut active_line);
+                    } else {
+                        buffer.push(' ');
                     }
                 }
                 Some('h') => {
@@ -795,7 +797,7 @@ fn default_event_format() -> Vec<String> {
     .collect()
 }
 
-fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
+fn parse_style_line(value: &str, format: &[String], track_type: TrackType) -> Option<ParsedStyle> {
     let fields = split_fields(value, format.len());
     if fields.len() != format.len() {
         return None;
@@ -805,8 +807,18 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
     for (key, raw_value) in format.iter().zip(fields) {
         let lowered = key.to_ascii_lowercase();
         match lowered.as_str() {
-            "name" => style.name = raw_value.trim().to_string(),
-            "fontname" => style.font_name = raw_value.trim().to_string(),
+            "name" => {
+                let name = raw_value.trim().trim_start_matches('*');
+                style.name = if name.is_empty() {
+                    "Default".to_string()
+                } else {
+                    name.to_string()
+                };
+            }
+            "fontname" => {
+                let font_name = raw_value.trim();
+                style.font_name = font_name.to_string();
+            }
             "fontsize" => style.font_size = parse_f64(raw_value, style.font_size),
             "primarycolour" | "primarycolor" => {
                 style.primary_colour = parse_color(raw_value, style.primary_colour)
@@ -824,19 +836,20 @@ fn parse_style_line(value: &str, format: &[String]) -> Option<ParsedStyle> {
                 style.font_weight = parse_bold_weight(raw_value, style.font_weight);
                 style.bold = bold_weight_is_active(style.font_weight);
             }
-            "italic" => style.italic = parse_bool(raw_value, style.italic),
-            "underline" => style.underline = parse_bool(raw_value, style.underline),
-            "strikeout" => style.strike_out = parse_bool(raw_value, style.strike_out),
+            "italic" => style.italic = parse_style_bool(raw_value, style.italic),
+            "underline" => style.underline = parse_style_bool(raw_value, style.underline),
+            "strikeout" => style.strike_out = parse_style_bool(raw_value, style.strike_out),
             "scalex" => style.scale_x = parse_scale(raw_value, style.scale_x),
             "scaley" => style.scale_y = parse_scale(raw_value, style.scale_y),
-            "spacing" => style.spacing = parse_f64(raw_value, style.spacing),
+            "spacing" => style.spacing = parse_f64(raw_value, style.spacing).max(0.0),
             "angle" => style.angle = parse_f64(raw_value, style.angle),
             "borderstyle" => style.border_style = parse_i32(raw_value, style.border_style),
-            "outline" => style.outline = parse_f64(raw_value, style.outline),
-            "shadow" => style.shadow = parse_f64(raw_value, style.shadow),
+            "outline" => style.outline = parse_f64(raw_value, style.outline).max(0.0),
+            "shadow" => style.shadow = parse_f64(raw_value, style.shadow).max(0.0),
             "alignment" => {
-                let raw_alignment = parse_i32(raw_value, style.alignment);
-                style.alignment = alignment_from_an(raw_alignment).unwrap_or(style.alignment);
+                if let Some(raw_alignment) = parse_i32_prefix(raw_value) {
+                    style.alignment = style_alignment_from_style(raw_alignment, track_type);
+                }
             }
             "marginl" => style.margin_l = parse_i32(raw_value, style.margin_l),
             "marginr" => style.margin_r = parse_i32(raw_value, style.margin_r),
@@ -877,9 +890,9 @@ fn parse_event_line(
         match lowered.as_str() {
             "layer" => event.layer = parse_i32(raw_value, event.layer),
             "start" => event.start = parse_timestamp(raw_value).unwrap_or(event.start),
-            "end" => end = parse_timestamp(raw_value).unwrap_or(end),
+            "end" | "duration" => end = parse_timestamp(raw_value).unwrap_or(end),
             "style" => event.style = parse_style_reference(raw_value, styles),
-            "name" => event.name = raw_value.trim().to_string(),
+            "name" | "actor" => event.name = raw_value.trim().to_string(),
             "marginl" => event.margin_l = parse_i32(raw_value, event.margin_l),
             "marginr" => event.margin_r = parse_i32(raw_value, event.margin_r),
             "marginv" => event.margin_v = parse_i32(raw_value, event.margin_v),
@@ -889,7 +902,7 @@ fn parse_event_line(
         }
     }
 
-    event.duration = (end - event.start).max(0);
+    event.duration = end - event.start;
     Some(event)
 }
 
@@ -909,7 +922,7 @@ fn split_fields(input: &str, field_count: usize) -> Vec<&str> {
             remainder = "";
         }
     }
-    fields.push(remainder.trim());
+    fields.push(remainder.trim_end_matches(['\r', '\t', ' ']));
     fields
 }
 
@@ -932,22 +945,25 @@ fn apply_script_info_field(track: &mut ParsedTrack, key: &str, value: &str) {
 }
 
 fn parse_bool(value: &str, fallback: bool) -> bool {
-    match value.trim().parse::<i32>() {
-        Ok(parsed) => parsed != 0,
-        Err(_) => match value.trim().to_ascii_lowercase().as_str() {
-            "yes" | "true" => true,
-            "no" | "false" => false,
-            _ => fallback,
-        },
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return fallback;
     }
+    if trimmed.to_ascii_lowercase().starts_with("yes") {
+        return true;
+    }
+    parse_i32_prefix(trimmed).map_or(false, |parsed| parsed > 0)
+}
+
+fn parse_style_bool(value: &str, fallback: bool) -> bool {
+    parse_i32_prefix(value.trim()).map_or(fallback, |parsed| parsed != 0)
 }
 
 fn parse_bold_weight(value: &str, fallback: i32) -> i32 {
-    match value.trim().parse::<i32>() {
-        Ok(0) => 400,
-        Ok(1) => 700,
-        Ok(parsed) => parsed,
-        Err(_) => {
+    match parse_i32_prefix(value.trim()) {
+        Some(0) => 400,
+        Some(_) => 700,
+        None => {
             if parse_bool(value, bold_weight_is_active(fallback)) {
                 700
             } else {
@@ -960,44 +976,99 @@ fn parse_bold_weight(value: &str, fallback: i32) -> i32 {
 fn parse_override_bold_weight(value: &str, fallback: i32) -> i32 {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        700
+        fallback
     } else {
-        parse_bold_weight(trimmed, fallback)
+        match parse_i32_prefix(trimmed) {
+            Some(0) => 400,
+            Some(1 | -1) => 700,
+            Some(weight) if weight >= 100 => weight,
+            _ => fallback,
+        }
     }
 }
 
 fn bold_weight_is_active(weight: i32) -> bool {
-    weight == 1 || !(0..700).contains(&weight)
+    weight >= 700
 }
 
 fn parse_i32(value: &str, fallback: i32) -> i32 {
-    value.trim().parse().unwrap_or(fallback)
+    parse_i32_prefix(value.trim()).unwrap_or(fallback)
 }
 
 fn parse_f64(value: &str, fallback: f64) -> f64 {
-    value.trim().parse().unwrap_or(fallback)
+    parse_drawing_number(value.trim()).unwrap_or(fallback)
 }
 
 fn parse_scale(value: &str, fallback: f64) -> f64 {
     let parsed = parse_f64(value, fallback * 100.0);
-    if parsed > 10.0 {
-        parsed / 100.0
-    } else {
-        parsed
-    }
+    (parsed / 100.0).max(0.0)
 }
 
 fn parse_color(value: &str, fallback: u32) -> u32 {
     let trimmed = value.trim();
-    if let Some(hex) = trimmed
-        .strip_prefix("&H")
-        .or_else(|| trimmed.strip_prefix("&h"))
-    {
-        let hex = hex.trim_end_matches('&');
-        u32::from_str_radix(hex, 16).unwrap_or(fallback)
-    } else {
-        trimmed.parse().unwrap_or(fallback)
+    parse_ass_color_prefix(trimmed).unwrap_or(fallback)
+}
+
+fn parse_i32_prefix(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
     }
+
+    let (sign, rest) = match value.as_bytes()[0] {
+        b'+' => (1_i64, &value[1..]),
+        b'-' => (-1_i64, &value[1..]),
+        _ => (1_i64, value),
+    };
+    let (radix, digits) = rest
+        .strip_prefix("&H")
+        .or_else(|| rest.strip_prefix("&h"))
+        .or_else(|| rest.strip_prefix("0x"))
+        .or_else(|| rest.strip_prefix("0X"))
+        .map_or((10, rest), |digits| (16, digits));
+
+    let end = digits
+        .char_indices()
+        .take_while(|(_, character)| character.is_digit(radix))
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?;
+    let parsed = i64::from_str_radix(&digits[..end], radix).ok()?;
+    Some((parsed.saturating_mul(sign)).clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+}
+
+fn parse_ass_color_prefix(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("&H")
+        .or_else(|| value.strip_prefix("&h"))
+    {
+        return parse_hex_prefix_u32(hex).map(|color| color & 0xFFFF_FFFF);
+    }
+    parse_i32_prefix(value).map(|color| color as u32)
+}
+
+fn parse_hex_prefix_u32(value: &str) -> Option<u32> {
+    let value = value.trim();
+    let end = value
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_hexdigit())
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?;
+    u32::from_str_radix(&value[..end], 16).ok()
+}
+
+fn parenthesized_args(value: &str) -> Option<&str> {
+    let inside = value.trim().strip_prefix('(')?;
+    Some(inside.strip_suffix(')').unwrap_or(inside))
+}
+
+fn apply_color_override(value: &str, current: u32, base: u32) -> u32 {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return base;
+    }
+    let rgb = parse_override_rgb(trimmed).unwrap_or(current & 0x00FF_FFFF);
+    (current & 0xFF00_0000) | rgb
 }
 
 fn parse_timestamp(value: &str) -> Option<i64> {
@@ -1035,8 +1106,10 @@ fn parse_style_reference(value: &str, styles: &[ParsedStyle]) -> i32 {
 
     styles
         .iter()
-        .position(|style| style.name.eq_ignore_ascii_case(style_name))
-        .map(|index| index as i32)
+        .enumerate()
+        .rev()
+        .find(|(_, style)| style.name == style_name)
+        .map(|(index, _)| index as i32)
         .unwrap_or(0)
 }
 
@@ -1054,6 +1127,7 @@ fn apply_override_block(
     drawing_scale: &mut i32,
     current_transforms: &mut Vec<ParsedSpanTransform>,
     current_wrap_style: &mut i32,
+    inherited_wrap_style: i32,
 ) {
     for raw_tag in split_override_tags(block) {
         let tag = raw_tag.trim();
@@ -1065,11 +1139,13 @@ fn apply_override_block(
         let previous_transforms = current_transforms.clone();
         if let Some(rest) = tag.strip_prefix("fn") {
             let family = rest.trim();
-            if !family.is_empty() {
+            if family.is_empty() {
+                current_style.font_name = base_style.font_name.clone();
+            } else {
                 current_style.font_name = family.to_string();
             }
         } else if let Some(rest) = tag.strip_prefix("fe") {
-            current_style.encoding = parse_i32(rest, current_style.encoding);
+            current_style.encoding = parse_i32(rest, base_style.encoding);
         } else if let Some(rest) = tag.strip_prefix("kt") {
             flush_span(
                 buffer,
@@ -1121,13 +1197,13 @@ fn apply_override_block(
             current_style.scale_x = base_style.scale_x;
             current_style.scale_y = base_style.scale_y;
         } else if let Some(rest) = tag.strip_prefix("fsp") {
-            current_style.spacing = parse_f64(rest, current_style.spacing);
+            current_style.spacing = parse_f64(rest, base_style.spacing).max(0.0);
         } else if let Some(rest) = tag.strip_prefix("frx") {
-            current_style.rotation_x = parse_f64(rest, current_style.rotation_x);
+            current_style.rotation_x = parse_f64(rest, 0.0);
         } else if let Some(rest) = tag.strip_prefix("fry") {
-            current_style.rotation_y = parse_f64(rest, current_style.rotation_y);
+            current_style.rotation_y = parse_f64(rest, 0.0);
         } else if let Some(rest) = tag.strip_prefix("frz").or_else(|| tag.strip_prefix("fr")) {
-            current_style.rotation_z = parse_f64(rest, current_style.rotation_z);
+            current_style.rotation_z = parse_f64(rest, base_style.angle);
         } else if let Some(rest) = tag.strip_prefix("fax") {
             current_style.shear_x = parse_f64(rest, current_style.shear_x);
         } else if let Some(rest) = tag.strip_prefix("fay") {
@@ -1162,9 +1238,13 @@ fn apply_override_block(
                 parsed.movement_exact = parse_move_exact(rest);
             }
         } else if let Some(rest) = tag.strip_prefix("fade") {
-            parsed.fade = parse_fade(rest);
+            if parsed.fade.is_none() {
+                parsed.fade = parse_fade(rest);
+            }
         } else if let Some(rest) = tag.strip_prefix("fad") {
-            parsed.fade = parse_fad(rest);
+            if parsed.fade.is_none() {
+                parsed.fade = parse_fad(rest);
+            }
         } else if let Some(rest) = tag.strip_prefix("clip") {
             if let Some(rect) = parse_rect_clip(rest) {
                 parsed.clip_rect = Some(rect);
@@ -1183,77 +1263,114 @@ fn apply_override_block(
                 parsed.inverse_clip = false;
             }
         } else if let Some(rest) = tag.strip_prefix("1c").or_else(|| tag.strip_prefix('c')) {
-            current_style.primary_colour = parse_override_color(rest, current_style.primary_colour);
+            current_style.primary_colour = apply_color_override(
+                rest,
+                current_style.primary_colour,
+                base_style.primary_colour,
+            );
         } else if let Some(rest) = tag.strip_prefix("2c") {
-            current_style.secondary_colour =
-                parse_override_color(rest, current_style.secondary_colour);
+            current_style.secondary_colour = apply_color_override(
+                rest,
+                current_style.secondary_colour,
+                base_style.secondary_colour,
+            );
         } else if let Some(rest) = tag.strip_prefix("3c") {
-            current_style.outline_colour = parse_override_color(rest, current_style.outline_colour);
+            current_style.outline_colour = apply_color_override(
+                rest,
+                current_style.outline_colour,
+                base_style.outline_colour,
+            );
         } else if let Some(rest) = tag.strip_prefix("4c") {
-            current_style.back_colour = parse_override_color(rest, current_style.back_colour);
+            current_style.back_colour =
+                apply_color_override(rest, current_style.back_colour, base_style.back_colour);
         } else if let Some(rest) = tag.strip_prefix("alpha") {
-            let alpha = parse_alpha_tag(rest, alpha_of(current_style.primary_colour));
-            current_style.primary_colour = with_alpha(current_style.primary_colour, alpha);
-            current_style.secondary_colour = with_alpha(current_style.secondary_colour, alpha);
-            current_style.outline_colour = with_alpha(current_style.outline_colour, alpha);
-            current_style.back_colour = with_alpha(current_style.back_colour, alpha);
+            if let Some(alpha) = parse_alpha_tag(rest) {
+                current_style.primary_colour = with_alpha(current_style.primary_colour, alpha);
+                current_style.secondary_colour = with_alpha(current_style.secondary_colour, alpha);
+                current_style.outline_colour = with_alpha(current_style.outline_colour, alpha);
+                current_style.back_colour = with_alpha(current_style.back_colour, alpha);
+            } else {
+                current_style.primary_colour = with_alpha(
+                    current_style.primary_colour,
+                    alpha_of(base_style.primary_colour),
+                );
+                current_style.secondary_colour = with_alpha(
+                    current_style.secondary_colour,
+                    alpha_of(base_style.secondary_colour),
+                );
+                current_style.outline_colour = with_alpha(
+                    current_style.outline_colour,
+                    alpha_of(base_style.outline_colour),
+                );
+                current_style.back_colour =
+                    with_alpha(current_style.back_colour, alpha_of(base_style.back_colour));
+            }
         } else if let Some(rest) = tag.strip_prefix("1a") {
-            let alpha = parse_alpha_tag(rest, alpha_of(current_style.primary_colour));
+            let alpha =
+                parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(base_style.primary_colour));
             current_style.primary_colour = with_alpha(current_style.primary_colour, alpha);
         } else if let Some(rest) = tag.strip_prefix("2a") {
-            let alpha = parse_alpha_tag(rest, alpha_of(current_style.secondary_colour));
+            let alpha =
+                parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(base_style.secondary_colour));
             current_style.secondary_colour = with_alpha(current_style.secondary_colour, alpha);
         } else if let Some(rest) = tag.strip_prefix("3a") {
-            let alpha = parse_alpha_tag(rest, alpha_of(current_style.outline_colour));
+            let alpha =
+                parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(base_style.outline_colour));
             current_style.outline_colour = with_alpha(current_style.outline_colour, alpha);
         } else if let Some(rest) = tag.strip_prefix("4a") {
-            let alpha = parse_alpha_tag(rest, alpha_of(current_style.back_colour));
+            let alpha = parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(base_style.back_colour));
             current_style.back_colour = with_alpha(current_style.back_colour, alpha);
         } else if let Some(rest) = tag.strip_prefix("xbord") {
-            current_style.border_x = parse_f64(rest, current_style.border_x);
+            current_style.border_x = parse_f64(rest, base_style.outline).max(0.0);
         } else if let Some(rest) = tag.strip_prefix("ybord") {
-            current_style.border_y = parse_f64(rest, current_style.border_y);
+            current_style.border_y = parse_f64(rest, base_style.outline).max(0.0);
         } else if let Some(rest) = tag.strip_prefix("bord") {
-            current_style.border = parse_f64(rest, current_style.border);
+            current_style.border = parse_f64(rest, base_style.outline).max(0.0);
             current_style.border_x = current_style.border;
             current_style.border_y = current_style.border;
         } else if let Some(rest) = tag.strip_prefix("xshad") {
-            current_style.shadow_x = parse_f64(rest, current_style.shadow_x);
+            current_style.shadow_x = parse_f64(rest, base_style.shadow);
         } else if let Some(rest) = tag.strip_prefix("yshad") {
-            current_style.shadow_y = parse_f64(rest, current_style.shadow_y);
+            current_style.shadow_y = parse_f64(rest, base_style.shadow);
         } else if let Some(rest) = tag.strip_prefix("shad") {
-            current_style.shadow = parse_f64(rest, current_style.shadow);
+            current_style.shadow = parse_f64(rest, base_style.shadow).max(0.0);
             current_style.shadow_x = current_style.shadow;
             current_style.shadow_y = current_style.shadow;
         } else if let Some(rest) = tag.strip_prefix("blur") {
-            current_style.blur = parse_f64(rest, current_style.blur);
+            current_style.blur = parse_f64(rest, base_style.blur).clamp(0.0, 100.0);
         } else if let Some(rest) = tag.strip_prefix("be") {
-            current_style.be = parse_f64(rest, current_style.be);
+            current_style.be = parse_f64(rest, 0.0).clamp(0.0, 127.0).trunc();
         } else if let Some(rest) = tag.strip_prefix('t') {
             current_transforms.extend(parse_transforms(rest, current_style));
         } else if let Some(rest) = tag.strip_prefix('u') {
-            current_style.underline = parse_override_bool(rest, current_style.underline);
+            current_style.underline = parse_override_bool(rest, base_style.underline);
         } else if let Some(rest) = tag.strip_prefix('s') {
-            current_style.strike_out = parse_override_bool(rest, current_style.strike_out);
+            current_style.strike_out = parse_override_bool(rest, base_style.strike_out);
         } else if let Some(rest) = tag.strip_prefix('b') {
-            current_style.font_weight = parse_override_bold_weight(rest, current_style.font_weight);
+            current_style.font_weight = parse_override_bold_weight(rest, base_style.font_weight);
             current_style.bold = bold_weight_is_active(current_style.font_weight);
         } else if let Some(rest) = tag.strip_prefix('i') {
-            current_style.italic = parse_override_bool(rest, current_style.italic);
+            current_style.italic = parse_override_bool(rest, base_style.italic);
         } else if let Some(rest) = tag.strip_prefix("an") {
-            if let Ok(value) = rest.trim().parse::<i32>() {
-                parsed.alignment = alignment_from_an(value);
+            if parsed.alignment.is_none() {
+                let value = parse_i32(rest, 0);
+                parsed.alignment = Some(alignment_from_an(value).unwrap_or(base_style.alignment));
             }
         } else if let Some(rest) = tag.strip_prefix('a') {
-            if let Ok(value) = rest.trim().parse::<i32>() {
-                parsed.alignment = alignment_from_legacy_a(value);
+            if parsed.alignment.is_none() {
+                let value = parse_i32(rest, 0);
+                parsed.alignment =
+                    Some(alignment_from_legacy_a(value).unwrap_or(base_style.alignment));
             }
         } else if let Some(rest) = tag.strip_prefix('q') {
-            if let Ok(value) = rest.trim().parse::<i32>() {
-                let value = value.clamp(0, 3);
-                parsed.wrap_style = Some(value);
-                *current_wrap_style = value;
-            }
+            let value = parse_i32(rest, inherited_wrap_style);
+            let value = if (0..=3).contains(&value) {
+                value
+            } else {
+                inherited_wrap_style
+            };
+            parsed.wrap_style = Some(value);
+            *current_wrap_style = value;
         } else if let Some(rest) = tag.strip_prefix("org") {
             parsed.origin = parse_pos(rest);
             parsed.origin_exact = parse_pos_exact(rest);
@@ -1378,11 +1495,7 @@ fn suppress_transform_fields_for_override(
 }
 
 fn parse_transforms(value: &str, current_style: &ParsedSpanStyle) -> Vec<ParsedSpanTransform> {
-    let Some(inside) = value
-        .trim()
-        .strip_prefix('(')
-        .and_then(|value| value.strip_suffix(')'))
-    else {
+    let Some(inside) = parenthesized_args(value) else {
         return Vec::new();
     };
     let inside = inside.trim();
@@ -1415,7 +1528,7 @@ fn parse_transform_ms(value: &str, fallback: i32) -> i32 {
 }
 
 fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<ParsedSpanTransform> {
-    let inside = value.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    let inside = parenthesized_args(value)?.trim();
     let tag_start = inside.find('\\')?;
     let (timing_part, tags_part) = inside.split_at(tag_start);
     let params = timing_part
@@ -1428,13 +1541,13 @@ fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<Parse
         [] => (0, None, 1.0),
         [accel] => (0, None, parse_f64(accel, 1.0)),
         [start, end] => {
-            let start = parse_transform_ms(start, 0).max(0);
-            let end = parse_transform_ms(end, 0).max(start);
+            let start = parse_transform_ms(start, 0);
+            let end = parse_transform_ms(end, 0);
             (start, Some(end), 1.0)
         }
         [start, end, accel, ..] => {
-            let start = parse_transform_ms(start, 0).max(0);
-            let end = parse_transform_ms(end, 0).max(start);
+            let start = parse_transform_ms(start, 0);
+            let end = parse_transform_ms(end, 0);
             (start, Some(end), parse_f64(accel, 1.0))
         }
     };
@@ -1452,7 +1565,7 @@ fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<Parse
     (!animated.is_empty()).then_some(ParsedSpanTransform {
         start_ms,
         end_ms,
-        accel: if accel > 0.0 { accel } else { 1.0 },
+        accel,
         style: animated,
     })
 }
@@ -1636,7 +1749,7 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
     } else if let Some(rest) = tag.strip_prefix("4c") {
         style.back_colour = parse_override_color(rest, style.back_colour);
     } else if let Some(rest) = tag.strip_prefix("alpha") {
-        let alpha = parse_alpha_tag(rest, alpha_of(style.primary_colour));
+        let alpha = parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(style.primary_colour));
         style.primary_colour = with_alpha(style.primary_colour, alpha);
         style.secondary_colour = with_alpha(style.secondary_colour, alpha);
         style.outline_colour = with_alpha(style.outline_colour, alpha);
@@ -1644,22 +1757,22 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
     } else if let Some(rest) = tag.strip_prefix("1a") {
         style.primary_colour = with_alpha(
             style.primary_colour,
-            parse_alpha_tag(rest, alpha_of(style.primary_colour)),
+            parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(style.primary_colour)),
         );
     } else if let Some(rest) = tag.strip_prefix("2a") {
         style.secondary_colour = with_alpha(
             style.secondary_colour,
-            parse_alpha_tag(rest, alpha_of(style.secondary_colour)),
+            parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(style.secondary_colour)),
         );
     } else if let Some(rest) = tag.strip_prefix("3a") {
         style.outline_colour = with_alpha(
             style.outline_colour,
-            parse_alpha_tag(rest, alpha_of(style.outline_colour)),
+            parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(style.outline_colour)),
         );
     } else if let Some(rest) = tag.strip_prefix("4a") {
         style.back_colour = with_alpha(
             style.back_colour,
-            parse_alpha_tag(rest, alpha_of(style.back_colour)),
+            parse_alpha_tag(rest).unwrap_or_else(|| alpha_of(style.back_colour)),
         );
     } else if let Some(rest) = tag.strip_prefix("fscx") {
         style.scale_x = parse_scale(rest, style.scale_x);
@@ -1678,13 +1791,13 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
     } else if let Some(rest) = tag.strip_prefix("fay") {
         style.shear_y = parse_f64(rest, style.shear_y);
     } else if let Some(rest) = tag.strip_prefix("fs") {
-        style.font_size = parse_f64(rest, style.font_size);
+        style.font_size = parse_font_size_override(rest, style.font_size, style.font_size);
     } else if let Some(rest) = tag.strip_prefix("xbord") {
-        style.border_x = parse_f64(rest, style.border_x);
+        style.border_x = parse_f64(rest, style.border_x).max(0.0);
     } else if let Some(rest) = tag.strip_prefix("ybord") {
-        style.border_y = parse_f64(rest, style.border_y);
+        style.border_y = parse_f64(rest, style.border_y).max(0.0);
     } else if let Some(rest) = tag.strip_prefix("bord") {
-        style.border = parse_f64(rest, style.border);
+        style.border = parse_f64(rest, style.border).max(0.0);
         style.border_x = style.border;
         style.border_y = style.border;
     } else if let Some(rest) = tag.strip_prefix("xshad") {
@@ -1692,13 +1805,13 @@ fn apply_transform_tag(tag: &str, style: &mut ParsedSpanStyle) {
     } else if let Some(rest) = tag.strip_prefix("yshad") {
         style.shadow_y = parse_f64(rest, style.shadow_y);
     } else if let Some(rest) = tag.strip_prefix("shad") {
-        style.shadow = parse_f64(rest, style.shadow);
+        style.shadow = parse_f64(rest, style.shadow).max(0.0);
         style.shadow_x = style.shadow;
         style.shadow_y = style.shadow;
     } else if let Some(rest) = tag.strip_prefix("blur") {
-        style.blur = parse_f64(rest, style.blur);
+        style.blur = parse_f64(rest, style.blur).clamp(0.0, 100.0);
     } else if let Some(rest) = tag.strip_prefix("be") {
-        style.be = parse_f64(rest, style.be);
+        style.be = parse_f64(rest, style.be).clamp(0.0, 127.0).trunc();
     }
 }
 
@@ -1756,7 +1869,7 @@ fn parse_font_size_override(value: &str, current: f64, base: f64) -> f64 {
         return base;
     }
 
-    let parsed = trimmed.parse::<f64>().unwrap_or(0.0);
+    let parsed = parse_drawing_number(trimmed).unwrap_or(0.0);
     let resolved = if trimmed.starts_with(['+', '-']) {
         current * (1.0 + parsed / 10.0)
     } else {
@@ -1767,30 +1880,38 @@ fn parse_font_size_override(value: &str, current: f64, base: f64) -> f64 {
 }
 
 fn parse_karaoke_duration(value: &str) -> Option<i32> {
-    value
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .map(|centiseconds| centiseconds.max(0) * 10)
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(1000);
+    }
+    parse_drawing_number(trimmed).map(|centiseconds| (centiseconds * 10.0) as i32)
 }
 
 fn parse_override_color(value: &str, fallback: u32) -> u32 {
-    let trimmed = value.trim();
-    let trimmed = trimmed.trim_matches('&').trim_start_matches(['H', 'h']);
-    if trimmed.is_empty() {
-        return fallback;
-    }
-
-    u32::from_str_radix(trimmed, 16).unwrap_or(fallback)
+    apply_color_override(value, fallback, fallback)
 }
 
-fn parse_alpha_tag(value: &str, fallback: u8) -> u8 {
+fn parse_override_rgb(value: &str) -> Option<u32> {
     let trimmed = value.trim();
-    let trimmed = trimmed.trim_matches('&').trim_start_matches(['H', 'h']);
+    let trimmed = trimmed.trim_start_matches('&');
+    let trimmed = trimmed
+        .strip_prefix('H')
+        .or_else(|| trimmed.strip_prefix('h'))
+        .unwrap_or(trimmed);
+    parse_hex_prefix_u32(trimmed).map(|color| color & 0x00FF_FFFF)
+}
+
+fn parse_alpha_tag(value: &str) -> Option<u8> {
+    let trimmed = value.trim();
     if trimmed.is_empty() {
-        return fallback;
+        return None;
     }
-    u8::from_str_radix(trimmed, 16).unwrap_or(fallback)
+    let trimmed = trimmed.trim_start_matches('&');
+    let trimmed = trimmed
+        .strip_prefix('H')
+        .or_else(|| trimmed.strip_prefix('h'))
+        .unwrap_or(trimmed);
+    parse_hex_prefix_u32(trimmed).map(|alpha| alpha as u8)
 }
 
 fn alpha_of(color: u32) -> u8 {
@@ -1804,7 +1925,7 @@ fn with_alpha(color: u32, alpha: u8) -> u32 {
 fn parse_override_bool(value: &str, fallback: bool) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        true
+        fallback
     } else {
         parse_bool(trimmed, fallback)
     }
@@ -1826,6 +1947,11 @@ fn alignment_from_an(value: i32) -> Option<i32> {
 }
 
 fn alignment_from_legacy_a(value: i32) -> Option<i32> {
+    if !(1..=11).contains(&value) {
+        return None;
+    }
+
+    let value = if value & 0x3 == 0 { 5 } else { value };
     let halign = match value & 0x3 {
         1 => ass::HALIGN_LEFT,
         2 => ass::HALIGN_CENTER,
@@ -1842,9 +1968,39 @@ fn alignment_from_legacy_a(value: i32) -> Option<i32> {
     Some(valign | halign)
 }
 
+fn style_alignment_from_style(value: i32, track_type: TrackType) -> i32 {
+    if track_type == TrackType::Ssa {
+        match value {
+            8 => 3,
+            4 => 11,
+            _ => value,
+        }
+    } else {
+        style_alignment_from_numpad(value)
+    }
+}
+
+fn style_alignment_from_numpad(value: i32) -> i32 {
+    let value = match value.checked_abs() {
+        Some(value) => value,
+        None => 2,
+    };
+    if value == 0 {
+        return 0;
+    }
+    let halign = ((value - 1) % 3) + 1;
+    let valign = if value <= 3 {
+        ass::VALIGN_SUB
+    } else if value <= 6 {
+        ass::VALIGN_CENTER
+    } else {
+        ass::VALIGN_TOP
+    };
+    valign | halign
+}
+
 fn parse_pos(value: &str) -> Option<(i32, i32)> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let inside = parenthesized_args(value)?;
     let mut parts = inside.split(',').map(str::trim);
     let x = parts.next()?.parse::<i32>().ok()?;
     let y = parts.next()?.parse::<i32>().ok()?;
@@ -1852,8 +2008,7 @@ fn parse_pos(value: &str) -> Option<(i32, i32)> {
 }
 
 fn parse_pos_exact(value: &str) -> Option<(f64, f64)> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let inside = parenthesized_args(value)?;
     let mut parts = inside.split(',').map(str::trim);
     let x = parts.next()?.parse::<f64>().ok()?;
     let y = parts.next()?.parse::<f64>().ok()?;
@@ -1864,8 +2019,7 @@ fn parse_pos_exact(value: &str) -> Option<(f64, f64)> {
 }
 
 fn parse_rect_clip(value: &str) -> Option<Rect> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let inside = parenthesized_args(value)?;
     let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
     if parts.len() != 4 {
         return None;
@@ -1886,8 +2040,7 @@ fn parse_rect_clip(value: &str) -> Option<Rect> {
 }
 
 fn parse_rect_clip_exact(value: &str) -> Option<ParsedRectF64> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let inside = parenthesized_args(value)?;
     let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
     if parts.len() != 4 {
         return None;
@@ -1908,15 +2061,14 @@ fn parse_rect_clip_exact(value: &str) -> Option<ParsedRectF64> {
 }
 
 fn parse_vector_clip(value: &str) -> Option<ParsedVectorClip> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let inside = parenthesized_args(value)?.trim();
     if inside.is_empty() {
         return None;
     }
 
     let (scale, drawing) = if let Some((scale, drawing)) = inside.split_once(',') {
-        if let Ok(scale) = scale.trim().parse::<i32>() {
-            (scale.max(1), drawing.trim())
+        if let Some(scale) = parse_i32_prefix(scale.trim()) {
+            (scale, drawing.trim())
         } else {
             (1, inside)
         }
@@ -2233,8 +2385,7 @@ fn bounds_from_polygons(polygons: &[Vec<Point>]) -> Option<Rect> {
 }
 
 fn parse_move(value: &str) -> Option<ParsedMovement> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let inside = parenthesized_args(value)?;
     let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
     let (x1, y1, x2, y2, t1_ms, t2_ms) = match parts.as_slice() {
         [x1, y1, x2, y2] => (
@@ -2246,8 +2397,8 @@ fn parse_move(value: &str) -> Option<ParsedMovement> {
             0,
         ),
         [x1, y1, x2, y2, t1, t2] => {
-            let mut t1_ms = t1.parse::<i32>().ok()?;
-            let mut t2_ms = t2.parse::<i32>().ok()?;
+            let mut t1_ms = parse_i32_prefix(t1.trim())?;
+            let mut t2_ms = parse_i32_prefix(t2.trim())?;
             if t1_ms > t2_ms {
                 std::mem::swap(&mut t1_ms, &mut t2_ms);
             }
@@ -2272,8 +2423,7 @@ fn parse_move(value: &str) -> Option<ParsedMovement> {
 }
 
 fn parse_move_exact(value: &str) -> Option<ParsedMovementExact> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let inside = parenthesized_args(value)?;
     let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
     let (x1, y1, x2, y2, t1_ms, t2_ms) = match parts.as_slice() {
         [x1, y1, x2, y2] => (
@@ -2285,8 +2435,8 @@ fn parse_move_exact(value: &str) -> Option<ParsedMovementExact> {
             0,
         ),
         [x1, y1, x2, y2, t1, t2] => {
-            let mut t1_ms = t1.parse::<i32>().ok()?;
-            let mut t2_ms = t2.parse::<i32>().ok()?;
+            let mut t1_ms = parse_i32_prefix(t1.trim())?;
+            let mut t2_ms = parse_i32_prefix(t2.trim())?;
             if t1_ms > t2_ms {
                 std::mem::swap(&mut t1_ms, &mut t2_ms);
             }
@@ -2314,36 +2464,32 @@ fn parse_move_exact(value: &str) -> Option<ParsedMovementExact> {
 }
 
 fn parse_fad(value: &str) -> Option<ParsedFade> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
-    let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
-    let [fade_in, fade_out] = parts.as_slice() else {
-        return None;
-    };
-
-    Some(ParsedFade::Simple {
-        fade_in_ms: fade_in.parse::<i32>().ok()?,
-        fade_out_ms: fade_out.parse::<i32>().ok()?,
-    })
+    parse_fade_tag(value)
 }
 
 fn parse_fade(value: &str) -> Option<ParsedFade> {
-    let trimmed = value.trim();
-    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?;
-    let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
-    let [a1, a2, a3, t1, t2, t3, t4] = parts.as_slice() else {
-        return None;
-    };
+    parse_fade_tag(value)
+}
 
-    Some(ParsedFade::Complex {
-        alpha1: a1.parse::<i32>().ok()?.clamp(0, 255),
-        alpha2: a2.parse::<i32>().ok()?.clamp(0, 255),
-        alpha3: a3.parse::<i32>().ok()?.clamp(0, 255),
-        t1_ms: t1.parse::<i32>().ok()?,
-        t2_ms: t2.parse::<i32>().ok()?,
-        t3_ms: t3.parse::<i32>().ok()?,
-        t4_ms: t4.parse::<i32>().ok()?,
-    })
+fn parse_fade_tag(value: &str) -> Option<ParsedFade> {
+    let inside = parenthesized_args(value)?;
+    let parts = inside.split(',').map(str::trim).collect::<Vec<_>>();
+    match parts.as_slice() {
+        [fade_in, fade_out] => Some(ParsedFade::Simple {
+            fade_in_ms: parse_i32(fade_in, 0),
+            fade_out_ms: parse_i32(fade_out, 0),
+        }),
+        [a1, a2, a3, t1, t2, t3, t4] => Some(ParsedFade::Complex {
+            alpha1: parse_i32(a1, 0),
+            alpha2: parse_i32(a2, 0),
+            alpha3: parse_i32(a3, 0),
+            t1_ms: parse_i32(t1, 0),
+            t2_ms: parse_i32(t2, 0),
+            t3_ms: parse_i32(t3, 0),
+            t4_ms: parse_i32(t4, 0),
+        }),
+        _ => None,
+    }
 }
 
 fn resolve_reset_style(
@@ -2358,7 +2504,8 @@ fn resolve_reset_style(
 
     styles
         .iter()
-        .find(|style| style.name.eq_ignore_ascii_case(name))
+        .rev()
+        .find(|style| style.name == name)
         .map(ParsedSpanStyle::from_style)
         .unwrap_or_else(|| ParsedSpanStyle::from_style(base_style))
 }
@@ -2418,6 +2565,10 @@ fn parse_matrix(value: &str) -> YCbCrMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STYLE_FORMAT: &str = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding";
+    const EVENT_FORMAT: &str =
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text";
 
     #[test]
     fn parses_p_drawing_with_numeric_token_followed_by_plain_text_suffix() {
@@ -2493,6 +2644,75 @@ mod tests {
     }
 
     #[test]
+    fn resolves_styles_by_exact_last_match_like_libass() {
+        let input = format!(
+            "[V4+ Styles]\n{STYLE_FORMAT}\n\
+Style: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\
+Style: Sign,Old,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,20,20,20,1\n\
+Style: sign,Lower,30,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,20,20,20,1\n\
+Style: Sign,New,40,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,20,20,20,1\n\n\
+[Events]\n{EVENT_FORMAT}\n\
+Dialogue: 0,0:00:00.00,0:00:01.00,Sign,,0000,0000,0000,,Upper\n\
+Dialogue: 0,0:00:00.00,0:00:01.00,sign,,0000,0000,0000,,Lower\n\
+Dialogue: 0,0:00:00.00,0:00:01.00,SIGN,,0000,0000,0000,,Fallback"
+        );
+        let track = parse_script_text(&input).expect("script should parse");
+
+        assert_eq!(track.events[0].style, 3);
+        assert_eq!(track.events[1].style, 2);
+        assert_eq!(track.events[2].style, 0);
+
+        let parsed = parse_dialogue_text(
+            "{\\rsign}lower{\\rSign}upper{\\rSIGN}fallback",
+            &track.styles[0],
+            &track.styles,
+        );
+        assert_eq!(parsed.lines[0].spans[0].style.font_size, 30.0);
+        assert_eq!(parsed.lines[0].spans[1].style.font_size, 40.0);
+        assert_eq!(parsed.lines[0].spans[2].style.font_size, 20.0);
+    }
+
+    #[test]
+    fn defaults_empty_style_name_but_preserves_empty_font_like_libass() {
+        let input = format!(
+            "[V4+ Styles]\n{STYLE_FORMAT}\n\
+Style: , ,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,0,10,10,10,1"
+        );
+        let track = parse_script_text(&input).expect("script should parse");
+
+        assert_eq!(track.styles[0].name, "Default");
+        assert_eq!(track.styles[0].font_name, "");
+        assert_eq!(track.styles[0].alignment, 0);
+    }
+
+    #[test]
+    fn clamps_style_spacing_and_booleanizes_negative_flags_like_libass() {
+        let input = format!(
+            "[V4+ Styles]\n{STYLE_FORMAT}\n\
+Style: Default,Arial,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,-1,-2,-3,100,100,-5,0,1,2,2,2,10,10,10,1"
+        );
+        let track = parse_script_text(&input).expect("script should parse");
+        let style = &track.styles[0];
+
+        assert_eq!(style.font_weight, 700);
+        assert!(style.bold);
+        assert!(style.italic);
+        assert!(style.underline);
+        assert!(style.strike_out);
+        assert_eq!(style.spacing, 0.0);
+    }
+
+    #[test]
+    fn v4_style_alignment_uses_ssa_legacy_quirks() {
+        let input = "[V4 Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\nStyle: Four,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,1,2,2,4,10,10,10,0,1\nStyle: Eight,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,1,2,2,8,10,10,10,0,1";
+        let track = parse_script_text(input).expect("script should parse");
+
+        assert_eq!(track.track_type, TrackType::Ssa);
+        assert_eq!(track.styles[0].alignment, 11);
+        assert_eq!(track.styles[1].alignment, 3);
+    }
+
+    #[test]
     fn parses_dialogue_overrides_into_spans_and_event_metadata() {
         let base_style = ParsedStyle {
             font_name: "Arial".to_string(),
@@ -2522,6 +2742,31 @@ mod tests {
         assert_eq!(parsed.lines[0].spans[0].style.spacing, 3.0);
         assert_eq!(parsed.lines[0].spans[1].style.font_name, "DejaVu Sans");
         assert_eq!(parsed.lines[1].text, "again");
+    }
+
+    #[test]
+    fn first_alignment_override_wins_and_invalid_values_reset_to_base() {
+        let base_style = ParsedStyle {
+            alignment: ass::VALIGN_SUB | ass::HALIGN_RIGHT,
+            ..ParsedStyle::default()
+        };
+
+        let first = parse_dialogue_text("{\\an7\\an2}first", &base_style, &[]);
+        assert_eq!(first.alignment, Some(ass::VALIGN_TOP | ass::HALIGN_LEFT));
+
+        let legacy_a4 = parse_dialogue_text("{\\a4}legacy", &base_style, &[]);
+        let legacy_a8 = parse_dialogue_text("{\\a8}legacy", &base_style, &[]);
+        assert_eq!(
+            legacy_a4.alignment,
+            Some(ass::VALIGN_TOP | ass::HALIGN_LEFT)
+        );
+        assert_eq!(
+            legacy_a8.alignment,
+            Some(ass::VALIGN_TOP | ass::HALIGN_LEFT)
+        );
+
+        let invalid = parse_dialogue_text("{\\an12\\an7}invalid", &base_style, &[]);
+        assert_eq!(invalid.alignment, Some(base_style.alignment));
     }
 
     #[test]
@@ -2587,6 +2832,20 @@ mod tests {
         assert_eq!((span_style.secondary_colour >> 24) & 0xff, 0x40);
         assert_eq!((span_style.outline_colour >> 24) & 0xff, 0x20);
         assert_eq!((span_style.back_colour >> 24) & 0xff, 0x80);
+    }
+
+    #[test]
+    fn color_overrides_preserve_alpha_and_empty_args_reset_base_channels() {
+        let style = ParsedStyle {
+            primary_colour: 0x2212_3456,
+            secondary_colour: 0x3344_5566,
+            ..ParsedStyle::default()
+        };
+        let parsed = parse_dialogue_text("{\\1a&H80&\\1c&H112233&\\2a&H40&\\2c}alpha", &style, &[]);
+        let span_style = &parsed.lines[0].spans[0].style;
+
+        assert_eq!(span_style.primary_colour, 0x8011_2233);
+        assert_eq!(span_style.secondary_colour, style.secondary_colour);
     }
 
     #[test]
@@ -2775,6 +3034,42 @@ mod tests {
     }
 
     #[test]
+    fn fade_parsers_accept_libass_argument_counts_and_first_tag_wins() {
+        let base_style = ParsedStyle::default();
+        let fade_two = parse_dialogue_text("{\\fade(120,240)}Fade", &base_style, &[]);
+        assert_eq!(
+            fade_two.fade,
+            Some(ParsedFade::Simple {
+                fade_in_ms: 120,
+                fade_out_ms: 240,
+            })
+        );
+
+        let fad_seven = parse_dialogue_text("{\\fad(1,2,3,4,5,6,7)}Fade", &base_style, &[]);
+        assert_eq!(
+            fad_seven.fade,
+            Some(ParsedFade::Complex {
+                alpha1: 1,
+                alpha2: 2,
+                alpha3: 3,
+                t1_ms: 4,
+                t2_ms: 5,
+                t3_ms: 6,
+                t4_ms: 7,
+            })
+        );
+
+        let first_wins = parse_dialogue_text("{\\fad(10,20)\\fade(1,2)}Fade", &base_style, &[]);
+        assert_eq!(
+            first_wins.fade,
+            Some(ParsedFade::Simple {
+                fade_in_ms: 10,
+                fade_out_ms: 20,
+            })
+        );
+    }
+
+    #[test]
     fn parses_karaoke_spans() {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\k10}Ka{\\K20}ra{\\ko30}oke", &base_style, &[]);
@@ -2833,6 +3128,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_karaoke_empty_decimal_and_negative_durations_like_libass() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\k}A{\\k1.5}B{\\k-2}C", &base_style, &[]);
+
+        assert_eq!(parsed.lines[0].spans.len(), 3);
+        assert_eq!(
+            parsed.lines[0].spans[0].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 0,
+                duration_ms: 1000,
+                mode: ParsedKaraokeMode::FillSwap,
+            })
+        );
+        assert_eq!(
+            parsed.lines[0].spans[1].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 1000,
+                duration_ms: 15,
+                mode: ParsedKaraokeMode::FillSwap,
+            })
+        );
+        assert_eq!(
+            parsed.lines[0].spans[2].karaoke,
+            Some(ParsedKaraokeSpan {
+                start_ms: 1015,
+                duration_ms: -20,
+                mode: ParsedKaraokeMode::FillSwap,
+            })
+        );
+    }
+
+    #[test]
     fn parses_font_size_relative_and_scale_reset_overrides() {
         let base_style = ParsedStyle {
             font_size: 20.0,
@@ -2856,16 +3183,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_backslash_n_as_space_unless_wrap_style_two() {
+    fn parses_backslash_n_breaks_only_with_wrap_style_one_or_three() {
         let base_style = ParsedStyle::default();
         let normal = parse_dialogue_text("one\\ntwo", &base_style, &[]);
         assert_eq!(normal.lines.len(), 1);
         assert_eq!(normal.lines[0].spans[0].text, "one two");
 
         let q2 = parse_dialogue_text("{\\q2}one\\ntwo", &base_style, &[]);
-        assert_eq!(q2.lines.len(), 2);
-        assert_eq!(q2.lines[0].spans[0].text, "one");
-        assert_eq!(q2.lines[1].spans[0].text, "two");
+        assert_eq!(q2.lines.len(), 1);
+        assert_eq!(q2.lines[0].spans[0].text, "one two");
+
+        for wrap_style in [1, 3] {
+            let parsed =
+                parse_dialogue_text_with_wrap_style("one\\ntwo", &base_style, &[], wrap_style);
+            assert_eq!(parsed.lines.len(), 2);
+            assert_eq!(parsed.lines[0].spans[0].text, "one");
+            assert_eq!(parsed.lines[1].spans[0].text, "two");
+        }
+
+        let reset = parse_dialogue_text_with_wrap_style("{\\q2\\q4}one\\ntwo", &base_style, &[], 1);
+        assert_eq!(reset.wrap_style, Some(1));
+        assert_eq!(reset.lines.len(), 2);
     }
 
     #[test]
@@ -3004,6 +3342,20 @@ mod tests {
         assert_eq!(transforms[0].start_ms, 53);
         assert_eq!(transforms[0].end_ms, Some(107));
         assert_eq!(transforms[0].style.rotation_z, Some(4.0));
+    }
+
+    #[test]
+    fn transform_preserves_negative_times_zero_accel_and_unclosed_args() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\t(-100,100,0,\\fscx10\\bord-3}Text", &base_style, &[]);
+
+        let transforms = &parsed.lines[0].spans[0].transforms;
+        assert_eq!(transforms.len(), 1);
+        assert_eq!(transforms[0].start_ms, -100);
+        assert_eq!(transforms[0].end_ms, Some(100));
+        assert_eq!(transforms[0].accel, 0.0);
+        assert_eq!(transforms[0].style.scale_x, Some(0.1));
+        assert_eq!(transforms[0].style.border, Some(0.0));
     }
 
     #[test]

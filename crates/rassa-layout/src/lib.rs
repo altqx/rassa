@@ -276,13 +276,6 @@ fn auto_wrap_width(
     _position: Option<(i32, i32)>,
     _alignment: i32,
 ) -> f32 {
-    if track.play_res_x == ParsedTrack::default().play_res_x
-        && track.play_res_y == ParsedTrack::default().play_res_y
-        && track.layout_res_x == 0
-        && track.layout_res_y == 0
-    {
-        return f32::INFINITY;
-    }
     let margin_l = resolve_margin(event.margin_l, style.margin_l).max(0);
     let margin_r = resolve_margin(event.margin_r, style.margin_r).max(0);
     (track.play_res_x - margin_l - margin_r).max(0) as f32
@@ -815,6 +808,30 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
     }
 
     #[test]
+    fn layout_wraps_against_default_script_resolution() {
+        let track = parse_track(
+            "[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,190,190,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert!(
+            layout.lines.len() > 1,
+            "missing PlayRes should still use ASS default resolution for wrapping"
+        );
+        assert!(layout.lines.iter().all(|line| line.width <= 4.0));
+    }
+
+    #[test]
     fn explicit_hard_break_lines_are_not_auto_wrapped_again() {
         let track = parse_track(
             "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,Fontin Sans Rg,70,&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,1,3.5,1.5,2,140,140,45,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:06:06.20,0:06:11.56,Main,,0,0,0,,Eu sei que a Karin é fofa, mas quem seria tão\\N descaradamente indecente em plena luz do dia?!",
@@ -886,6 +903,32 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(10,20)\\an5\\q
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
 
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].text, "alpha beta gamma delta");
+    }
+
+    #[test]
+    fn layout_wraps_exact_positioned_text_against_margins_not_anchor_space() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 40
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(10.5,20.25)\\an5\\q0}alpha beta gamma delta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.position_exact, Some((10.5, 20.25)));
         assert_eq!(layout.lines.len(), 1);
         assert_eq!(layout.lines[0].text, "alpha beta gamma delta");
     }
