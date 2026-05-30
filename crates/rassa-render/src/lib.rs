@@ -480,16 +480,6 @@ impl RenderEngine {
                             outline: run_outline_start,
                             character: run_character_start,
                         };
-                        normalize_libass_animated_identity_drawing_planes(
-                            &mut shadow_planes,
-                            &mut outline_planes,
-                            &mut character_planes,
-                            run_plane_starts,
-                            run_transform,
-                            track.events.get(event.event_index),
-                            line.runs.iter().all(|run| run.drawing.is_some()),
-                            effective_style.blur.max(effective_style.be),
-                        );
                         apply_run_transform_to_recent_planes(
                             &mut shadow_planes,
                             &mut outline_planes,
@@ -724,37 +714,6 @@ impl RenderEngine {
                         y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
                     });
                 }
-                if pads_positioned_center_animated_text_allocation(
-                    line,
-                    track.events.get(event.event_index),
-                    now_ms,
-                    effective_position,
-                    event.alignment,
-                ) {
-                    let has_active_transform = positioned_center_line_has_active_transform(
-                        line,
-                        track.events.get(event.event_index),
-                        now_ms,
-                    );
-                    let has_active_projective_transform =
-                        positioned_center_line_has_active_projective_transform(
-                            line,
-                            track.events.get(event.event_index),
-                            now_ms,
-                        );
-                    let has_outline_or_shadow = line_has_outline_or_shadow(line);
-                    pad_libass_positioned_center_animated_text_line(
-                        &mut shadow_planes,
-                        &mut outline_planes,
-                        &mut character_planes,
-                        line_plane_starts,
-                        has_active_projective_transform,
-                        has_active_transform,
-                        has_outline_or_shadow,
-                        line_single_text_char(line),
-                        event.position_exact.map(|(x, _)| x.fract().abs()),
-                    );
-                }
                 align_positioned_text_line_bottom(
                     &mut shadow_planes,
                     &mut outline_planes,
@@ -825,23 +784,7 @@ impl RenderEngine {
                 } else {
                     clip_rect
                 };
-                let pads_transformed_text_rect_clip =
-                    !event.inverse_clip && libass_pads_transformed_text_rect_clip(event);
-                if pads_transformed_text_rect_clip {
-                    event_planes = event_planes
-                        .into_iter()
-                        .map(|plane| prepad_libass_transformed_text_rect_clip_plane(plane, event))
-                        .collect();
-                }
                 event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
-                if pads_transformed_text_rect_clip {
-                    event_planes = event_planes
-                        .into_iter()
-                        .filter_map(|plane| {
-                            pad_libass_transformed_text_rect_clip_plane(plane, event)
-                        })
-                        .collect();
-                }
             } else if let Some(vector_clip) = &event.vector_clip {
                 event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
             }
