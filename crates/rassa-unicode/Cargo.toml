@@ -10,8 +10,8 @@ readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
-rassa-core = { path = "../rassa-core", version = "0.5.1" }
-rassa-unibreak = { path = "../rassa-unibreak", version = "0.5.1" }
+rassa-core = { path = "../rassa-core", version = "0.6.0" }
+rassa-unibreak = { path = "../rassa-unibreak", version = "0.6.0" }
 unicode-bidi = "0.3.18"
 
 [lib]
