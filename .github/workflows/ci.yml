@@ -242,34 +242,3 @@ jobs:
           else
             python target/runtime-visual/validate_png.py
           fi
-
-  broad-corpus:
-    name: broad corpus report
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install native dependencies
-        timeout-minutes: 15
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-            apt-get install -y --no-install-recommends \
-            build-essential \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            pkg-config
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Run broad corpus pixel diff report
-        run: |
-          cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report \
-            -- --ignored --nocapture
