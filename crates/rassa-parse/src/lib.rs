@@ -952,7 +952,7 @@ fn parse_bool(value: &str, fallback: bool) -> bool {
     if trimmed.to_ascii_lowercase().starts_with("yes") {
         return true;
     }
-    parse_i32_prefix(trimmed).map_or(false, |parsed| parsed > 0)
+    parse_i32_prefix(trimmed).is_some_and(|parsed| parsed > 0)
 }
 
 fn parse_style_bool(value: &str, fallback: bool) -> bool {
@@ -1042,7 +1042,7 @@ fn parse_ass_color_prefix(value: &str) -> Option<u32> {
         .strip_prefix("&H")
         .or_else(|| value.strip_prefix("&h"))
     {
-        return parse_hex_prefix_u32(hex).map(|color| color & 0xFFFF_FFFF);
+        return parse_hex_prefix_u32(hex);
     }
     parse_i32_prefix(value).map(|color| color as u32)
 }
@@ -1987,10 +1987,7 @@ fn style_alignment_from_style(value: i32, track_type: TrackType) -> i32 {
 }
 
 fn style_alignment_from_numpad(value: i32) -> i32 {
-    let value = match value.checked_abs() {
-        Some(value) => value,
-        None => 2,
-    };
+    let value = value.checked_abs().unwrap_or(2);
     if value == 0 {
         return 0;
     }
