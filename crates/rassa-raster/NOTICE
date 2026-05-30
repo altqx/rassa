@@ -1,0 +1,15 @@
+rassa-raster
+
+This crate is a fork of crossfont (https://github.com/alacritty/crossfont).
+
+crossfont is licensed under the Apache License, Version 2.0.
+Copyright the crossfont / Alacritty project contributors.
+
+Portions of this crate are derived from crossfont and remain subject to the
+terms of the Apache License, Version 2.0. A copy of the license is included in
+the LICENSE-APACHE file in this crate, and is also available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Modifications made for rassa are likewise distributed under the Apache License,
+Version 2.0.

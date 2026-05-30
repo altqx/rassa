@@ -401,16 +401,20 @@ RASSA_BROAD_FILTER=broad_box RASSA_STRICT_BROAD_PIXEL_DIFF=1 \
   cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture
 ```
 
-## Open-source contribution guidelines
+## Contributing
 
-- Keep this project a Rust rewrite. Do not vendor, compile, or wrap upstream libass C source in production code.
-- Upstream libass fixtures, public headers, and generated reference artifacts may be used as compatibility test oracles when their licensing allows it.
-- Keep ABI compatibility and rendering parity separate when reporting status: a symbol may exist before its behavior is fully compatible.
-- Add tests for compatibility fixes. Prefer small focused tests plus corpus coverage for renderer changes.
-- Run formatting, tests, clippy, and the relevant pixel-diff gates before submitting changes.
+We do not accept contributions yet. If you run into a bug or have a suggestion,
+feel free to [open an issue](https://github.com/altqx/rassa/issues) — issue
+reports are very welcome.
 
 ## License
 
 This repository is licensed under the MIT License. See `LICENSE` for details.
 
 Some public compatibility headers keep their original notices where applicable.
+
+The `rassa-raster` crate is a fork of
+[`crossfont`](https://github.com/alacritty/crossfont), which is licensed under
+the Apache License, Version 2.0. Portions of that crate derived from crossfont
+remain subject to the Apache-2.0 terms; see `crates/rassa-raster/LICENSE-APACHE`
+and `crates/rassa-raster/NOTICE` for details.
