@@ -54,7 +54,9 @@ jobs:
           fi
 
           changed=false
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists; skipping publish."
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             changed=true
           elif git rev-parse "${{ github.event.before }}" >/dev/null 2>&1; then
             old_version=$(git show "${{ github.event.before }}:Cargo.toml" | awk '
@@ -69,12 +71,11 @@ jobs:
             if [ "$old_version" != "$version" ]; then
               changed=true
             fi
+          else
+            changed=true
           fi
 
-          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
-            echo "Tag v$version already exists; skipping publish."
-            changed=false
-          else
+          if [ "$changed" = false ]; then
             crates=(
               rassa-core
               rassa-fonts
@@ -90,7 +91,6 @@ jobs:
               rassa-libass-capi
               rassa-check
             )
-
             for crate in "${crates[@]}"; do
               status=$(curl -A "rassa-release-workflow" -sS -o /tmp/crate-version.json -w "%{http_code}" \
                 "https://crates.io/api/v1/crates/$crate/$version" || true)
