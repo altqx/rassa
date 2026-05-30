@@ -112,6 +112,13 @@ pub(crate) fn apply_effect_to_planes(
     planes
 }
 
+pub(crate) fn transition_effect_disables_collision(event: &ParsedEvent) -> bool {
+    let effect = event.effect.as_str();
+    effect.starts_with("Banner;")
+        || effect.starts_with("Scroll up;")
+        || effect.starts_with("Scroll down;")
+}
+
 pub(crate) fn effect_values(effect: &str) -> Vec<i32> {
     effect.split(';').skip(1).take(4).map(atoi_prefix).collect()
 }

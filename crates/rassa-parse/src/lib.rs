@@ -980,7 +980,7 @@ fn parse_override_bold_weight(value: &str, fallback: i32) -> i32 {
     } else {
         match parse_i32_prefix(trimmed) {
             Some(0) => 400,
-            Some(1 | -1) => 700,
+            Some(1) => 700,
             Some(weight) if weight >= 100 => weight,
             _ => fallback,
         }
@@ -1197,7 +1197,7 @@ fn apply_override_block(
             current_style.scale_x = base_style.scale_x;
             current_style.scale_y = base_style.scale_y;
         } else if let Some(rest) = tag.strip_prefix("fsp") {
-            current_style.spacing = parse_f64(rest, base_style.spacing).max(0.0);
+            current_style.spacing = parse_f64(rest, base_style.spacing);
         } else if let Some(rest) = tag.strip_prefix("frx") {
             current_style.rotation_x = parse_f64(rest, 0.0);
         } else if let Some(rest) = tag.strip_prefix("fry") {
@@ -1372,8 +1372,10 @@ fn apply_override_block(
             parsed.wrap_style = Some(value);
             *current_wrap_style = value;
         } else if let Some(rest) = tag.strip_prefix("org") {
-            parsed.origin = parse_pos(rest);
-            parsed.origin_exact = parse_pos_exact(rest);
+            if parsed.origin.is_none() && parsed.origin_exact.is_none() {
+                parsed.origin = parse_pos(rest);
+                parsed.origin_exact = parse_pos_exact(rest);
+            }
         } else if let Some(rest) = tag.strip_prefix("pos") {
             if parsed.position.is_none()
                 && parsed.position_exact.is_none()
@@ -1927,7 +1929,11 @@ fn parse_override_bool(value: &str, fallback: bool) -> bool {
     if trimmed.is_empty() {
         fallback
     } else {
-        parse_bool(trimmed, fallback)
+        match parse_i32_prefix(trimmed) {
+            Some(0) => false,
+            Some(1) => true,
+            _ => fallback,
+        }
     }
 }
 
@@ -2098,11 +2104,13 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
         match tokens[index].to_ascii_lowercase().as_str() {
             "m" | "n" => {
                 spline_state = None;
+                index += 1;
+                let Some((point, next_index)) = parse_drawing_point(&tokens, index, scale) else {
+                    continue;
+                };
                 if current.len() >= 3 {
                     polygons.push(std::mem::take(&mut current));
                 }
-                index += 1;
-                let (point, next_index) = parse_drawing_point(&tokens, index, scale)?;
                 current.push(point);
                 index = next_index;
                 while let Some((point, next_index)) =
@@ -2115,48 +2123,51 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
             "l" => {
                 spline_state = None;
                 if current.is_empty() {
-                    return None;
+                    index += 1;
+                    continue;
                 }
                 index += 1;
-                let mut consumed = false;
                 while let Some((point, next_index)) =
                     parse_drawing_point_optional(&tokens, index, scale)
                 {
                     current.push(point);
                     index = next_index;
-                    consumed = true;
-                }
-                if !consumed {
-                    return None;
                 }
             }
             "b" => {
                 spline_state = None;
                 if current.is_empty() {
-                    return None;
+                    index += 1;
+                    continue;
                 }
                 index += 1;
-                let mut consumed = false;
                 while let Some(((control1, control2, end), next_index)) =
                     parse_bezier_segment(&tokens, index, scale)
                 {
                     let start = *current.last()?;
                     current.extend(approximate_cubic_bezier(start, control1, control2, end, 16));
                     index = next_index;
-                    consumed = true;
-                }
-                if !consumed {
-                    return None;
                 }
             }
             "s" => {
                 if current.is_empty() {
-                    return None;
+                    index += 1;
+                    continue;
                 }
                 index += 1;
-                let (point1, next_index) = parse_drawing_point(&tokens, index, scale)?;
-                let (point2, next_index) = parse_drawing_point(&tokens, next_index, scale)?;
-                let (point3, next_index) = parse_drawing_point(&tokens, next_index, scale)?;
+                let Some((point1, next_index)) = parse_drawing_point(&tokens, index, scale) else {
+                    continue;
+                };
+                let Some((point2, next_index)) = parse_drawing_point(&tokens, next_index, scale)
+                else {
+                    index = next_index;
+                    continue;
+                };
+                let Some((point3, next_index)) = parse_drawing_point(&tokens, next_index, scale)
+                else {
+                    index = next_index;
+                    continue;
+                };
                 let start = *current.last()?;
                 current.extend(approximate_spline_segment(
                     start, point1, point2, point3, 16,
@@ -2168,9 +2179,10 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 index = next_index;
             }
             "p" => {
-                let state = spline_state.as_mut()?;
                 index += 1;
-                let mut consumed = false;
+                let Some(state) = spline_state.as_mut() else {
+                    continue;
+                };
                 while let Some((point, next_index)) =
                     parse_drawing_point_optional(&tokens, index, scale)
                 {
@@ -2184,14 +2196,13 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                     ));
                     state.history.push(point);
                     index = next_index;
-                    consumed = true;
-                }
-                if !consumed {
-                    return None;
                 }
             }
             "c" => {
-                let state = spline_state.take()?;
+                let Some(state) = spline_state.take() else {
+                    index += 1;
+                    continue;
+                };
                 for point in state.first_three {
                     let len = state.history.len();
                     current.extend(approximate_spline_segment(
@@ -2204,7 +2215,7 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
                 }
                 index += 1;
             }
-            _ => return None,
+            _ => index += 1,
         }
     }
 
@@ -2588,6 +2599,30 @@ mod tests {
     }
 
     #[test]
+    fn drawing_parser_keeps_valid_prefix_after_unknown_tokens_like_libass() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text(
+            "{\\p1}ignored m 0 0 l 10 0 10 10 0 10 lyric",
+            &base_style,
+            &[],
+        );
+
+        let drawing = parsed.lines[0].spans[0]
+            .drawing
+            .as_ref()
+            .expect("drawing span");
+        assert_eq!(
+            drawing.bounds(),
+            Some(Rect {
+                x_min: 0,
+                y_min: 0,
+                x_max: 11,
+                y_max: 11,
+            })
+        );
+    }
+
+    #[test]
     fn parses_basic_ass_script() {
         let input = "[Script Info]\nPlayResX: 1280\nPlayResY: 720\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,42,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.50,Default,,0000,0000,0000,,Hello, world!";
         let track = parse_script_text(input).expect("script should parse");
@@ -2938,6 +2973,43 @@ Style: Default,Arial,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,-1,-2,-3,
                 y_max: 40,
             })
         );
+    }
+
+    #[test]
+    fn origin_override_is_first_wins_like_libass() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\org(10,20)\\org(30,40)}Origin", &base_style, &[]);
+
+        assert_eq!(parsed.origin, Some((10, 20)));
+        assert_eq!(parsed.origin_exact, Some((10.0, 20.0)));
+    }
+
+    #[test]
+    fn invalid_boolean_overrides_fall_back_like_libass() {
+        let base_style = ParsedStyle {
+            italic: true,
+            underline: true,
+            strike_out: true,
+            font_weight: 400,
+            bold: false,
+            ..ParsedStyle::default()
+        };
+        let parsed = parse_dialogue_text("{\\b-1\\i2\\u-1\\s3}Flags", &base_style, &[]);
+        let style = &parsed.lines[0].spans[0].style;
+
+        assert_eq!(style.font_weight, 400);
+        assert!(!style.bold);
+        assert!(style.italic);
+        assert!(style.underline);
+        assert!(style.strike_out);
+    }
+
+    #[test]
+    fn negative_letter_spacing_is_preserved_like_libass() {
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\fsp-2.5}Spacing", &base_style, &[]);
+
+        assert_eq!(parsed.lines[0].spans[0].style.spacing, -2.5);
     }
 
     #[test]

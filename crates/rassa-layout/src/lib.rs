@@ -114,10 +114,15 @@ impl LayoutEngine {
                 )
             })
             .collect::<RassaResult<Vec<_>>>()?;
-        let wrap_style = parsed_text
+        let parsed_wrap_style = parsed_text
             .wrap_style
             .unwrap_or(track.wrap_style)
             .clamp(0, 3);
+        let wrap_style = if banner_effect_forces_no_wrap(event) {
+            2
+        } else {
+            parsed_wrap_style
+        };
         let alignment = parsed_text.alignment.unwrap_or(style.alignment);
         let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment);
         let lines = if explicit_lines.len() > 1 {
@@ -137,8 +142,8 @@ impl LayoutEngine {
                 .join("\n"),
             font_family: font.family.clone(),
             font: font.clone(),
-            alignment: parsed_text.alignment.unwrap_or(style.alignment),
-            justify: normalize_justify(style.justify, style.alignment),
+            alignment,
+            justify: normalize_justify(style.justify, alignment),
             margin_l: resolve_margin(event.margin_l, style.margin_l),
             margin_r: resolve_margin(event.margin_r, style.margin_r),
             margin_v: resolve_margin(event.margin_v, style.margin_v),
@@ -152,7 +157,11 @@ impl LayoutEngine {
                 .or_else(|| parsed_text.clip_rect_exact.map(rect_from_exact_clip)),
             vector_clip: parsed_text.vector_clip,
             inverse_clip: parsed_text.inverse_clip,
-            wrap_style: parsed_text.wrap_style,
+            wrap_style: if banner_effect_forces_no_wrap(event) {
+                Some(2)
+            } else {
+                parsed_text.wrap_style
+            },
             origin: parsed_text.origin,
             origin_exact: parsed_text.origin_exact,
             lines,
@@ -178,6 +187,10 @@ fn rect_from_exact_clip(rect: ParsedRectF64) -> Rect {
     }
 }
 
+fn banner_effect_forces_no_wrap(event: &ParsedEvent) -> bool {
+    event.effect.starts_with("Banner;")
+}
+
 fn layout_line_from_text<P: FontProvider>(
     event_index: usize,
     style_index: usize,
@@ -199,12 +212,7 @@ fn layout_line_from_text<P: FontProvider>(
             weight: font_query_weight(span.style.font_weight),
         });
         if let Some(drawing) = &span.drawing {
-            let width = drawing
-                .bounds()
-                .map(|bounds| {
-                    (bounds.width() - 1).max(0) as f32 * span.style.scale_x.max(0.0) as f32
-                })
-                .unwrap_or_default();
+            let width = drawing_layout_width(&span.text, drawing, span.style.scale_x);
             runs.push(LayoutGlyphRun {
                 text: span.text.clone(),
                 direction: line_direction,
@@ -267,6 +275,143 @@ fn layout_line_from_text<P: FontProvider>(
         width,
         runs,
     })
+}
+
+fn drawing_layout_width(text: &str, drawing: &ParsedDrawing, scale_x: f64) -> f32 {
+    let scale_x = scale_x.max(0.0);
+    if let Some((x_min_d6, x_max_d6)) = drawing_text_x_bounds_d6(text) {
+        let scale_base = 1_i32
+            .checked_shl(drawing.scale.saturating_sub(1) as u32)
+            .unwrap_or(1)
+            .max(1) as f64;
+        return (((x_max_d6 - x_min_d6).max(0) as f64 / 64.0) / scale_base * scale_x) as f32;
+    }
+
+    drawing
+        .bounds()
+        .map(|bounds| (bounds.width() - 1).max(0) as f32 * scale_x as f32)
+        .unwrap_or_default()
+}
+
+fn drawing_text_x_bounds_d6(text: &str) -> Option<(i32, i32)> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut x_min = i32::MAX;
+    let mut x_max = i32::MIN;
+    let mut has_current = false;
+    let mut spline_active = false;
+
+    while index < tokens.len() {
+        match tokens[index].to_ascii_lowercase().as_str() {
+            "m" | "n" => {
+                spline_active = false;
+                index += 1;
+                while let Some((x, next_index)) = parse_drawing_x_coordinate_d6(&tokens, index) {
+                    x_min = x_min.min(x);
+                    x_max = x_max.max(x);
+                    has_current = true;
+                    index = next_index;
+                }
+            }
+            "l" if has_current => {
+                spline_active = false;
+                index += 1;
+                while let Some((x, next_index)) = parse_drawing_x_coordinate_d6(&tokens, index) {
+                    x_min = x_min.min(x);
+                    x_max = x_max.max(x);
+                    index = next_index;
+                }
+            }
+            "b" if has_current => {
+                spline_active = false;
+                index += 1;
+                while let Some((xs, next_index)) = parse_drawing_bezier_xs_d6(&tokens, index) {
+                    for x in xs {
+                        x_min = x_min.min(x);
+                        x_max = x_max.max(x);
+                    }
+                    index = next_index;
+                }
+            }
+            "s" if has_current => {
+                index += 1;
+                if let Some((xs, next_index)) = parse_drawing_bezier_xs_d6(&tokens, index) {
+                    for x in xs {
+                        x_min = x_min.min(x);
+                        x_max = x_max.max(x);
+                    }
+                    index = next_index;
+                    spline_active = true;
+                }
+            }
+            "p" if spline_active => {
+                index += 1;
+                while let Some((x, next_index)) = parse_drawing_x_coordinate_d6(&tokens, index) {
+                    x_min = x_min.min(x);
+                    x_max = x_max.max(x);
+                    index = next_index;
+                }
+            }
+            "c" => {
+                spline_active = false;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    (x_min <= x_max).then_some((x_min, x_max))
+}
+
+fn parse_drawing_bezier_xs_d6(tokens: &[&str], index: usize) -> Option<([i32; 3], usize)> {
+    let (x1, next_index) = parse_drawing_x_coordinate_d6(tokens, index)?;
+    let (x2, next_index) = parse_drawing_x_coordinate_d6(tokens, next_index)?;
+    let (x3, next_index) = parse_drawing_x_coordinate_d6(tokens, next_index)?;
+    Some(([x1, x2, x3], next_index))
+}
+
+fn parse_drawing_x_coordinate_d6(tokens: &[&str], index: usize) -> Option<(i32, usize)> {
+    let x = parse_drawing_number_prefix(tokens.get(index)?)?;
+    parse_drawing_number_prefix(tokens.get(index + 1)?)?;
+    Some(((x * 64.0).round() as i32, index + 2))
+}
+
+fn parse_drawing_number_prefix(token: &str) -> Option<f64> {
+    if token.parse::<f64>().is_ok() {
+        return token.parse().ok();
+    }
+
+    let mut end = 0;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut previous_was_exponent = false;
+    for (index, character) in token.char_indices() {
+        let allowed = if character.is_ascii_digit() {
+            seen_digit = true;
+            previous_was_exponent = false;
+            true
+        } else if (character == '+' || character == '-') && (index == 0 || previous_was_exponent) {
+            previous_was_exponent = false;
+            true
+        } else if character == '.' && !seen_dot && !previous_was_exponent {
+            seen_dot = true;
+            true
+        } else if (character == 'e' || character == 'E') && seen_digit && !previous_was_exponent {
+            previous_was_exponent = true;
+            true
+        } else {
+            false
+        };
+        if !allowed {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+
+    if !seen_digit || end == 0 || previous_was_exponent {
+        return None;
+    }
+    token[..end].parse().ok()
 }
 
 fn auto_wrap_width(
@@ -832,6 +977,32 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta",
     }
 
     #[test]
+    fn banner_effect_forces_no_wrap_like_libass() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 40
+PlayResY: 80
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,Banner;25;0;0,alpha beta gamma delta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.wrap_style, Some(2));
+        assert_eq!(layout.lines.len(), 1);
+    }
+
+    #[test]
     fn explicit_hard_break_lines_are_not_auto_wrapped_again() {
         let track = parse_track(
             "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,Fontin Sans Rg,70,&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,1,3.5,1.5,2,140,140,45,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:06:06.20,0:06:11.56,Main,,0,0,0,,Eu sei que a Karin é fofa, mas quem seria tão\\N descaradamente indecente em plena luz do dia?!",
@@ -1254,6 +1425,35 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
     }
 
     #[test]
+    fn layout_uses_decimal_drawing_control_bounds_for_width() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p1}m 0 0 b 41.909 83.818 83.818 65.378 83.818 41.909",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        let width = layout.lines[0].runs[0].width;
+        assert!((width - 83.8125).abs() < 0.001, "drawing width was {width}");
+    }
+
+    #[test]
+    fn layout_drawing_width_ignores_invalid_spline_extension_points() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p1}m 0 0 l 8 0 8 8 0 8 p 200 0",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.lines[0].runs[0].width, 8.0);
+    }
+
+    #[test]
     fn layout_carries_missing_override_metadata() {
         let track = parse_track(
             "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\u1\\s1\\a10\\q2\\org(320,240)\\frx12\\fry-8\\fax0.25\\fay-0.5\\xbord3\\ybord4\\xshad5\\yshad-6\\be2\\pbo7}Meta",
@@ -1280,6 +1480,21 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
         assert_eq!(style.shadow_y, -6.0);
         assert_eq!(style.be, 2.0);
         assert_eq!(style.pbo, 7.0);
+    }
+
+    #[test]
+    fn auto_justify_uses_effective_alignment_override() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding, Justify\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,3,10,10,10,1,0\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an1}Left",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.alignment, ass::VALIGN_SUB | ass::HALIGN_LEFT);
+        assert_eq!(layout.justify, ass::ASS_JUSTIFY_LEFT);
     }
 
     #[test]

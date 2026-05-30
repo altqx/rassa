@@ -97,6 +97,78 @@ fn fade_alpha_combines_with_existing_colour_alpha() {
     assert_eq!(with_fade_alpha(0xFF00_0080, 127), 0xFF00_00BF);
 }
 
+#[test]
+fn move_interpolation_swaps_reversed_times_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 500,
+        ..ParsedEvent::default()
+    };
+
+    assert_eq!(
+        interpolate_move(
+            ParsedMovement {
+                start: (0, 0),
+                end: (100, 0),
+                t1_ms: 200,
+                t2_ms: 0,
+            },
+            Some(&event),
+            100,
+        ),
+        (50, 0)
+    );
+}
+
+#[test]
+fn scaled_clip_rect_rounds_edges_like_libass() {
+    assert_eq!(
+        scale_clip_rect(
+            Rect {
+                x_min: 659,
+                y_min: 35,
+                x_max: 1261,
+                y_max: 48,
+            },
+            0.5,
+            1.5,
+        ),
+        Rect {
+            x_min: 330,
+            y_min: 53,
+            x_max: 631,
+            y_max: 72,
+        }
+    );
+}
+
+#[test]
+fn transform_accel_preserves_libass_power_value() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            font_size: 10.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: -1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                font_size: Some(20.0),
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 500).font_size, 30.0);
+}
+
 fn vertical_span(planes: &[ImagePlane]) -> i32 {
     let min_y = planes
         .iter()
@@ -6760,6 +6832,31 @@ fn render_frame_allows_basic_collision_across_different_layers() {
         .expect("layer 1 character plane");
 
     assert_eq!(layer0_y, layer1_y);
+}
+
+#[test]
+fn banner_effect_does_not_participate_in_collision_layout_like_libass() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,Banner;25;0;0,{\\1c&H00FF00&}Second").expect("script should parse");
+    let banner_only = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,Banner;25;0;0,{\\1c&H00FF00&}Second").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 100);
+    let solo_planes = engine.render_frame_with_provider(&banner_only, &provider, 100);
+
+    let banner_y = planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
+        .map(|plane| plane.destination.y)
+        .min()
+        .expect("banner character plane");
+    let solo_banner_y = solo_planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
+        .map(|plane| plane.destination.y)
+        .min()
+        .expect("solo banner character plane");
+
+    assert_eq!(banner_y, solo_banner_y);
 }
 
 #[test]

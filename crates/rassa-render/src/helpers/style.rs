@@ -23,11 +23,7 @@ pub(crate) fn resolve_run_style(
             1.0
         } else {
             let linear = f64::from(elapsed - start_ms) / f64::from((end_ms - start_ms).max(1));
-            linear.powf(if transform.accel > 0.0 {
-                transform.accel
-            } else {
-                1.0
-            })
+            linear.powf(transform.accel)
         };
 
         if let Some(font_size) = transform.style.font_size {
@@ -385,7 +381,7 @@ pub(crate) fn scale_raster_glyph(glyph: RasterGlyph, scale_x: f64, scale_y: f64)
 }
 
 pub(crate) fn interpolate_f64(from: f64, to: f64, progress: f64) -> f64 {
-    from + (to - from) * progress.clamp(0.0, 1.0)
+    from + (to - from) * progress
 }
 
 pub(crate) fn interpolate_color(from: u32, to: u32, progress: f64) -> u32 {

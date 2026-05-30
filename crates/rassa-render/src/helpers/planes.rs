@@ -249,10 +249,10 @@ pub(crate) fn scale_clip_rect(rect: Rect, scale_x: f64, scale_y: f64) -> Rect {
     let scale_x = style_scale(scale_x);
     let scale_y = style_scale(scale_y);
     Rect {
-        x_min: (f64::from(rect.x_min) * scale_x).floor() as i32,
-        y_min: (f64::from(rect.y_min) * scale_y).floor() as i32,
-        x_max: (f64::from(rect.x_max) * scale_x).ceil() as i32,
-        y_max: (f64::from(rect.y_max) * scale_y).ceil() as i32,
+        x_min: (f64::from(rect.x_min) * scale_x).round() as i32,
+        y_min: (f64::from(rect.y_min) * scale_y).round() as i32,
+        x_max: (f64::from(rect.x_max) * scale_x).round() as i32,
+        y_max: (f64::from(rect.y_max) * scale_y).round() as i32,
     }
 }
 
@@ -379,8 +379,10 @@ pub(crate) fn interpolate_move(
 
     let (t1_ms, t2_ms) = if movement.t1_ms <= 0 && movement.t2_ms <= 0 {
         (0, event_duration)
+    } else if movement.t1_ms <= movement.t2_ms {
+        (movement.t1_ms.max(0), movement.t2_ms.max(0))
     } else {
-        (movement.t1_ms.max(0), movement.t2_ms.max(movement.t1_ms))
+        (movement.t2_ms.max(0), movement.t1_ms.max(0))
     };
     let k = if event_elapsed <= t1_ms {
         0.0
@@ -415,8 +417,10 @@ pub(crate) fn interpolate_move_exact(
 
     let (t1_ms, t2_ms) = if movement.t1_ms <= 0 && movement.t2_ms <= 0 {
         (0, event_duration)
+    } else if movement.t1_ms <= movement.t2_ms {
+        (movement.t1_ms.max(0), movement.t2_ms.max(0))
     } else {
-        (movement.t1_ms.max(0), movement.t2_ms.max(movement.t1_ms))
+        (movement.t2_ms.max(0), movement.t1_ms.max(0))
     };
     let k = if event_elapsed <= t1_ms {
         0.0

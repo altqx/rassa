@@ -129,6 +129,7 @@ impl RenderEngine {
         let render_scale = (style_scale(render_scale_x) + style_scale(render_scale_y)) / 2.0;
 
         for event in &prepared.active_events {
+            let source_event = track.events.get(event.event_index);
             let Some(style) = track.styles.get(event.style_index) else {
                 continue;
             };
@@ -144,12 +145,20 @@ impl RenderEngine {
             );
             let layer = event_layer(track, event);
             let occupied_bounds = occupied_bounds_by_layer.entry(layer).or_default();
+            let effect_disables_collision = source_event
+                .map(transition_effect_disables_collision)
+                .unwrap_or(false);
+            let layout_occupied_bounds = if effect_disables_collision {
+                &[][..]
+            } else {
+                occupied_bounds.as_slice()
+            };
             let vertical_layout = resolve_vertical_layout(
                 track,
                 event,
                 effective_position,
-                occupied_bounds,
-                track.events.get(event.event_index),
+                layout_occupied_bounds,
+                source_event,
                 now_ms,
                 config,
                 RenderScale {
@@ -158,17 +167,18 @@ impl RenderEngine {
                     uniform: render_scale,
                 },
             );
-            let occupied_bound = effective_position.is_none().then(|| {
-                event_bounds(
-                    track,
-                    event,
-                    &vertical_layout,
-                    effective_position,
-                    config,
-                    render_scale_x,
-                    render_scale_y,
-                )
-            });
+            let occupied_bound =
+                (!effect_disables_collision && effective_position.is_none()).then(|| {
+                    event_bounds(
+                        track,
+                        event,
+                        &vertical_layout,
+                        effective_position,
+                        config,
+                        render_scale_x,
+                        render_scale_y,
+                    )
+                });
             for (line_index, (line, line_top)) in event
                 .lines
                 .iter()
@@ -188,7 +198,7 @@ impl RenderEngine {
                 let center_transformed_position = effective_position.is_some()
                     && positioned_center_line_has_active_projective_transform(
                         line,
-                        track.events.get(event.event_index),
+                        source_event,
                         now_ms,
                     );
                 let text_line_top = if effective_position.is_some() {
@@ -211,7 +221,7 @@ impl RenderEngine {
                 };
                 let scaled_line_width = rendered_text_alignment_width(
                     line,
-                    track.events.get(event.event_index),
+                    source_event,
                     now_ms,
                     track,
                     config,
@@ -251,7 +261,7 @@ impl RenderEngine {
                     && !line_has_outline_or_shadow(line);
                 let line_ascender = line_raster_ascender(
                     line,
-                    track.events.get(event.event_index),
+                    source_event,
                     now_ms,
                     track,
                     config,
@@ -293,7 +303,7 @@ impl RenderEngine {
                 let mut line_has_transformed_borderstyle3_box = false;
                 for run in &line.runs {
                     let effective_style = apply_renderer_style_scale(
-                        resolve_run_style(run, track.events.get(event.event_index), now_ms),
+                        resolve_run_style(run, source_event, now_ms),
                         track,
                         config,
                         render_scale,
@@ -384,7 +394,7 @@ impl RenderEngine {
                                 color: resolve_run_fill_color(
                                     run,
                                     &effective_style,
-                                    track.events.get(event.event_index),
+                                    source_event,
                                     now_ms,
                                 ),
                                 scale_x: effective_style.scale_x,
@@ -544,7 +554,7 @@ impl RenderEngine {
                     let effective_blur = effective_style.blur.max(effective_style.be);
                     let has_outline = style.border_style != 3
                         && effective_style.border > 0.0
-                        && !karaoke_hides_outline(run, track.events.get(event.event_index), now_ms);
+                        && !karaoke_hides_outline(run, source_event, now_ms);
                     let has_shadow = effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON;
                     let fill_blur = if has_outline || has_shadow {
@@ -573,12 +583,8 @@ impl RenderEngine {
                             outline_planes.push(plane);
                         }
                     }
-                    let fill_color = resolve_run_fill_color(
-                        run,
-                        &effective_style,
-                        track.events.get(event.event_index),
-                        now_ms,
-                    );
+                    let fill_color =
+                        resolve_run_fill_color(run, &effective_style, source_event, now_ms);
                     if run.karaoke.is_none() && effective_blur > 0.0 {
                         if let Some(plane) = combined_image_plane_from_glyphs(
                             &raster_glyphs,
@@ -607,7 +613,7 @@ impl RenderEngine {
                                 fill_planes,
                                 run,
                                 &effective_style,
-                                track.events.get(event.event_index),
+                                source_event,
                                 now_ms,
                                 glyph_origin_x,
                                 raster_glyphs
@@ -789,16 +795,11 @@ impl RenderEngine {
                 event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
             }
             if let Some(fade) = event.fade {
-                event_planes = apply_fade_to_planes(
-                    event_planes,
-                    fade,
-                    track.events.get(event.event_index),
-                    now_ms,
-                );
+                event_planes = apply_fade_to_planes(event_planes, fade, source_event, now_ms);
             }
             event_planes = apply_effect_to_planes(
                 event_planes,
-                track.events.get(event.event_index),
+                source_event,
                 track,
                 config,
                 now_ms,
