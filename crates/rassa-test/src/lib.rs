@@ -698,23 +698,6 @@ mod tests {
         render_track_planes_with_config(&track, &provider, now_ms, &config)
     }
 
-    fn plane_geometries(
-        planes: &[rassa_core::ImagePlane],
-    ) -> Vec<(ass::ImageType, i32, i32, i32, i32)> {
-        planes
-            .iter()
-            .map(|plane| {
-                (
-                    plane.kind,
-                    plane.destination.x,
-                    plane.destination.y,
-                    plane.size.width,
-                    plane.size.height,
-                )
-            })
-            .collect()
-    }
-
     fn assert_pixel_perfect_compare_fixture(script: &str, now_ms: i64, reference_png: &[u8]) {
         let (width, height, target) = decode_png_compare_target(reference_png);
         let planes = compare_fixture_planes(script, now_ms, reference_png);
