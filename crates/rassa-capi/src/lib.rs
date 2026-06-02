@@ -458,6 +458,10 @@ fn render_frame_planes(
     renderer_config: &RendererConfig,
 ) -> Vec<ImagePlane> {
     let provider = cached_font_provider(renderer, library);
+    // SAFETY: `cached_font_provider` returns a pointer to a heap-allocated trait object
+    // stored inside `renderer` (or a fallback allocation tied to the same lifetime). The
+    // borrow is valid for the duration of this call because neither `renderer` nor the
+    // font provider it owns are freed or mutated by any other thread during this scope.
     let provider: &dyn FontProvider = unsafe { &*provider };
     let planes = RenderEngine::new().render_frame_with_provider_and_config(
         parsed,
@@ -777,7 +781,15 @@ fn ass_color_to_rgba(color: u32) -> u32 {
 }
 
 impl OwnedStyleOverride {
+    /// # Safety
+    ///
+    /// `style` must be either null (returns `None`) or a valid pointer to a live
+    /// `ASS_Style` whose fields are in a consistent state as written by the C
+    /// caller. The pointed-to value must not be freed or mutated by another
+    /// thread for the duration of this call.
     unsafe fn from_ffi(style: *mut ASS_Style) -> Option<Self> {
+        // SAFETY: `as_ref` returns `None` for null pointers and a shared reference
+        // otherwise. The caller guarantees the pointer is valid when non-null.
         let style = style.as_ref()?;
         Some(Self {
             style: ParsedStyle {
@@ -859,23 +871,36 @@ impl Default for ASS_Renderer {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: No pointer dereference; the function only reads a compile-time
+// constant. Marked `unsafe extern "C"` solely to satisfy the C ABI contract.
 pub unsafe extern "C" fn ass_library_version() -> c_int {
     ass::LIBASS_VERSION
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: Allocates a new `ASS_Library` on the heap and transfers ownership to
+// the caller as a raw pointer. The caller is responsible for eventually passing
+// the returned pointer to `ass_library_done` to free it.
 pub unsafe extern "C" fn ass_library_init() -> *mut ASS_Library {
     Box::into_raw(Box::new(ASS_Library::default()))
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be either null (no-op) or a pointer previously returned
+// by `ass_library_init` that has not yet been freed. After this call the pointer
+// is dangling; the caller must not use it again.
 pub unsafe extern "C" fn ass_library_done(priv_: *mut ASS_Library) {
     if !priv_.is_null() {
+        // SAFETY: Pointer was allocated via `Box::new` in `ass_library_init` and
+        // has not been freed yet (caller's responsibility to uphold this).
         drop(Box::from_raw(priv_));
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid, non-freed pointer returned
+// by `ass_library_init`. `fonts_dir` must be null or a valid NUL-terminated
+// C string that remains live for the duration of the call.
 pub unsafe extern "C" fn ass_set_fonts_dir(priv_: *mut ASS_Library, fonts_dir: *const c_char) {
     if let Some(library) = priv_.as_mut() {
         library.fonts_dir = string_option_from_ptr(fonts_dir);
@@ -883,6 +908,8 @@ pub unsafe extern "C" fn ass_set_fonts_dir(priv_: *mut ASS_Library, fonts_dir: *
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid, non-freed pointer returned
+// by `ass_library_init`.
 pub unsafe extern "C" fn ass_set_extract_fonts(priv_: *mut ASS_Library, extract: c_int) {
     if let Some(library) = priv_.as_mut() {
         library.extract_fonts = extract != 0;
@@ -890,6 +917,10 @@ pub unsafe extern "C" fn ass_set_extract_fonts(priv_: *mut ASS_Library, extract:
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid, non-freed pointer returned
+// by `ass_library_init`. `list` must be either null or a pointer to a
+// null-terminated array of NUL-terminated C strings, all of which must remain
+// live and unmodified for the duration of this call.
 pub unsafe extern "C" fn ass_set_style_overrides(priv_: *mut ASS_Library, list: *mut *mut c_char) {
     let Some(library) = priv_.as_mut() else {
         return;
@@ -912,6 +943,11 @@ pub unsafe extern "C" fn ass_set_style_overrides(priv_: *mut ASS_Library, list: 
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid, non-freed pointer returned
+// by `ass_new_track`. The track's `library` back-pointer must also be valid.
+// The internal `styles` array (if non-null) must be a live allocation of at
+// least `n_styles` contiguous `ASS_Style` elements, consistent with the layout
+// maintained by `ass_alloc_style` / `ass_free_style`.
 pub unsafe extern "C" fn ass_process_force_style(track: *mut ASS_Track) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -946,6 +982,10 @@ pub unsafe extern "C" fn ass_process_force_style(track: *mut ASS_Track) {
             continue;
         }
 
+        // SAFETY: `track_ref.styles` is non-null (checked above) and was allocated
+        // by `ass_alloc_style` as a contiguous array of `n_styles` elements. No
+        // other reference to this slice exists for the duration of this loop body
+        // because we hold a mutable reference to `track_ref` from `track.as_mut()`.
         for style in slice::from_raw_parts_mut(track_ref.styles, track_ref.n_styles as usize) {
             let matches_style = style_name.is_none_or(|target| {
                 string_option_from_ptr(style.Name)
@@ -960,6 +1000,10 @@ pub unsafe extern "C" fn ass_process_force_style(track: *mut ASS_Track) {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid, non-freed pointer returned
+// by `ass_library_init`. `msg_cb` and `data` are stored as opaque pointers and
+// never dereferenced by rassa itself; the caller is responsible for ensuring
+// they remain valid as long as the library is alive.
 pub unsafe extern "C" fn ass_set_message_cb(
     priv_: *mut ASS_Library,
     msg_cb: *mut c_void,
@@ -972,18 +1016,29 @@ pub unsafe extern "C" fn ass_set_message_cb(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `_library` is accepted for libass ABI compatibility but not
+// dereferenced. Allocates a new `ASS_Renderer` on the heap and transfers
+// ownership to the caller; the caller must eventually pass the pointer to
+// `ass_renderer_done`.
 pub unsafe extern "C" fn ass_renderer_init(_library: *mut ASS_Library) -> *mut ASS_Renderer {
     Box::into_raw(Box::new(ASS_Renderer::default()))
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be either null (no-op) or a pointer previously returned
+// by `ass_renderer_init` that has not yet been freed. After this call the
+// pointer is dangling; the caller must not use it again.
 pub unsafe extern "C" fn ass_renderer_done(priv_: *mut ASS_Renderer) {
     if !priv_.is_null() {
+        // SAFETY: Allocated via `Box::new` in `ass_renderer_init`; not yet freed.
         drop(Box::from_raw(priv_));
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: For all `ass_set_*` renderer functions: `priv_` must be null (no-op)
+// or a valid, non-freed pointer returned by `ass_renderer_init`. No other
+// thread may concurrently mutate the renderer for the duration of the call.
 pub unsafe extern "C" fn ass_set_frame_size(priv_: *mut ASS_Renderer, w: c_int, h: c_int) {
     if let Some(renderer) = priv_.as_mut() {
         let (w, h) = sanitize_size_pair(w, h);
@@ -993,6 +1048,8 @@ pub unsafe extern "C" fn ass_set_frame_size(priv_: *mut ASS_Renderer, w: c_int, 
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: See `ass_set_frame_size` — same contract applies to all simple
+// renderer setters below: `priv_` must be null or a valid non-freed renderer.
 pub unsafe extern "C" fn ass_set_storage_size(priv_: *mut ASS_Renderer, w: c_int, h: c_int) {
     if let Some(renderer) = priv_.as_mut() {
         let (w, h) = sanitize_size_pair(w, h);
@@ -1083,6 +1140,11 @@ pub unsafe extern "C" fn ass_set_line_position(priv_: *mut ASS_Renderer, line_po
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `providers` and `size` must each be either null (triggers early
+// return) or valid, writable pointers to at least one element. `allocation`
+// is produced by `ass_malloc` (aligned for `c_int`) and is at least
+// `values.len()` elements large, so `ptr::copy_nonoverlapping` is in-bounds
+// and the source (`values`) does not overlap the heap allocation.
 pub unsafe extern "C" fn ass_get_available_font_providers(
     _priv_: *mut ASS_Library,
     providers: *mut *mut c_int,
@@ -1100,17 +1162,25 @@ pub unsafe extern "C" fn ass_get_available_font_providers(
     let allocation_size = mem::size_of_val(&values);
     let allocation = ass_malloc(allocation_size) as *mut c_int;
     if allocation.is_null() {
+        // SAFETY: `providers` and `size` are non-null (checked above).
         *providers = ptr::null_mut();
         *size = usize::MAX;
         return;
     }
 
+    // SAFETY: `allocation` is a fresh heap block of `allocation_size` bytes
+    // (= `values.len() * size_of::<c_int>()`), properly aligned; `values` is
+    // on the stack and does not alias the allocation.
     ptr::copy_nonoverlapping(values.as_ptr(), allocation, values.len());
+    // SAFETY: `providers` and `size` are non-null (checked above).
     *providers = allocation;
     *size = values.len();
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid non-freed renderer pointer.
+// `default_font`, `default_family`, and `config` must each be null or a valid
+// NUL-terminated C string that remains live for the duration of this call.
 pub unsafe extern "C" fn ass_set_fonts(
     priv_: *mut ASS_Renderer,
     default_font: *const c_char,
@@ -1129,6 +1199,7 @@ pub unsafe extern "C" fn ass_set_fonts(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid non-freed renderer pointer.
 pub unsafe extern "C" fn ass_set_selective_style_override_enabled(
     priv_: *mut ASS_Renderer,
     bits: c_int,
@@ -1139,6 +1210,9 @@ pub unsafe extern "C" fn ass_set_selective_style_override_enabled(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid non-freed renderer pointer.
+// `style` must satisfy the invariants of `OwnedStyleOverride::from_ffi` —
+// either null or a pointer to a live, consistently-initialised `ASS_Style`.
 pub unsafe extern "C" fn ass_set_selective_style_override(
     priv_: *mut ASS_Renderer,
     style: *mut ASS_Style,
@@ -1149,11 +1223,14 @@ pub unsafe extern "C" fn ass_set_selective_style_override(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `_priv_` is accepted for libass ABI compatibility and not
+// dereferenced; the function is a no-op stub that always returns 1.
 pub unsafe extern "C" fn ass_fonts_update(_priv_: *mut ASS_Renderer) -> c_int {
     1
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `priv_` must be null (no-op) or a valid non-freed renderer pointer.
 pub unsafe extern "C" fn ass_set_cache_limits(
     priv_: *mut ASS_Renderer,
     glyph_max: c_int,
@@ -1165,6 +1242,16 @@ pub unsafe extern "C" fn ass_set_cache_limits(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY:
+//   - `priv_` must be null (returns null) or a valid non-freed `ASS_Renderer`.
+//   - `track` must be null (returns null) or a valid non-freed `ASS_Track`
+//     whose internal `library`, `styles`, and `events` arrays are consistent
+//     (i.e. allocated and sized as maintained by the `ass_alloc_*` / `ass_free_*`
+//     family of functions).
+//   - `detect_change` must be null (ignored) or a writable `c_int` pointer.
+//   - The returned `*mut ASS_Image` is owned by the renderer's internal cache
+//     and must not be freed by the caller; it remains valid only until the next
+//     call to `ass_render_frame` or `ass_renderer_done` on the same renderer.
 pub unsafe extern "C" fn ass_render_frame(
     priv_: *mut ASS_Renderer,
     track: *mut ASS_Track,
@@ -1278,6 +1365,10 @@ pub unsafe extern "C" fn ass_render_frame(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `library` is stored as a raw back-pointer inside the returned track
+// and must remain valid (non-freed) for the entire lifetime of the track.
+// Ownership of the returned `*mut ASS_Track` transfers to the caller, who must
+// eventually pass it to `ass_free_track`.
 pub unsafe extern "C" fn ass_new_track(library: *mut ASS_Library) -> *mut ASS_Track {
     let state = Box::new(TrackState {
         check_readorder: true,
@@ -1314,6 +1405,8 @@ pub unsafe extern "C" fn ass_new_track(library: *mut ASS_Library) -> *mut ASS_Tr
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (returns -1) or a valid non-freed pointer
+// returned by `ass_new_track`, with its `parser_priv` field intact.
 pub unsafe extern "C" fn ass_track_set_feature(
     track: *mut ASS_Track,
     feature: c_int,
@@ -1333,20 +1426,29 @@ pub unsafe extern "C" fn ass_track_set_feature(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a pointer previously returned by
+// `ass_new_track` that has not yet been freed. After this call the pointer is
+// dangling; the caller must not use it again. The embedded `parser_priv` must
+// also be a live `Box<TrackState>` allocated in `ass_new_track`.
 pub unsafe extern "C" fn ass_free_track(track: *mut ASS_Track) {
     if track.is_null() {
         return;
     }
 
+    // SAFETY: `track` was allocated via `Box::new` in `ass_new_track`.
     let mut boxed = Box::from_raw(track);
     free_track_contents(&mut boxed);
     if !boxed.parser_priv.is_null() {
+        // SAFETY: `parser_priv` was allocated as `Box<TrackState>` in
+        // `ass_new_track` and cast to `*mut ASS_ParserPriv`; not yet freed.
         drop(Box::from_raw(boxed.parser_priv as *mut TrackState));
         boxed.parser_priv = ptr::null_mut();
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (returns -1) or a valid non-freed track pointer
+// with consistent `styles`/`n_styles`/`max_styles` fields.
 pub unsafe extern "C" fn ass_alloc_style(track: *mut ASS_Track) -> c_int {
     let Some(track_ref) = track.as_mut() else {
         return -1;
@@ -1359,6 +1461,8 @@ pub unsafe extern "C" fn ass_alloc_style(track: *mut ASS_Track) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (returns -1) or a valid non-freed track pointer
+// with consistent `events`/`n_events`/`max_events` fields.
 pub unsafe extern "C" fn ass_alloc_event(track: *mut ASS_Track) -> c_int {
     let Some(track_ref) = track.as_mut() else {
         return -1;
@@ -1375,6 +1479,8 @@ pub unsafe extern "C" fn ass_alloc_event(track: *mut ASS_Track) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer.
+// `sid` must be a valid index previously returned by `ass_alloc_style`.
 pub unsafe extern "C" fn ass_free_style(track: *mut ASS_Track, sid: c_int) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -1388,6 +1494,8 @@ pub unsafe extern "C" fn ass_free_style(track: *mut ASS_Track, sid: c_int) {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer.
+// `eid` must be a valid index previously returned by `ass_alloc_event`.
 pub unsafe extern "C" fn ass_free_event(track: *mut ASS_Track, eid: c_int) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -1401,11 +1509,17 @@ pub unsafe extern "C" fn ass_free_event(track: *mut ASS_Track, eid: c_int) {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer.
+// `data` must be null (no-op) or a pointer to at least `size` bytes of valid
+// memory that remains live and unmodified for the duration of this call.
+// `size` must be non-negative; negative values are treated as a no-op.
 pub unsafe extern "C" fn ass_process_data(track: *mut ASS_Track, data: *const c_char, size: c_int) {
     if track.is_null() || data.is_null() || size < 0 {
         return;
     }
 
+    // SAFETY: `data` is non-null (checked above) and the caller guarantees it
+    // points to at least `size` bytes of initialised memory.
     let bytes = slice::from_raw_parts(data as *const u8, size as usize);
     if let Ok(parsed) = parse_script_bytes(bytes) {
         maybe_extract_parsed_fonts(track, &parsed);
@@ -1415,6 +1529,8 @@ pub unsafe extern "C" fn ass_process_data(track: *mut ASS_Track, data: *const c_
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: Delegates entirely to `ass_process_data`; same pointer contract
+// applies — `data` must be null or point to at least `size` valid bytes.
 pub unsafe extern "C" fn ass_process_codec_private(
     track: *mut ASS_Track,
     data: *const c_char,
@@ -1424,6 +1540,9 @@ pub unsafe extern "C" fn ass_process_codec_private(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer.
+// `data` must be null (no-op) or point to at least `size` valid bytes for the
+// duration of this call. `size` must be non-negative.
 pub unsafe extern "C" fn ass_process_chunk(
     track: *mut ASS_Track,
     data: *const c_char,
@@ -1438,6 +1557,8 @@ pub unsafe extern "C" fn ass_process_chunk(
         return;
     }
 
+    // SAFETY: `data` is non-null (checked above) and points to at least
+    // `size` bytes of initialised memory as guaranteed by the caller.
     let bytes = slice::from_raw_parts(data as *const u8, size as usize);
     let text = String::from_utf8_lossy(bytes).into_owned();
     let mut events = take_events(track_ref);
@@ -1465,6 +1586,8 @@ pub unsafe extern "C" fn ass_process_chunk(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer
+// with its `parser_priv` field intact.
 pub unsafe extern "C" fn ass_set_check_readorder(track: *mut ASS_Track, check_readorder: c_int) {
     if let Some(state) = track_state_mut(track) {
         state.check_readorder = check_readorder == 1;
@@ -1472,6 +1595,8 @@ pub unsafe extern "C" fn ass_set_check_readorder(track: *mut ASS_Track, check_re
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer
+// with consistent `events`/`n_events`/`max_events` fields.
 pub unsafe extern "C" fn ass_prune_events(track: *mut ASS_Track, deadline: i64) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -1492,6 +1617,8 @@ pub unsafe extern "C" fn ass_prune_events(track: *mut ASS_Track, deadline: i64) 
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer
+// with its `parser_priv` field intact.
 pub unsafe extern "C" fn ass_configure_prune(track: *mut ASS_Track, delay: i64) {
     if let Some(state) = track_state_mut(track) {
         state.prune_delay = (delay >= 0).then_some(delay);
@@ -1499,6 +1626,8 @@ pub unsafe extern "C" fn ass_configure_prune(track: *mut ASS_Track, delay: i64) 
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer
+// with consistent `events`/`n_events`/`max_events` fields.
 pub unsafe extern "C" fn ass_flush_events(track: *mut ASS_Track) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -1512,6 +1641,11 @@ pub unsafe extern "C" fn ass_flush_events(track: *mut ASS_Track) {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `library` must be null or a valid non-freed library pointer.
+// `fname` must be null (returns null) or a valid NUL-terminated C string for
+// the duration of this call. `codepage` must be null or a valid NUL-terminated
+// C string. The returned track (if non-null) is heap-allocated and owned by
+// the caller; pass it to `ass_free_track` when done.
 pub unsafe extern "C" fn ass_read_file(
     library: *mut ASS_Library,
     fname: *const c_char,
@@ -1534,6 +1668,11 @@ pub unsafe extern "C" fn ass_read_file(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `library` must be null or a valid non-freed library pointer.
+// `buf` must be null (returns null) or a pointer to at least `bufsize` bytes
+// of initialised memory that remains live for the duration of this call.
+// `codepage` must be null or a valid NUL-terminated C string.
+// The returned track (if non-null) is heap-allocated and owned by the caller.
 pub unsafe extern "C" fn ass_read_memory(
     library: *mut ASS_Library,
     buf: *mut c_char,
@@ -1545,6 +1684,8 @@ pub unsafe extern "C" fn ass_read_memory(
     }
 
     let codepage = string_option_from_ptr(codepage);
+    // SAFETY: `buf` is non-null (checked above) and points to at least
+    // `bufsize` bytes of initialised memory as guaranteed by the caller.
     let bytes = slice::from_raw_parts(buf as *const u8, bufsize);
     let Ok(parsed) = parse_script_bytes_with_codepage(bytes, codepage.as_deref()) else {
         return ptr::null_mut();
@@ -1556,6 +1697,10 @@ pub unsafe extern "C" fn ass_read_memory(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (returns 1) or a valid non-freed track pointer.
+// `fname` must be null (returns 1) or a valid NUL-terminated C string for the
+// duration of this call. `codepage` must be null or a valid NUL-terminated
+// C string.
 pub unsafe extern "C" fn ass_read_styles(
     track: *mut ASS_Track,
     fname: *const c_char,
@@ -1591,6 +1736,11 @@ pub unsafe extern "C" fn ass_read_styles(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `library` must be null (no-op) or a valid non-freed library pointer.
+// `name` must be null or a valid NUL-terminated C string. `data` must be null
+// (no-op) or a pointer to at least `data_size` bytes of initialised memory for
+// the duration of this call; the bytes are copied internally so the pointer
+// need not remain live after return. `data_size` must be non-negative.
 pub unsafe extern "C" fn ass_add_font(
     library: *mut ASS_Library,
     name: *const c_char,
@@ -1606,11 +1756,14 @@ pub unsafe extern "C" fn ass_add_font(
 
     library.fonts.push(FontAttachment {
         name: string_option_from_ptr(name).unwrap_or_default(),
+        // SAFETY: `data` is non-null (checked above) and the caller guarantees
+        // it points to at least `data_size` bytes of initialised memory.
         data: slice::from_raw_parts(data as *const u8, data_size as usize).to_vec(),
     });
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `library` must be null (no-op) or a valid non-freed library pointer.
 pub unsafe extern "C" fn ass_clear_fonts(library: *mut ASS_Library) {
     if let Some(library) = library.as_mut() {
         library.fonts.clear();
@@ -1621,6 +1774,9 @@ fn font_provider_cache_signature(
     renderer: &ASS_Renderer,
     library: *mut ASS_Library,
 ) -> FontProviderCacheSignature {
+    // SAFETY: `library` is either null (as_ref returns None) or a valid
+    // non-freed pointer for the duration of this call; the caller holds it
+    // alive via the surrounding `ass_render_frame` borrow.
     let library_ref = unsafe { library.as_ref() };
     let library_fonts_data = library_ref
         .map(|library| {
@@ -1686,6 +1842,8 @@ fn build_font_provider(
         _ => Box::new(NullFontProvider),
     };
 
+    // SAFETY: `library` is either null (returns early) or a valid non-freed
+    // pointer; the caller guarantees it remains live for this call.
     let Some(library) = (unsafe { library.as_ref() }) else {
         return wrap_default_font_path(system_provider, renderer);
     };
@@ -1775,6 +1933,8 @@ fn renderer_config(renderer: &ASS_Renderer, track: &ParsedTrack) -> RendererConf
 }
 
 fn maybe_extract_parsed_fonts(track: *mut ASS_Track, parsed: &ParsedTrack) {
+    // SAFETY: `track` is either null (returns early) or a valid non-freed
+    // pointer; callers always pass a track that outlives this call.
     let Some(track_ref) = (unsafe { track.as_ref() }) else {
         return;
     };
@@ -1782,6 +1942,8 @@ fn maybe_extract_parsed_fonts(track: *mut ASS_Track, parsed: &ParsedTrack) {
 }
 
 fn maybe_extract_fonts_to_library(library: *mut ASS_Library, attachments: &[ParsedAttachment]) {
+    // SAFETY: `library` is either null (returns early) or a valid non-freed
+    // pointer; callers always pass a library that outlives this call.
     let Some(library) = (unsafe { library.as_mut() }) else {
         return;
     };
@@ -1822,6 +1984,8 @@ fn apply_track_override(track: &mut ASS_Track, key: &str, value: &str) -> bool {
     true
 }
 
+// SAFETY: `style` must be a live, consistently-initialised `ASS_Style` whose
+// string fields (`Name`, `FontName`) satisfy the invariants of `free_c_string`.
 unsafe fn apply_style_override(style: &mut ASS_Style, field_name: &str, value: &str) {
     if field_name.eq_ignore_ascii_case("FontName") {
         replace_string(&mut style.FontName, value);
@@ -1944,6 +2108,10 @@ fn parse_override_color(value: &str, default: u32) -> u32 {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `track` must be null (returns 0) or a valid non-freed track pointer
+// with a consistent `events`/`n_events` array (null events with n_events <= 0
+// is also valid and returns 0). No other thread may mutate the events array
+// concurrently with this read-only traversal.
 pub unsafe extern "C" fn ass_step_sub(track: *mut ASS_Track, now: i64, movement: c_int) -> i64 {
     let Some(track_ref) = track.as_ref() else {
         return 0;
@@ -1952,6 +2120,9 @@ pub unsafe extern "C" fn ass_step_sub(track: *mut ASS_Track, now: i64, movement:
         return 0;
     }
 
+    // SAFETY: `events` is non-null (checked above) and points to a live,
+    // contiguous array of `n_events` `ASS_Event` elements as maintained by
+    // `ass_alloc_event` / `ass_free_event`. We only read from it here.
     let events = slice::from_raw_parts(track_ref.events, track_ref.n_events as usize);
     let direction = movement.signum();
     let mut remaining = movement;
@@ -1997,6 +2168,10 @@ pub unsafe extern "C" fn ass_step_sub(track: *mut ASS_Track, now: i64, movement:
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: Delegates to the platform allocator (`malloc` on native,
+// `Vec::with_capacity` + `mem::forget` on WASM). The returned pointer is
+// untyped heap memory owned by the caller; it must be freed with `ass_free`
+// (not Rust's allocator directly) to avoid allocator mismatch.
 pub unsafe extern "C" fn ass_malloc(size: usize) -> *mut c_void {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -2013,6 +2188,10 @@ pub unsafe extern "C" fn ass_malloc(size: usize) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `ptr` must be either null (no-op) or a pointer previously returned
+// by `ass_malloc` that has not yet been freed. On non-WASM targets this
+// delegates to libc `free`; the pointer must therefore have been allocated by
+// the same allocator (i.e. `ass_malloc`, not Rust's allocator).
 pub unsafe extern "C" fn ass_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
@@ -2029,12 +2208,18 @@ pub unsafe extern "C" fn ass_free(ptr: *mut c_void) {
     }
 }
 
+// SAFETY: `library` must be null or a valid non-freed library pointer that
+// outlives the returned track. The returned track is heap-allocated and owned
+// by the caller; pass it to `ass_free_track` when done.
 unsafe fn track_from_parsed(library: *mut ASS_Library, parsed: ParsedTrack) -> *mut ASS_Track {
     let track = ass_new_track(library);
     replace_track_from_parsed(track, parsed);
     track
 }
 
+// SAFETY: `track` must be a valid non-freed track pointer returned by
+// `ass_new_track`. The track's existing contents will be freed before being
+// replaced; all string fields must satisfy `free_c_string` invariants.
 unsafe fn replace_track_from_parsed(track: *mut ASS_Track, parsed: ParsedTrack) {
     let Some(track_ref) = track.as_mut() else {
         return;
@@ -2047,6 +2232,10 @@ unsafe fn replace_track_from_parsed(track: *mut ASS_Track, parsed: ParsedTrack) 
     *track_ref = build_track(parsed, library, parser_priv);
 }
 
+// SAFETY: `library` and `parser_priv` are stored as raw back-pointers inside
+// the returned `ASS_Track` and must remain valid (non-freed) for the track's
+// lifetime. The styles/events Vecs are consumed and their backing memory is
+// transferred to the track; they must later be reclaimed via `free_track_contents`.
 unsafe fn build_track(
     parsed: ParsedTrack,
     library: *mut ASS_Library,
@@ -2086,6 +2275,10 @@ unsafe fn build_track(
     track
 }
 
+// SAFETY: `track`'s `styles` / `events` arrays and all their string fields
+// must satisfy the invariants of `take_styles`, `take_events`, and
+// `free_c_string`. After this call the arrays are freed and set to null;
+// the track itself is not dropped.
 unsafe fn free_track_contents(track: &mut ASS_Track) {
     for mut style in take_styles(track) {
         free_style(&mut style);
@@ -2114,6 +2307,8 @@ unsafe fn track_styles_match_parsed(track: &ASS_Track, parsed: &ParsedTrack) -> 
     let current_styles = if track.styles.is_null() || track.n_styles <= 0 {
         Vec::new()
     } else {
+        // SAFETY: caller guarantees `track` was produced by `ass_new_track` and
+        // `styles` / `n_styles` are consistent (non-null and correctly sized).
         slice::from_raw_parts(track.styles, track.n_styles as usize)
             .iter()
             .map(|style| parsed_style_from_ffi(style))
@@ -2132,6 +2327,9 @@ unsafe fn take_styles(track: &mut ASS_Track) -> Vec<ASS_Style> {
         track.max_styles = 0;
         Vec::new()
     } else {
+        // SAFETY: `styles` was allocated as a `Vec<ASS_Style>` by `store_styles`
+        // and its length / capacity are tracked by `n_styles` / `max_styles`.
+        // We immediately null out the pointer so the track no longer owns it.
         let vec = Vec::from_raw_parts(
             track.styles,
             track.n_styles as usize,
@@ -2153,6 +2351,8 @@ unsafe fn store_styles(track: &mut ASS_Track, mut styles: Vec<ASS_Style>) {
     } else {
         styles.as_mut_ptr()
     };
+    // SAFETY: ownership of the backing allocation transfers to the track; it
+    // will be reclaimed by `take_styles` or `free_track_contents`.
     mem::forget(styles);
 }
 
@@ -2163,6 +2363,9 @@ unsafe fn take_events(track: &mut ASS_Track) -> Vec<ASS_Event> {
         track.max_events = 0;
         Vec::new()
     } else {
+        // SAFETY: `events` was allocated as a `Vec<ASS_Event>` by `store_events`
+        // and its length / capacity are tracked by `n_events` / `max_events`.
+        // We immediately null out the pointer so the track no longer owns it.
         let vec = Vec::from_raw_parts(
             track.events,
             track.n_events as usize,
@@ -2184,27 +2387,38 @@ unsafe fn store_events(track: &mut ASS_Track, mut events: Vec<ASS_Event>) {
     } else {
         events.as_mut_ptr()
     };
+    // SAFETY: ownership of the backing allocation transfers to the track; it
+    // will be reclaimed by `take_events` or `free_track_contents`.
     mem::forget(events);
 }
 
+// SAFETY: All string fields in `style` must be either null or C strings
+// previously allocated by `string_to_c_ptr` (i.e. via `CString::into_raw`).
 unsafe fn free_style(style: &mut ASS_Style) {
     free_c_string(&mut style.Name);
     free_c_string(&mut style.FontName);
 }
 
+// SAFETY: All string fields in `event` must be either null or C strings
+// previously allocated by `string_to_c_ptr`.
 unsafe fn free_event(event: &mut ASS_Event) {
     free_c_string(&mut event.Name);
     free_c_string(&mut event.Effect);
     free_c_string(&mut event.Text);
 }
 
+// SAFETY: `*value` must be either null (no-op) or a pointer previously
+// returned by `CString::into_raw` (i.e. `string_to_c_ptr`). After this call
+// `*value` is set to null; the caller must not use the old pointer again.
 unsafe fn free_c_string(value: &mut *mut c_char) {
     if !value.is_null() {
+        // SAFETY: pointer was produced by `CString::into_raw`; not yet freed.
         drop(CString::from_raw(*value));
         *value = ptr::null_mut();
     }
 }
 
+// SAFETY: `*target` must satisfy the invariants of `free_c_string`.
 unsafe fn replace_string(target: &mut *mut c_char, value: &str) {
     free_c_string(target);
     *target = string_to_c_ptr(value);
@@ -2265,6 +2479,8 @@ fn string_to_c_ptr(value: &str) -> *mut c_char {
         .unwrap_or(ptr::null_mut())
 }
 
+// SAFETY: `value` must be null or a valid NUL-terminated C string that remains
+// live for the duration of the call.
 unsafe fn string_option_from_ptr(value: *const c_char) -> Option<String> {
     if value.is_null() {
         None
@@ -2273,21 +2489,36 @@ unsafe fn string_option_from_ptr(value: *const c_char) -> Option<String> {
     }
 }
 
+// SAFETY: `value` must be a valid, non-null NUL-terminated C string that
+// remains live for the duration of the call.
 unsafe fn string_from_ptr(value: *const c_char) -> String {
+    // SAFETY: caller guarantees `value` is a valid NUL-terminated C string.
     CStr::from_ptr(value).to_string_lossy().into_owned()
 }
 
+// SAFETY: `track` must be null (returns None) or a valid non-freed track
+// pointer whose `parser_priv` field, if non-null, points to a live
+// `Box<TrackState>` allocated in `ass_new_track`. The returned reference
+// borrows from `'static` because the C owner controls the lifetime; the
+// caller must not hold it past the next mutation of the track.
 unsafe fn track_state_ref(track: *mut ASS_Track) -> Option<&'static TrackState> {
     track.as_ref().and_then(|track| {
+        // SAFETY: `parser_priv` was cast from `Box<TrackState>` in
+        // `ass_new_track` and has not been freed yet.
         (!track.parser_priv.is_null()).then(|| &*(track.parser_priv as *const TrackState))
     })
 }
 
+// SAFETY: Same as `track_state_ref` but returns a mutable reference; the
+// caller must ensure no other references to this `TrackState` exist.
 unsafe fn track_state_mut(track: *mut ASS_Track) -> Option<&'static mut TrackState> {
     let track = track.as_mut()?;
+    // SAFETY: `parser_priv` was cast from `Box<TrackState>` in `ass_new_track`.
     (!track.parser_priv.is_null()).then_some(&mut *(track.parser_priv as *mut TrackState))
 }
 
+// SAFETY: `track` must be null (no-op) or a valid non-freed track pointer
+// with an intact `parser_priv` field (see `track_state_mut`).
 unsafe fn invalidate_parsed_track_cache(track: *mut ASS_Track) {
     if let Some(state) = track_state_mut(track) {
         state.parsed_cache_signature = None;
@@ -2296,8 +2527,12 @@ unsafe fn invalidate_parsed_track_cache(track: *mut ASS_Track) {
     }
 }
 
+// SAFETY: `track.parser_priv`, if non-null, must point to a live
+// `Box<TrackState>` allocated in `ass_new_track`. The caller must hold a
+// mutable reference to `track` so no other reference to the state exists.
 unsafe fn invalidate_parsed_track_cache_for_track(track: &mut ASS_Track) {
     if !track.parser_priv.is_null() {
+        // SAFETY: `parser_priv` was cast from `Box<TrackState>` in `ass_new_track`.
         let state = &mut *(track.parser_priv as *mut TrackState);
         state.parsed_cache_signature = None;
         state.parsed_cache = None;
@@ -2328,6 +2563,11 @@ fn parsed_track_cache_signature(track: &ASS_Track) -> ParsedTrackCacheSignature 
     }
 }
 
+// SAFETY: `track` must be a valid non-freed track pointer with an intact
+// `parser_priv` field. `track_ref` must be a reference to the same track.
+// The returned reference is valid until the next call that mutates the track's
+// parsed cache (i.e. another call to this function with a changed signature,
+// or `invalidate_parsed_track_cache`).
 unsafe fn cached_parsed_track_from_ffi<'a>(
     track: *mut ASS_Track,
     track_ref: &ASS_Track,
@@ -2351,6 +2591,8 @@ unsafe fn active_event_indices(track: *mut ASS_Track, now: i64) -> Vec<usize> {
         return Vec::new();
     }
 
+    // SAFETY: `events` is non-null (checked above) and the caller guarantees
+    // the track's `events` / `n_events` fields are consistent; we only read.
     slice::from_raw_parts(track.events, track.n_events as usize)
         .iter()
         .enumerate()
@@ -2424,6 +2666,8 @@ unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
     let styles = if track.styles.is_null() || track.n_styles <= 0 {
         Vec::new()
     } else {
+        // SAFETY: `styles` is non-null (checked above) and the caller guarantees
+        // `styles` / `n_styles` are consistent (allocated by `ass_alloc_style`).
         slice::from_raw_parts(track.styles, track.n_styles as usize)
             .iter()
             .map(|style| unsafe { parsed_style_from_ffi(style) })
@@ -2433,6 +2677,8 @@ unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
     let events = if track.events.is_null() || track.n_events <= 0 {
         Vec::new()
     } else {
+        // SAFETY: `events` is non-null (checked above) and the caller guarantees
+        // `events` / `n_events` are consistent (allocated by `ass_alloc_event`).
         slice::from_raw_parts(track.events, track.n_events as usize)
             .iter()
             .map(|event| unsafe { parsed_event_from_ffi(event) })
@@ -2480,6 +2726,9 @@ unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
     }
 }
 
+// SAFETY: `style` must be a live `ASS_Style` whose string fields (`Name`,
+// `FontName`) are either null or valid NUL-terminated C strings allocated by
+// `string_to_c_ptr`. The strings are only read, not freed, by this function.
 unsafe fn parsed_style_from_ffi(style: &ASS_Style) -> ParsedStyle {
     ParsedStyle {
         name: string_option_from_ptr(style.Name).unwrap_or_default(),
@@ -2589,6 +2838,9 @@ fn apply_selective_style_overrides(track: &mut ParsedTrack, renderer: &ASS_Rende
     }
 }
 
+// SAFETY: `event` must be a live `ASS_Event` whose string fields (`Name`,
+// `Effect`, `Text`) are either null or valid NUL-terminated C strings
+// allocated by `string_to_c_ptr`. The strings are only read, not freed.
 unsafe fn parsed_event_from_ffi(event: &ASS_Event) -> ParsedEvent {
     ParsedEvent {
         start: event.Start,
