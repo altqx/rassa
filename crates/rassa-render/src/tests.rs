@@ -2676,7 +2676,38 @@ fn render_frame_avoids_basic_bottom_collision_for_unpositioned_events() {
 }
 
 #[test]
-fn render_frame_allows_basic_collision_across_different_layers() {
+fn collision_positions_stay_stable_across_frames_like_libass() {
+    // libass keeps a per-event render_priv rect: an event placed by
+    // fix_collisions keeps its position in later frames while its height is
+    // unchanged, even after other events end (ass_render.c get_render_priv).
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:00.50,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\1c&H00FF00&}Second").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let second_y = |planes: &[ImagePlane]| {
+        planes
+            .iter()
+            .filter(|plane| {
+                plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000
+            })
+            .map(|plane| plane.destination.y)
+            .min()
+            .expect("second event plane")
+    };
+
+    let both_active = engine.render_frame_with_provider(&track, &provider, 200);
+    let first_gone = engine.render_frame_with_provider(&track, &provider, 1000);
+    assert_eq!(
+        second_y(&both_active),
+        second_y(&first_gone),
+        "an event keeps its collision-assigned position after the other event ends"
+    );
+}
+
+#[test]
+fn render_frame_collides_events_across_layers_like_libass() {
+    // libass fix_collisions (ass_render.c) runs over every event of the
+    // frame with no layer distinction: the layer only controls z-order, so
+    // two unpositioned bottom subtitles on different layers still stack.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 1,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H00FF00&}Second").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -2695,7 +2726,10 @@ fn render_frame_allows_basic_collision_across_different_layers() {
         .min()
         .expect("layer 1 character plane");
 
-    assert_eq!(layer0_y, layer1_y);
+    assert!(
+        (layer0_y - layer1_y).abs() >= 20,
+        "events on different layers still avoid each other in libass: layer0_y={layer0_y} layer1_y={layer1_y}"
+    );
 }
 
 #[test]

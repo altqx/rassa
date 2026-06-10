@@ -479,110 +479,128 @@ pub(crate) fn compute_vertical_layout(
     positions
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_vertical_layout(
-    track: &ParsedTrack,
-    event: &LayoutEvent,
-    metrics: &[LineMetrics],
-    effective_position: Option<(i32, i32)>,
-    occupied_bounds: &[Rect],
-    config: &RendererConfig,
-    render_scale: RenderScale,
-) -> Vec<i32> {
-    let mut vertical_layout = compute_vertical_layout(
-        track,
-        metrics,
-        event.alignment,
-        event.margin_v,
-        effective_position,
-        config,
-        render_scale,
-    );
-    if effective_position.is_some() || occupied_bounds.is_empty() {
-        return vertical_layout;
-    }
-
-    let scale_y = render_scale.y;
-    let line_height = metrics
-        .first()
-        .map(|line| line.height().round() as i32)
-        .unwrap_or(0)
-        .max(1);
-    let shift = match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
-        ass::VALIGN_TOP => line_height,
-        ass::VALIGN_CENTER => line_height,
-        _ => -line_height,
-    };
-
-    let mut bounds = event_bounds(
-        track,
-        event,
-        &vertical_layout,
-        metrics,
-        effective_position,
-        1.0,
-    );
-    let frame_height = (f64::from(track.play_res_y) * style_scale(scale_y)).round() as i32;
-    while occupied_bounds
-        .iter()
-        .any(|occupied| bounds.intersect(*occupied).is_some())
-    {
-        for line_top in &mut vertical_layout {
-            *line_top += shift;
-        }
-        bounds = event_bounds(
-            track,
-            event,
-            &vertical_layout,
-            metrics,
-            effective_position,
-            1.0,
-        );
-        if bounds.y_min < 0 || bounds.y_max > frame_height {
-            break;
-        }
-    }
-
-    vertical_layout
+/// One event's finished images plus the collision metadata libass keeps in
+/// EventImages.
+pub(crate) struct RenderedEvent {
+    pub(crate) event_index: usize,
+    pub(crate) planes: Vec<ImagePlane>,
+    /// libass EventImages rect: metric line box plus borders, not ink.
+    pub(crate) collision_rect: Option<Rect>,
+    pub(crate) detect_collisions: bool,
+    pub(crate) shift_direction: i32,
+    pub(crate) frame_clip: Rect,
 }
 
-pub(crate) fn event_bounds(
-    track: &ParsedTrack,
-    event: &LayoutEvent,
-    vertical_layout: &[i32],
-    metrics: &[LineMetrics],
-    effective_position: Option<(i32, i32)>,
-    scale_x: f64,
-) -> Rect {
-    let mut x_min = i32::MAX;
-    let mut y_min = i32::MAX;
-    let mut x_max = i32::MIN;
-    let mut y_max = i32::MIN;
-
-    for ((line, line_top), line_metrics) in event
-        .lines
-        .iter()
-        .zip(vertical_layout.iter().copied())
-        .zip(metrics.iter())
-    {
-        let line_width = (f64::from(line.width) * style_scale(scale_x)).round() as i32;
-        let origin_x =
-            compute_horizontal_origin(track, event, line_width, effective_position, scale_x);
-        x_min = x_min.min(origin_x);
-        y_min = y_min.min(line_top);
-        x_max = x_max.max(origin_x + line_width);
-        y_max = y_max.max(line_top + line_metrics.height().round() as i32);
-    }
-
-    if x_min == i32::MAX {
-        Rect::default()
-    } else {
-        Rect {
-            x_min,
-            y_min,
-            x_max,
-            y_max,
+/// Port of libass fit_rect (ass_render.c): accumulate the shift needed to
+/// clear every already-used rect in the given direction; `used` is sorted by
+/// y_min.
+fn fit_rect(rect: Rect, used: &[Rect], direction: i32) -> i32 {
+    let mut shift = 0;
+    if direction >= 0 {
+        for fixed in used {
+            if rect.y_max + shift <= fixed.y_min
+                || rect.y_min + shift >= fixed.y_max
+                || rect.x_max <= fixed.x_min
+                || rect.x_min >= fixed.x_max
+            {
+                continue;
+            }
+            shift = fixed.y_max - rect.y_min;
         }
+    } else {
+        for fixed in used.iter().rev() {
+            if rect.y_max + shift <= fixed.y_min
+                || rect.y_min + shift >= fixed.y_max
+                || rect.x_max <= fixed.x_min
+                || rect.x_min >= fixed.x_max
+            {
+                continue;
+            }
+            shift = fixed.y_min - rect.y_max;
+        }
+    }
+    shift
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.y_min < b.y_max && b.y_min < a.y_max && a.x_min < b.x_max && b.x_min < a.x_max
+}
+
+/// Port of libass fix_collisions (ass_render.c): events already positioned
+/// in a previous frame stay put while their height is unchanged and they
+/// don't overlap another fixed event; everything else is shifted into free
+/// space with fit_rect and becomes fixed.
+pub(crate) fn fix_collisions(
+    cache: &mut std::collections::HashMap<usize, Rect>,
+    records: &mut [RenderedEvent],
+) {
+    let mut used: Vec<Rect> = Vec::new();
+
+    // Pass 1: keep events at their cached positions where still valid.
+    let mut fixed_shift = vec![None; records.len()];
+    for (index, record) in records.iter().enumerate() {
+        if !record.detect_collisions {
+            continue;
+        }
+        let Some(bounds) = record.collision_rect else {
+            continue;
+        };
+        if bounds.width() <= 0 || bounds.height() <= 0 {
+            // VSFilter treats zero-area events as effectively fixed.
+            continue;
+        }
+        let Some(cached) = cache.get(&record.event_index).copied() else {
+            continue;
+        };
+        if cached.height() != bounds.height() || used.iter().any(|rect| rects_overlap(cached, *rect))
+        {
+            cache.remove(&record.event_index);
+            continue;
+        }
+        used.push(cached);
+        fixed_shift[index] = Some(cached.y_min - bounds.y_min);
+    }
+    used.sort_by_key(|rect| rect.y_min);
+
+    // Pass 2: fit the remaining events into free space and fix them.
+    for (index, record) in records.iter_mut().enumerate() {
+        if !record.detect_collisions {
+            continue;
+        }
+        if let Some(shift) = fixed_shift[index] {
+            if shift != 0 {
+                translate_planes_y(&mut record.planes, shift);
+            }
+            continue;
+        }
+        let Some(bounds) = record.collision_rect else {
+            continue;
+        };
+        if bounds.width() <= 0 || bounds.height() <= 0 {
+            continue;
+        }
+        let shift = fit_rect(bounds, &used, record.shift_direction);
+        if shift != 0 {
+            translate_planes_y(&mut record.planes, shift);
+        }
+        let assigned = Rect {
+            x_min: bounds.x_min,
+            y_min: bounds.y_min + shift,
+            x_max: bounds.x_max,
+            y_max: bounds.y_max + shift,
+        };
+        cache.insert(record.event_index, assigned);
+        used.push(assigned);
+        used.sort_by_key(|rect| rect.y_min);
+    }
+}
+
+pub(crate) fn translate_planes_y(planes: &mut [ImagePlane], delta_y: i32) {
+    if delta_y == 0 {
+        return;
+    }
+    for plane in planes {
+        plane.destination.y += delta_y;
     }
 }
 

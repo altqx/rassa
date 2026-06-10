@@ -26,6 +26,13 @@ pub struct PreparedFrame {
 #[derive(Default)]
 pub struct RenderEngine {
     layout: LayoutEngine,
+    // libass keeps a per-event ASS_RenderPriv with the rect the event was
+    // assigned by fix_collisions; while the event keeps rendering with the
+    // same height it stays at that position across frames.  The cache is
+    // invalidated when the renderer settings change (libass bumps render_id
+    // on every ass_set_*).
+    collision_cache: std::sync::Mutex<HashMap<usize, Rect>>,
+    collision_render_id: std::sync::Mutex<u64>,
 }
 
 mod metrics;
@@ -119,8 +126,27 @@ impl RenderEngine {
         config: &RendererConfig,
     ) -> Vec<ImagePlane> {
         let prepared = self.prepare_frame_with_config(track, provider, now_ms, config);
-        let mut planes = Vec::new();
-        let mut occupied_bounds_by_layer = HashMap::<i32, Vec<Rect>>::new();
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{config:?}").hash(&mut hasher);
+            track.play_res_x.hash(&mut hasher);
+            track.play_res_y.hash(&mut hasher);
+            track.events.len().hash(&mut hasher);
+            let render_id = hasher.finish();
+            let mut current = self
+                .collision_render_id
+                .lock()
+                .expect("collision render id mutex poisoned");
+            if *current != render_id {
+                *current = render_id;
+                self.collision_cache
+                    .lock()
+                    .expect("collision cache mutex poisoned")
+                    .clear();
+            }
+        }
+        let mut rendered_events = Vec::new();
 
         let render_scale_x = output_scale_x(track, config);
         let render_scale_y = output_scale_y(track, config);
@@ -146,16 +172,9 @@ impl RenderEngine {
                 render_scale_x,
                 render_scale_y,
             );
-            let layer = event_layer(track, event);
-            let occupied_bounds = occupied_bounds_by_layer.entry(layer).or_default();
             let effect_disables_collision = source_event
                 .map(transition_effect_disables_collision)
                 .unwrap_or(false);
-            let layout_occupied_bounds = if effect_disables_collision {
-                &[][..]
-            } else {
-                occupied_bounds.as_slice()
-            };
             let metrics_context = LineMetricsContext {
                 track,
                 config,
@@ -164,26 +183,19 @@ impl RenderEngine {
                 render_scale: render_scale_all,
             };
             let line_metrics = event_line_metrics(&event.lines, &metrics_context);
-            let vertical_layout = resolve_vertical_layout(
+            let vertical_layout = compute_vertical_layout(
                 track,
-                event,
                 &line_metrics,
+                event.alignment,
+                event.margin_v,
                 effective_position,
-                layout_occupied_bounds,
                 config,
                 render_scale_all,
             );
-            let occupied_bound =
-                (!effect_disables_collision && effective_position.is_none()).then(|| {
-                    event_bounds(
-                        track,
-                        event,
-                        &vertical_layout,
-                        &line_metrics,
-                        effective_position,
-                        render_scale_x,
-                    )
-                });
+            let mut event_left = i32::MAX;
+            let mut event_right = i32::MIN;
+            let mut event_border_x = 0_i32;
+            let mut event_border_y = 0_i32;
             for ((line, line_top), line_metric) in event
                 .lines
                 .iter()
@@ -213,6 +225,8 @@ impl RenderEngine {
                     effective_position,
                     render_scale_x,
                 );
+                event_left = event_left.min(origin_x);
+                event_right = event_right.max(origin_x + scaled_line_width);
                 let origin_x_26_6 = origin_x * 64;
                 let mut line_pen_x_26_6 = 0;
                 let mut line_has_transformed_borderstyle3_box = false;
@@ -224,6 +238,12 @@ impl RenderEngine {
                         render_scale,
                     );
                     clip_mask_bleed = clip_mask_bleed.max(style_clip_bleed(&effective_style));
+                    if run.drawing.is_none() {
+                        event_border_x =
+                            event_border_x.max(effective_style.border_x.round().max(0.0) as i32);
+                        event_border_y =
+                            event_border_y.max(effective_style.border_y.round().max(0.0) as i32);
+                    }
                     let run_origin_x_26_6 = origin_x_26_6 + line_pen_x_26_6;
                     let run_origin_x = run_origin_x_26_6 >> 6;
                     let run_shadow_start = shadow_planes.len();
@@ -666,17 +686,51 @@ impl RenderEngine {
             );
             let render_offset = output_offset(config);
             event_planes = translate_planes(event_planes, render_offset);
-            event_planes = apply_event_clip(
-                event_planes,
-                frame_clip_rect(track, config, event, effective_position),
-                false,
-            );
-            if let Some(occupied_bound) = occupied_bound {
-                occupied_bounds.push(occupied_bound);
-            }
-            planes.extend(event_planes);
+            // libass EventImages: top = device_y - lines[0].asc - border_top,
+            // height = text height + borders, width = bbox + 2 * border_x.
+            let collision_rect = (!event.lines.is_empty() && event_left < event_right).then(|| {
+                let total_height = total_text_height(&line_metrics, config).round() as i32;
+                Rect {
+                    x_min: event_left - event_border_x + render_offset.x,
+                    y_min: vertical_layout.first().copied().unwrap_or(0) - event_border_y
+                        + render_offset.y,
+                    x_max: event_right + event_border_x + render_offset.x,
+                    y_max: vertical_layout.first().copied().unwrap_or(0)
+                        + total_height
+                        + event_border_y
+                        + render_offset.y,
+                }
+            });
+            rendered_events.push(RenderedEvent {
+                event_index: event.event_index,
+                planes: event_planes,
+                collision_rect,
+                detect_collisions: effective_position.is_none() && !effect_disables_collision,
+                shift_direction: if (event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER))
+                    == ass::VALIGN_SUB
+                {
+                    -1
+                } else {
+                    1
+                },
+                frame_clip: frame_clip_rect(track, config, event, effective_position),
+            });
         }
 
+        // libass runs fix_collisions over the finished event images of the
+        // whole frame (all layers together), then clips to the frame.
+        {
+            let mut cache = self
+                .collision_cache
+                .lock()
+                .expect("collision cache mutex poisoned");
+            fix_collisions(&mut cache, &mut rendered_events);
+        }
+
+        let mut planes = Vec::new();
+        for record in rendered_events {
+            planes.extend(apply_event_clip(record.planes, record.frame_clip, false));
+        }
         planes
     }
 
