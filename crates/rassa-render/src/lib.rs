@@ -698,7 +698,9 @@ impl RenderEngine {
             // libass combines bitmaps of the same type and color within an
             // event (render_and_combine_glyphs); merge unconditionally.
             event_planes = merge_compatible_event_planes(event_planes);
-            if let Some(clip_rect) = event.clip_rect {
+            if let Some(clip_rect) =
+                resolve_animated_clip_rect(event, track, source_event, now_ms)
+            {
                 let clip_rect = scale_clip_rect(clip_rect, render_scale_x, render_scale_y);
                 let clip_rect = if event.inverse_clip {
                     expand_rect(clip_rect, clip_mask_bleed)
@@ -712,6 +714,19 @@ impl RenderEngine {
             if let Some(fade) = event.fade {
                 event_planes = apply_fade_to_planes(event_planes, fade, source_event, now_ms);
             }
+            // libass EventImages: top = device_y - lines[0].asc - border_top,
+            // height = text height + borders, width = bbox + 2 * border_x.
+            let event_line_box = (!event.lines.is_empty() && event_left < event_right).then(|| {
+                let total_height = total_text_height(&line_metrics, config).round() as i32;
+                Rect {
+                    x_min: event_left - event_border_x,
+                    y_min: vertical_layout.first().copied().unwrap_or(0) - event_border_y,
+                    x_max: event_right + event_border_x,
+                    y_max: vertical_layout.first().copied().unwrap_or(0)
+                        + total_height
+                        + event_border_y,
+                }
+            });
             event_planes = apply_effect_to_planes(
                 event_planes,
                 source_event,
@@ -720,23 +735,15 @@ impl RenderEngine {
                 now_ms,
                 render_scale_x,
                 render_scale_y,
+                event_line_box,
             );
             let render_offset = output_offset(config);
             event_planes = translate_planes(event_planes, render_offset);
-            // libass EventImages: top = device_y - lines[0].asc - border_top,
-            // height = text height + borders, width = bbox + 2 * border_x.
-            let collision_rect = (!event.lines.is_empty() && event_left < event_right).then(|| {
-                let total_height = total_text_height(&line_metrics, config).round() as i32;
-                Rect {
-                    x_min: event_left - event_border_x + render_offset.x,
-                    y_min: vertical_layout.first().copied().unwrap_or(0) - event_border_y
-                        + render_offset.y,
-                    x_max: event_right + event_border_x + render_offset.x,
-                    y_max: vertical_layout.first().copied().unwrap_or(0)
-                        + total_height
-                        + event_border_y
-                        + render_offset.y,
-                }
+            let collision_rect = event_line_box.map(|rect| Rect {
+                x_min: rect.x_min + render_offset.x,
+                y_min: rect.y_min + render_offset.y,
+                x_max: rect.x_max + render_offset.x,
+                y_max: rect.y_max + render_offset.y,
             });
             rendered_events.push(RenderedEvent {
                 event_index: event.event_index,

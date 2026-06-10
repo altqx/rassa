@@ -1982,6 +1982,28 @@ fn render_frame_accepts_renderer_shaping_mode() {
 }
 
 #[test]
+fn render_frame_interpolates_animated_clip_rect() {
+    // libass interpolates rectangular \clip coordinates inside \t
+    // (ass_parse.c): the visible ink window grows monotonically between the
+    // transform's start and end times.
+    let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(20,30)\\clip(20,0,40,120)\\t(0,1000,\\clip(20,0,300,120))}Clipping").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let width_at = |now_ms: i64| {
+        let planes = engine.render_frame_with_provider(&track, &provider, now_ms);
+        visible_bounds(&planes).map(|rect| rect.width()).unwrap_or(0)
+    };
+
+    let start = width_at(10);
+    let middle = width_at(200);
+    let near_end = width_at(400);
+    assert!(
+        start < middle && middle < near_end,
+        "animated \\t(\\clip) must widen the visible window over time: {start} < {middle} < {near_end}"
+    );
+}
+
+#[test]
 fn render_frame_applies_inverse_rectangular_clip() {
     let plane = ImagePlane {
         size: Size {
@@ -2419,7 +2441,10 @@ fn render_frame_applies_scroll_effect_motion() {
         .expect("early scroll-up bounds");
     let up_late = character_bounds(&engine.render_frame_with_provider(&up, &provider, 1500))
         .expect("late scroll-up bounds");
-    let down_early = character_bounds(&engine.render_frame_with_provider(&down, &provider, 100))
+    // At 100ms a scroll-down box bottom sits at y0 + 4 with the glyph ink
+    // still above the y0..y1 clip window (libass shows nothing yet), so
+    // sample once the text has entered the window.
+    let down_early = character_bounds(&engine.render_frame_with_provider(&down, &provider, 500))
         .expect("early scroll-down bounds");
     let down_late = character_bounds(&engine.render_frame_with_provider(&down, &provider, 1500))
         .expect("late scroll-down bounds");

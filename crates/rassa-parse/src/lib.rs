@@ -145,6 +145,9 @@ pub struct ParsedAnimatedStyle {
     pub shadow_y: Option<f64>,
     pub blur: Option<f64>,
     pub be: Option<f64>,
+    /// Animated rectangular \clip target (libass interpolates rect clips
+    /// inside \t; vector clips never animate).
+    pub clip_rect: Option<ParsedRectF64>,
 }
 
 impl ParsedAnimatedStyle {
@@ -170,6 +173,7 @@ impl ParsedAnimatedStyle {
             && self.shadow_y.is_none()
             && self.blur.is_none()
             && self.be.is_none()
+            && self.clip_rect.is_none()
     }
 
     fn clear_colours(&mut self) {
@@ -1556,14 +1560,22 @@ fn parse_transform(value: &str, current_style: &ParsedSpanStyle) -> Option<Parse
 
     let mut target_style = current_style.clone();
     let mut explicit_style = ParsedAnimatedStyle::default();
+    let mut animated_clip = None;
     for raw_tag in split_override_tags(tags_part) {
         let tag = raw_tag.trim();
+        if let Some(rest) = tag.strip_prefix("clip") {
+            if let Some(rect) = parse_rect_clip_exact(rest) {
+                animated_clip = Some(rect);
+            }
+            continue;
+        }
         apply_transform_tag(tag, &mut target_style);
         record_explicit_transform_tag(tag, &target_style, &mut explicit_style);
     }
 
     let mut animated = diff_animated_style(current_style, &target_style);
     merge_explicit_transform_style(&mut animated, explicit_style);
+    animated.clip_rect = animated_clip;
     (!animated.is_empty()).then_some(ParsedSpanTransform {
         start_ms,
         end_ms,
@@ -1862,6 +1874,7 @@ fn diff_animated_style(base: &ParsedSpanStyle, target: &ParsedSpanStyle) -> Pars
             .then_some(target.shadow_y),
         blur: ((target.blur - base.blur).abs() > f64::EPSILON).then_some(target.blur),
         be: ((target.be - base.be).abs() > f64::EPSILON).then_some(target.be),
+        clip_rect: None,
     }
 }
 
@@ -3447,9 +3460,26 @@ Style: Default,Arial,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,-1,-2,-3,
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\t(0,100,\\clip(0,0,10,10))}Text", &base_style, &[]);
 
+        let transforms = &parsed.lines[0].spans[0].transforms;
+        assert_eq!(
+            transforms.len(),
+            1,
+            "an animated rect clip parses as a transform target"
+        );
+        let style = &transforms[0].style;
+        assert_eq!(
+            style.clip_rect,
+            Some(ParsedRectF64 {
+                x_min: 0.0,
+                y_min: 0.0,
+                x_max: 10.0,
+                y_max: 10.0,
+            }),
+            "the \\t carries the clip rect target"
+        );
         assert!(
-            parsed.lines[0].spans[0].transforms.is_empty(),
-            "unsupported animated clip must not become a no-op primary-colour transform"
+            style.primary_colour.is_none(),
+            "\\clip inside \\t must not be misclassified as a \\c colour reset"
         );
     }
 

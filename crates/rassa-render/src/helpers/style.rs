@@ -98,6 +98,71 @@ pub(crate) fn resolve_run_style(
     style
 }
 
+/// Resolve the event's rectangular clip at `now_ms`, interpolating animated
+/// \t(\clip(...)) targets like libass ass_parse.c: each coordinate is
+/// lerped with the transform's power from the current clip (the static
+/// \clip, or the full frame when none is set).
+pub(crate) fn resolve_animated_clip_rect(
+    event: &LayoutEvent,
+    track: &ParsedTrack,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> Option<Rect> {
+    let animated = event
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .flat_map(|run| run.transforms.iter())
+        .filter(|transform| transform.style.clip_rect.is_some())
+        .collect::<Vec<_>>();
+    if animated.is_empty() {
+        return event.clip_rect;
+    }
+    let source = source_event?;
+    let elapsed = (now_ms - source.start).clamp(0, source.duration.max(0)) as i32;
+    let base = event.clip_rect.unwrap_or(Rect {
+        x_min: 0,
+        y_min: 0,
+        x_max: track.play_res_x,
+        y_max: track.play_res_y,
+    });
+    let mut current = [
+        f64::from(base.x_min),
+        f64::from(base.y_min),
+        f64::from(base.x_max),
+        f64::from(base.y_max),
+    ];
+    for transform in animated {
+        let target = transform.style.clip_rect.expect("filtered to clip transforms");
+        let start_ms = transform.start_ms.max(0);
+        let end_ms = transform
+            .end_ms
+            .unwrap_or(source.duration.max(0) as i32)
+            .max(start_ms);
+        let progress = if elapsed <= start_ms {
+            0.0
+        } else if elapsed >= end_ms {
+            1.0
+        } else {
+            let linear = f64::from(elapsed - start_ms) / f64::from((end_ms - start_ms).max(1));
+            linear.powf(transform.accel)
+        };
+        let lerp = |from: f64, to: f64| from + (to - from) * progress;
+        current = [
+            lerp(current[0], target.x_min),
+            lerp(current[1], target.y_min),
+            lerp(current[2], target.x_max),
+            lerp(current[3], target.y_max),
+        ];
+    }
+    Some(Rect {
+        x_min: current[0].round() as i32,
+        y_min: current[1].round() as i32,
+        x_max: current[2].round() as i32,
+        y_max: current[3].round() as i32,
+    })
+}
+
 pub(crate) fn apply_renderer_style_scale(
     mut style: ParsedSpanStyle,
     track: &ParsedTrack,

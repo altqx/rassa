@@ -16,6 +16,7 @@ pub(crate) fn apply_fade_to_planes(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_effect_to_planes(
     planes: Vec<ImagePlane>,
     source_event: Option<&ParsedEvent>,
@@ -24,6 +25,7 @@ pub(crate) fn apply_effect_to_planes(
     now_ms: i64,
     scale_x: f64,
     scale_y: f64,
+    line_box: Option<Rect>,
 ) -> Vec<ImagePlane> {
     let Some(event) = source_event else {
         return planes;
@@ -31,7 +33,12 @@ pub(crate) fn apply_effect_to_planes(
     if planes.is_empty() || event.effect.is_empty() {
         return planes;
     }
-    let Some(bounds) = planes_ink_bounds(&planes).or_else(|| planes_bounds(&planes)) else {
+    // libass positions transition effects from the event's text box
+    // (device position and bbox), not from rendered ink.
+    let Some(bounds) = line_box
+        .or_else(|| planes_ink_bounds(&planes))
+        .or_else(|| planes_bounds(&planes))
+    else {
         return planes;
     };
     let effect = event.effect.as_str();
@@ -46,20 +53,20 @@ pub(crate) fn apply_effect_to_planes(
         let delay = scaled_effect_delay(delay, effect_delay_scale.x);
         let shift = elapsed / delay;
         let left_to_right = values.get(1).copied().unwrap_or(0) != 0;
+        // libass ass_render_event: SCROLL_RL puts the text box's left edge at
+        // PlayResX - shift; SCROLL_LR puts its right edge at shift.
         let target_left = if left_to_right {
             (shift * scale_x).round() as i32 - (bounds.x_max - bounds.x_min)
         } else {
             (f64::from(track.play_res_x) * scale_x - shift * scale_x).round() as i32
         };
-        let translated = translate_planes(
+        return translate_planes(
             planes,
             Point {
                 x: target_left - bounds.x_min,
                 y: 0,
             },
         );
-        let pixel_x = scale_x.round().max(1.0) as i32;
-        return extend_planes_for_effect_motion(translated, pixel_x, 0, 0, 0);
     }
 
     let scroll_up = effect.starts_with("Scroll up;");
@@ -75,13 +82,14 @@ pub(crate) fn apply_effect_to_planes(
         let y1 = values[0].max(values[1]);
         let clip_y0 = (f64::from(y0) * scale_y).round() as i32;
         let clip_y1 = (f64::from(y1) * scale_y).round() as i32;
-        let vertical_pixel = scale_y.round().max(1.0) as i32;
+        // libass: SCROLL_BT anchors the box top at y1 - shift, SCROLL_TB the
+        // box bottom at y0 + shift, then clips to y0..y1.
         let target_offset = if scroll_up {
             let target_top = (f64::from(y1) * scale_y - shift * scale_y).round() as i32;
-            target_top - bounds.y_min - vertical_pixel
+            target_top - bounds.y_min
         } else {
             let target_bottom = (f64::from(y0) * scale_y + shift * scale_y).round() as i32;
-            target_bottom - bounds.y_max - vertical_pixel
+            target_bottom - bounds.y_max
         };
         let translated = translate_planes(
             planes,
@@ -90,13 +98,6 @@ pub(crate) fn apply_effect_to_planes(
                 y: target_offset,
             },
         );
-        let pixel_x = style_scale(scale_x).round().max(1.0) as i32;
-        let pixel_y = scale_y.round().max(1.0) as i32;
-        let translated = if scroll_up {
-            extend_planes_for_effect_motion(translated, 0, pixel_x, pixel_y, 0)
-        } else {
-            extend_planes_for_effect_motion(translated, 0, pixel_x, 0, pixel_y)
-        };
         return apply_event_clip(
             translated,
             Rect {
