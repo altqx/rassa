@@ -256,6 +256,23 @@ pub(crate) fn font_vertical_metrics(
     None
 }
 
+/// Combined \be/\blur strength in \blur units.  libass applies \be as N
+/// passes of a [1,2,1] box blur (variance N/2) followed by the \blur
+/// gaussian (variance blur^2); sequential blurs add variances.
+pub(crate) fn effective_blur_strength(style: &ParsedSpanStyle) -> f64 {
+    let blur = if style.blur.is_finite() && style.blur > 0.0 {
+        style.blur
+    } else {
+        0.0
+    };
+    let be = if style.be.is_finite() && style.be > 0.0 {
+        style.be
+    } else {
+        0.0
+    };
+    (be / 2.0 + blur * blur).sqrt()
+}
+
 pub(crate) fn renderer_blur_radius(blur: f64) -> u32 {
     if !(blur.is_finite() && blur > 0.0) {
         return 0;
@@ -270,7 +287,7 @@ pub(crate) fn style_clip_bleed(style: &ParsedSpanStyle) -> i32 {
         .abs()
         .max(style.shadow_y.abs())
         .max(style.shadow);
-    let blur_bleed = renderer_blur_radius(style.blur.max(style.be)) as f64;
+    let blur_bleed = renderer_blur_radius(effective_blur_strength(style)) as f64;
     (border_bleed + shadow_bleed + blur_bleed).ceil().max(0.0) as i32
 }
 

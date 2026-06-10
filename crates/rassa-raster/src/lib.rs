@@ -128,7 +128,21 @@ impl Rasterizer {
     pub fn outline_glyphs(&self, glyphs: &[RasterGlyph], radius: i32) -> Vec<RasterGlyph> {
         glyphs
             .iter()
-            .map(|glyph| expand_outline(glyph, radius))
+            .map(|glyph| expand_outline_xy(glyph, radius, radius))
+            .collect()
+    }
+
+    /// Anisotropic outline expansion: libass strokes borders with separate
+    /// x/y radii (\xbord/\ybord), so the ink may grow on one axis only.
+    pub fn outline_glyphs_xy(
+        &self,
+        glyphs: &[RasterGlyph],
+        radius_x: i32,
+        radius_y: i32,
+    ) -> Vec<RasterGlyph> {
+        glyphs
+            .iter()
+            .map(|glyph| expand_outline_xy(glyph, radius_x, radius_y))
             .collect()
     }
 
@@ -1326,37 +1340,51 @@ fn apply_rectilinear_boundary_phase_corrections(
     }
 }
 
-fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {
-    if radius <= 0 || glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
+fn expand_outline_xy(glyph: &RasterGlyph, radius_x: i32, radius_y: i32) -> RasterGlyph {
+    let radius_x = radius_x.max(0);
+    let radius_y = radius_y.max(0);
+    if (radius_x <= 0 && radius_y <= 0)
+        || glyph.width <= 0
+        || glyph.height <= 0
+        || glyph.bitmap.is_empty()
+    {
         return glyph.clone();
     }
 
-    let radius = radius as usize;
-    let radius_squared = (radius * radius) as i32;
+    let radius_x = radius_x as usize;
+    let radius_y = radius_y as usize;
     let width = glyph.width as usize;
     let height = glyph.height as usize;
     let stride = glyph.stride as usize;
-    let new_width = width + radius * 2;
-    let new_height = height + radius * 2;
+    let new_width = width + radius_x * 2;
+    let new_height = height + radius_y * 2;
     let mut bitmap = vec![0_u8; new_width * new_height];
-
+    let rx2 = (radius_x * radius_x).max(1) as f64;
+    let ry2 = (radius_y * radius_y).max(1) as f64;
     for y in 0..height {
         for x in 0..width {
             let value = glyph.bitmap[y * stride + x];
             if value == 0 {
                 continue;
             }
-            let center_x = x + radius;
-            let center_y = y + radius;
+            let center_x = x + radius_x;
+            let center_y = y + radius_y;
             for outline_y in
-                center_y.saturating_sub(radius)..=(center_y + radius).min(new_height - 1)
+                center_y.saturating_sub(radius_y)..=(center_y + radius_y).min(new_height - 1)
             {
                 for outline_x in
-                    center_x.saturating_sub(radius)..=(center_x + radius).min(new_width - 1)
+                    center_x.saturating_sub(radius_x)..=(center_x + radius_x).min(new_width - 1)
                 {
-                    let dx = outline_x as i32 - center_x as i32;
-                    let dy = outline_y as i32 - center_y as i32;
-                    if dx * dx + dy * dy > radius_squared {
+                    let dx = (outline_x as i32 - center_x as i32) as f64;
+                    let dy = (outline_y as i32 - center_y as i32) as f64;
+                    let inside = if radius_x == 0 {
+                        dx == 0.0 && dy * dy <= ry2
+                    } else if radius_y == 0 {
+                        dy == 0.0 && dx * dx <= rx2
+                    } else {
+                        dx * dx / rx2 + dy * dy / ry2 <= 1.0 + f64::EPSILON
+                    };
+                    if !inside {
                         continue;
                     }
                     let index = outline_y * new_width + outline_x;
@@ -1370,8 +1398,8 @@ fn expand_outline(glyph: &RasterGlyph, radius: i32) -> RasterGlyph {
         width: new_width as i32,
         height: new_height as i32,
         stride: new_width as i32,
-        left: glyph.left - radius as i32,
-        top: glyph.top + radius as i32,
+        left: glyph.left - radius_x as i32,
+        top: glyph.top + radius_y as i32,
         bitmap,
         ..glyph.clone()
     }

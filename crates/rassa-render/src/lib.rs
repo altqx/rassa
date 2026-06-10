@@ -311,30 +311,43 @@ impl RenderEngine {
                                 baseline_offset: pbo_script,
                             },
                         ) {
-                            let drawing_fill_blur = if effective_style.border > 0.0
-                                || effective_style.shadow > 0.0
+                            let drawing_fill_blur = if effective_style.border_x > 0.0
+                                || effective_style.border_y > 0.0
+                                || effective_style.shadow_x.abs() > f64::EPSILON
+                                || effective_style.shadow_y.abs() > f64::EPSILON
                             {
                                 0
                             } else {
-                                renderer_blur_radius(effective_style.blur.max(effective_style.be))
+                                renderer_blur_radius(effective_blur_strength(&effective_style))
                             };
                             if drawing_fill_blur > 0 {
                                 plane = blur_image_plane(plane, drawing_fill_blur);
                             }
-                            if effective_style.border > 0.0 {
+                            if effective_style.border_x > 0.0 || effective_style.border_y > 0.0
+                            {
                                 let outline_glyph = plane_to_raster_glyph(&plane);
                                 let rasterizer = Rasterizer::with_options(RasterOptions {
                                     size_26_6: 64,
                                     hinting: config.hinting,
                                 });
-                                let mut outline_glyphs = rasterizer.outline_glyphs(
+                                let radius_for = |border: f64| {
+                                    if border > 0.0 {
+                                        border.round().max(1.0) as i32
+                                    } else {
+                                        0
+                                    }
+                                };
+                                let mut outline_glyphs = rasterizer.outline_glyphs_xy(
                                     &[outline_glyph],
-                                    effective_style.border.round().max(1.0) as i32,
+                                    radius_for(effective_style.border_x),
+                                    radius_for(effective_style.border_y),
                                 );
-                                if effective_style.blur > 0.0 {
+                                let drawing_blur =
+                                    effective_blur_strength(&effective_style);
+                                if drawing_blur > 0.0 {
                                     outline_glyphs = rasterizer.blur_glyphs(
                                         &outline_glyphs,
-                                        renderer_blur_radius(effective_style.blur),
+                                        renderer_blur_radius(drawing_blur),
                                     );
                                 }
                                 outline_planes.extend(image_planes_from_absolute_glyphs(
@@ -344,7 +357,9 @@ impl RenderEngine {
                                 ));
                             }
                             character_planes.push(plane);
-                            if effective_style.shadow > 0.0 {
+                            if effective_style.shadow_x.abs() > f64::EPSILON
+                                || effective_style.shadow_y.abs() > f64::EPSILON
+                            {
                                 let rasterizer = Rasterizer::with_options(RasterOptions {
                                     size_26_6: 64,
                                     hinting: config.hinting,
@@ -352,22 +367,28 @@ impl RenderEngine {
                                 let mut shadow_glyph = plane_to_raster_glyph(
                                     character_planes.last().expect("drawing plane"),
                                 );
-                                if effective_style.blur > 0.0 {
+                                let drawing_blur =
+                                    effective_blur_strength(&effective_style);
+                                if drawing_blur > 0.0 {
                                     shadow_glyph = rasterizer
                                         .blur_glyphs(
                                             &[shadow_glyph],
-                                            renderer_blur_radius(effective_style.blur),
+                                            renderer_blur_radius(drawing_blur),
                                         )
                                         .into_iter()
                                         .next()
                                         .expect("shadow glyph");
                                 }
+                                // libass offsets shadows down-right for
+                                // positive \xshad/\yshad; top here is the
+                                // baseline-relative bitmap top, so moving the
+                                // ink down means lowering it by shadow_y.
                                 shadow_planes.extend(image_planes_from_absolute_glyphs(
                                     &[RasterGlyph {
                                         left: shadow_glyph.left
-                                            + effective_style.shadow.round() as i32,
+                                            + effective_style.shadow_x.round() as i32,
                                         top: shadow_glyph.top
-                                            - effective_style.shadow.round() as i32,
+                                            + effective_style.shadow_y.round() as i32,
                                         ..shadow_glyph
                                     }],
                                     effective_style.back_colour,
@@ -418,9 +439,9 @@ impl RenderEngine {
                     );
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
                     let run_ascender = Some(line_ascender);
-                    let effective_blur = effective_style.blur.max(effective_style.be);
+                    let effective_blur = effective_blur_strength(&effective_style);
                     let has_outline = style.border_style != 3
-                        && effective_style.border > 0.0
+                        && (effective_style.border_x > 0.0 || effective_style.border_y > 0.0)
                         && !karaoke_hides_outline(run, source_event, now_ms);
                     let has_shadow = effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON;
@@ -431,9 +452,21 @@ impl RenderEngine {
                     };
                     let mut outlined_shadow_source_glyphs = None;
                     if has_outline {
-                        let outline_radius = effective_style.border.round().max(1.0) as i32;
-                        let outline_glyphs =
-                            rasterizer.outline_glyphs(&raster_glyphs, outline_radius);
+                        // libass strokes with independent x/y radii
+                        // (\xbord/\ybord); a zero radius keeps that axis
+                        // unexpanded.
+                        let radius_for = |border: f64| {
+                            if border > 0.0 {
+                                border.round().max(1.0) as i32
+                            } else {
+                                0
+                            }
+                        };
+                        let outline_glyphs = rasterizer.outline_glyphs_xy(
+                            &raster_glyphs,
+                            radius_for(effective_style.border_x),
+                            radius_for(effective_style.border_y),
+                        );
                         if has_shadow {
                             outlined_shadow_source_glyphs = Some(outline_glyphs.clone());
                         }

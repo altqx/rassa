@@ -1707,6 +1707,88 @@ fn render_frame_emits_outline_planes_for_border_override() {
 }
 
 #[test]
+fn render_frame_applies_anisotropic_borders() {
+    // libass strokes borders with independent x/y radii: \xbord4\ybord0
+    // grows ink horizontally only (ass_outline stroker / get_outline_glyph).
+    let script = |bord: &str| {
+        format!("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00010203,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(40,40){bord}}}Hi")
+    };
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let bounds = |script_text: &str, kind: ass::ImageType| {
+        let track = parse_script_text(script_text).expect("bord script parses");
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        planes
+            .iter()
+            .filter(|plane| plane.kind == kind)
+            .filter_map(plane_ink_bounds)
+            .reduce(|a, b| Rect {
+                x_min: a.x_min.min(b.x_min),
+                y_min: a.y_min.min(b.y_min),
+                x_max: a.x_max.max(b.x_max),
+                y_max: a.y_max.max(b.y_max),
+            })
+    };
+
+    let fill = bounds(&script("\\xbord4\\ybord0"), ass::ImageType::Character)
+        .expect("fill ink");
+    let outline = bounds(&script("\\xbord4\\ybord0"), ass::ImageType::Outline)
+        .expect("outline ink");
+    assert!(
+        (outline.width() - (fill.width() + 8)).abs() <= 1,
+        "\\xbord4 grows outline ink 4px per horizontal side: fill={fill:?} outline={outline:?}"
+    );
+    assert!(
+        (outline.height() - fill.height()).abs() <= 1,
+        "\\ybord0 must not grow outline ink vertically: fill={fill:?} outline={outline:?}"
+    );
+
+    let outline_v = bounds(&script("\\xbord0\\ybord4"), ass::ImageType::Outline)
+        .expect("vertical outline ink");
+    let fill_v = bounds(&script("\\xbord0\\ybord4"), ass::ImageType::Character)
+        .expect("vertical fill ink");
+    assert!(
+        (outline_v.height() - (fill_v.height() + 8)).abs() <= 1,
+        "\\ybord4 grows outline ink 4px per vertical side: fill={fill_v:?} outline={outline_v:?}"
+    );
+    assert!(
+        (outline_v.width() - fill_v.width()).abs() <= 1,
+        "\\xbord0 must not grow outline ink horizontally: fill={fill_v:?} outline={outline_v:?}"
+    );
+}
+
+#[test]
+fn render_frame_distinguishes_be_from_blur() {
+    // libass \be N applies N passes of a light [1,2,1] box blur while \blur
+    // is a gaussian of the given radius; \be1 must be visibly weaker than
+    // \blur1 and the two combine when both are present.
+    let script = |blur_tag: &str| {
+        format!("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(60,40){blur_tag}}}Hi")
+    };
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let ink_width = |script_text: &str| {
+        let track = parse_script_text(script_text).expect("blur script parses");
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        visible_bounds(&planes).expect("ink").width()
+    };
+
+    let sharp = ink_width(&script(""));
+    let be1 = ink_width(&script("\\be1"));
+    let blur1 = ink_width(&script("\\blur1"));
+    let both = ink_width(&script("\\be4\\blur1"));
+    assert!(be1 >= sharp, "\\be1 must not shrink ink");
+    assert!(
+        blur1 > be1,
+        "\\blur1 spreads further than \\be1: be1={be1} blur1={blur1}"
+    );
+    assert!(
+        both > blur1,
+        "\\be and \\blur combine: blur1={blur1} both={both}"
+    );
+}
+
+#[test]
 fn render_frame_emits_opaque_box_for_border_style_3() {
     let track = parse_script_text("[Script Info]\nPlayResX: 500\nPlayResY: 160\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,DejaVu Sans,30,&H00000000,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,3,2,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Box,,0000,0000,0000,,{\\an5\\pos(250,80)}BorderStyle=3 opaque box").expect("script should parse");
     let engine = RenderEngine::new();
