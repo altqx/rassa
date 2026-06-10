@@ -550,13 +550,50 @@ impl RenderEngine {
                         .iter()
                         .map(|glyph| glyph.advance_x_26_6)
                         .sum::<i32>();
-                    character_planes.extend(text_decoration_planes(
+                    let decoration_bars = text_decoration_bars(
                         &effective_style,
+                        &run.font,
+                        line_top + line_ascender,
                         run_origin_x,
-                        line_top,
                         (run_advance_26_6 + 32) >> 6,
-                        fill_color,
-                    ));
+                    );
+                    for bar in &decoration_bars {
+                        character_planes.push(solid_plane_from_rect(
+                            *bar,
+                            fill_color,
+                            ass::ImageType::Character,
+                        ));
+                        if has_outline {
+                            let expand = |border: f64| {
+                                if border > 0.0 {
+                                    border.round().max(1.0) as i32
+                                } else {
+                                    0
+                                }
+                            };
+                            outline_planes.push(solid_plane_from_rect(
+                                expand_rect_xy(
+                                    *bar,
+                                    expand(effective_style.border_x),
+                                    expand(effective_style.border_y),
+                                ),
+                                effective_style.outline_colour,
+                                ass::ImageType::Outline,
+                            ));
+                        }
+                        if has_shadow {
+                            let mut shadow_bar = *bar;
+                            shadow_bar.x_min += effective_style.shadow_x.round() as i32;
+                            shadow_bar.x_max += effective_style.shadow_x.round() as i32;
+                            shadow_bar.y_min += effective_style.shadow_y.round() as i32;
+                            shadow_bar.y_max += effective_style.shadow_y.round() as i32;
+                            shadow_planes.push(solid_plane_from_rect(
+                                shadow_bar,
+                                effective_style.back_colour,
+                                ass::ImageType::Shadow,
+                            ));
+                        }
+                    }
                     if effective_style.shadow_x.abs() > f64::EPSILON
                         || effective_style.shadow_y.abs() > f64::EPSILON
                     {

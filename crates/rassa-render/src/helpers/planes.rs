@@ -604,42 +604,63 @@ pub(crate) fn translate_planes_y(planes: &mut [ImagePlane], delta_y: i32) {
     }
 }
 
-pub(crate) fn text_decoration_planes(
+/// Decoration bars per libass ass_get_glyph_outline: underline from the post
+/// table, strikeout from OS/2, each a rect spanning the run advance at
+/// font-metric position/thickness (scaled by \fscy), part of the glyph
+/// geometry so it inherits border and shadow treatment.
+pub(crate) fn text_decoration_bars(
     style: &ParsedSpanStyle,
+    font: &FontMatch,
+    baseline_y: i32,
     origin_x: i32,
-    line_top: i32,
     width: i32,
-    color: u32,
-) -> Vec<ImagePlane> {
+) -> Vec<Rect> {
     if width <= 0 || !(style.underline || style.strike_out) {
         return Vec::new();
     }
-
-    let thickness = (style.font_size / 18.0).round().max(1.0) as i32;
-    let mut planes = Vec::new();
-    let mut push_decoration = |baseline_fraction: f64| {
-        let y = line_top + (style.font_size * baseline_fraction).round() as i32;
-        planes.push(ImagePlane {
-            size: Size {
-                width,
-                height: thickness,
-            },
-            stride: width,
-            color: rgba_color_from_ass(color),
-            destination: Point { x: origin_x, y },
-            kind: ass::ImageType::Character,
-            bitmap: vec![255; (width * thickness) as usize],
+    let size_26_6 = (style.font_size.max(1.0) * 64.0).round() as i32;
+    let Some(metrics) = font_vertical_metrics(font, size_26_6) else {
+        return Vec::new();
+    };
+    let scale_y = style_scale(style.scale_y);
+    let mut bars = Vec::new();
+    let mut push_bar = |line: (i32, i32)| {
+        let top = (f64::from(line.0) / 64.0 * scale_y).round() as i32;
+        let thickness = ((f64::from(line.1) / 64.0 * scale_y).round() as i32).max(1);
+        bars.push(Rect {
+            x_min: origin_x,
+            y_min: baseline_y + top,
+            x_max: origin_x + width,
+            y_max: baseline_y + top + thickness,
         });
     };
-
     if style.underline {
-        push_decoration(0.82);
+        if let Some(line) = metrics.underline_26_6 {
+            push_bar(line);
+        }
     }
     if style.strike_out {
-        push_decoration(0.48);
+        if let Some(line) = metrics.strikeout_26_6 {
+            push_bar(line);
+        }
     }
+    bars
+}
 
-    planes
+pub(crate) fn solid_plane_from_rect(rect: Rect, color: u32, kind: ass::ImageType) -> ImagePlane {
+    let width = rect.width().max(0);
+    let height = rect.height().max(0);
+    ImagePlane {
+        size: Size { width, height },
+        stride: width,
+        color: rgba_color_from_ass(color),
+        destination: Point {
+            x: rect.x_min,
+            y: rect.y_min,
+        },
+        kind,
+        bitmap: vec![255; (width * height).max(0) as usize],
+    }
 }
 
 /// Composite a run's glyph bitmaps into one plane.  Glyphs sit on the

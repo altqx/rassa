@@ -4,6 +4,13 @@ use super::*;
 pub(crate) struct FontVerticalMetrics {
     pub(crate) ascender_26_6: i32,
     pub(crate) descender_26_6: i32,
+    /// Underline (top offset below baseline, thickness), both 26.6, from the
+    /// post table the way libass ass_get_glyph_outline derives it:
+    /// top = -underlinePosition - thickness/2.
+    pub(crate) underline_26_6: Option<(i32, i32)>,
+    /// Strikeout (top offset relative baseline, negative above, thickness)
+    /// from OS/2 yStrikeoutPosition/ySize.
+    pub(crate) strikeout_26_6: Option<(i32, i32)>,
 }
 
 /// Per-line ascent/descent in device pixels, mirroring libass
@@ -240,11 +247,36 @@ pub(crate) fn font_vertical_metrics(
         .ok()?;
     rassa_raster::request_real_dim_size(&mut face, size_26_6.max(64)).ok()?;
     let metrics = face.size_metrics()?;
-    let ascender = unsafe { ffi::FT_MulFix(face.ascender().into(), metrics.y_scale) } as i32;
-    let descender = unsafe { ffi::FT_MulFix((-face.descender()).into(), metrics.y_scale) } as i32;
+    let scale = |value: i32| unsafe { ffi::FT_MulFix(value.into(), metrics.y_scale) } as i32;
+    let ascender = scale(face.ascender().into());
+    let descender = scale((-face.descender()).into());
+
+    // libass ass_get_glyph_outline: underline from the post table when
+    // underlinePosition <= 0 and underlineThickness > 0.
+    let raw = unsafe { &*(face.raw() as *const ffi::FT_FaceRec) };
+    let underline = (raw.underline_position <= 0 && raw.underline_thickness > 0).then(|| {
+        let pos = scale(raw.underline_position.into());
+        let size = scale(raw.underline_thickness.into());
+        (-pos - size / 2, size)
+    });
+    let os2 = unsafe {
+        ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_os2)
+            as *const ffi::TT_OS2
+    };
+    let strikeout = (!os2.is_null())
+        .then(|| unsafe { &*os2 })
+        .filter(|os2| os2.yStrikeoutPosition >= 0 && os2.yStrikeoutSize > 0)
+        .map(|os2| {
+            let pos = scale(os2.yStrikeoutPosition.into());
+            let size = scale(os2.yStrikeoutSize.into());
+            (-pos - size / 2, size)
+        });
+
     Some(FontVerticalMetrics {
         ascender_26_6: ascender,
         descender_26_6: descender,
+        underline_26_6: underline,
+        strikeout_26_6: strikeout,
     })
 }
 
@@ -289,6 +321,15 @@ pub(crate) fn style_clip_bleed(style: &ParsedSpanStyle) -> i32 {
         .max(style.shadow);
     let blur_bleed = renderer_blur_radius(effective_blur_strength(style)) as f64;
     (border_bleed + shadow_bleed + blur_bleed).ceil().max(0.0) as i32
+}
+
+pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {
+    Rect {
+        x_min: rect.x_min - amount_x.max(0),
+        y_min: rect.y_min - amount_y.max(0),
+        x_max: rect.x_max + amount_x.max(0),
+        y_max: rect.y_max + amount_y.max(0),
+    }
 }
 
 pub(crate) fn expand_rect(rect: Rect, amount: i32) -> Rect {
