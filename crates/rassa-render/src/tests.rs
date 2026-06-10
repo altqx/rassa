@@ -220,15 +220,6 @@ fn character_bounds(planes: &[ImagePlane]) -> Option<Rect> {
     kind_bounds(planes, ass::ImageType::Character)
 }
 
-fn kind_visible_bounds(planes: &[ImagePlane], kind: ass::ImageType) -> Option<Rect> {
-    let matching: Vec<ImagePlane> = planes
-        .iter()
-        .filter(|plane| plane.kind == kind)
-        .cloned()
-        .collect();
-    visible_bounds(&matching)
-}
-
 fn visible_bounds(planes: &[ImagePlane]) -> Option<Rect> {
     let mut bounds: Option<Rect> = None;
     for plane in planes {
@@ -319,14 +310,6 @@ fn render_text_plane_bounds(script: &str) -> Option<Rect> {
 
 fn render_text_plane_bounds_at(script: &str, now_ms: i64) -> Option<Rect> {
     render_text_kind_bounds_at(script, now_ms, ass::ImageType::Character)
-}
-
-fn render_text_visible_bounds_at(script: &str, now_ms: i64) -> Option<Rect> {
-    let track = parse_script_text(script).expect("text visible probe script should parse");
-    let engine = RenderEngine::new();
-    let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider(&track, &provider, now_ms);
-    visible_bounds(&planes)
 }
 
 fn render_text_kind_bounds_at(script: &str, now_ms: i64, kind: ass::ImageType) -> Option<Rect> {
@@ -558,46 +541,6 @@ Dialogue: 0,0:21:45.28,0:21:50.57,ED TH2,,0,0,0,fx,{\an2\pos(1246.1,1050)\bord0.
     );
 }
 
-fn assert_lower_ed_th2_single_event_planes(
-    name: &str,
-    override_tags: &str,
-    text: &str,
-    shadow: Rect,
-    outline: Rect,
-    character: Rect,
-) {
-    if !baseline_fontconfig_family_contains("K2D ExtraBold", "Liberation") {
-        return;
-    }
-    let script = format!(
-        "{}Dialogue: 0,0:22:56.14,0:23:00.72,ED TH2,,0,0,0,fx,{{{override_tags}}}{text}\n",
-        current_02ass_ed2_header()
-    );
-    let track = parse_script_text(&script).expect("lower ED TH2 single-event probe should parse");
-    let engine = RenderEngine::new();
-    let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider(&track, &provider, 1_380_000);
-
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Shadow),
-        shadow,
-        0,
-        &format!("02.ass {name} ED TH2 shadow allocation should match libass"),
-    );
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Outline),
-        outline,
-        0,
-        &format!("02.ass {name} ED TH2 outline allocation should match libass"),
-    );
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Character),
-        character,
-        0,
-        &format!("02.ass {name} ED TH2 character allocation should match libass"),
-    );
-}
-
 #[test]
 fn rotated_positioned_text_keeps_libass_like_transparent_frz_plane() {
     if !baseline_fontconfig_family_contains("Raphtalia", "Raphtalia") {
@@ -743,221 +686,6 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_
         },
         1,
         "02.ass upper empty clipped h slice should keep libass transparent ASS_Image plane geometry",
-    );
-}
-
-fn current_02ass_ed2_header() -> &'static str {
-    r#"[Script Info]
-ScriptType: v4.00+
-WrapStyle: 0
-PlayResX: 1920
-PlayResY: 1080
-ScaledBorderAndShadow: yes
-YCbCr Matrix: TV.709
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ED2-furigana,OFL Sorts Mill Goudy TT,35,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,1.5,1.5,8,30,30,30,1
-Style: ED TH2-furigana,K2D ExtraBold,37.5,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0.35,1.5,2,30,30,30,1
-Style: Default-furigana,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
-Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
-Style: ED TH2,K2D ExtraBold,75,&H00FFFFFF,&H0094FDFF,&H00000000,&H00B5B7B7,-1,0,0,0,100,100,0,0,1,0.7,3,2,30,30,30,1
-Style: ED2,OFL Sorts Mill Goudy TT,70,&H00FFAACD,&H00000000,&H00FFFFFF,&H00FFAACD,-1,0,0,0,100,100,0,0,1,3,3,8,30,30,30,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"#
-}
-
-fn assert_current_02ass_static_top_center_blurred_glyph(
-    text: char,
-    x: f64,
-    shadow: Rect,
-    outline: Rect,
-    character: Rect,
-) {
-    let script = format!(
-        "{}Dialogue: 3,0:00:00.00,0:00:04.21,ED2,,0,0,0,fx,{{\\pos({x:.1},65)\\b0\\bord3.5\\blur1.2\\fs70\\an5\\fsp0\\fad(0,400)}}{text}\n",
-        current_02ass_ed2_header()
-    );
-    let track = parse_script_text(&script).expect("02.ass static glyph probe should parse");
-    let engine = RenderEngine::new();
-    let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider(&track, &provider, 4050);
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Shadow),
-        shadow,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 static top-center blurred {text} shadow allocation should match libass"
-        ),
-    );
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Outline),
-        outline,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 static top-center blurred {text} outline allocation should match libass"
-        ),
-    );
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Character),
-        character,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 static top-center blurred {text} character allocation should match libass"
-        ),
-    );
-}
-
-fn rect_xywh(x: i32, y: i32, width: i32, height: i32) -> Rect {
-    Rect {
-        x_min: x,
-        y_min: y,
-        x_max: x + width,
-        y_max: y + height,
-    }
-}
-
-fn rect_xyxy(x_min: i32, y_min: i32, x_max: i32, y_max: i32) -> Rect {
-    Rect {
-        x_min,
-        y_min,
-        x_max,
-        y_max,
-    }
-}
-
-fn current_02ass_spark_drawing_path() -> &'static str {
-    "m 41.909 83.818 b 65.378 83.818 83.818 65.378 83.818 41.909 b 83.818 18.44 65.378 0 41.909 0 b 18.44 0 0 18.44 0 41.909 b 0 65.378 18.44 83.818 41.909 83.818 m 41.909 0.838 b 66.216 0.838 82.979 17.602 82.979 41.909 b 82.979 63.701 67.054 77.95 56.996 80.465 b 51.967 82.141 55.32 78.789 41.909 78.789 b 28.498 78.789 31.851 82.141 26.822 80.465 b 16.764 77.95 0.838 65.378 0.838 41.909 b 0.838 18.44 18.44 0.838 41.909 0.838 m 73.76 18.44 b 66.216 9.22 62.863 11.734 71.245 20.116 b 77.112 31.851 78.789 27.66 73.76 18.44 m 10.058 12.573 b 10.058 15.925 15.087 15.925 15.087 12.573 b 15.087 9.22 10.058 9.22 10.058 12.573 m 11.734 13.411 l 12.573 25.145 l 13.411 13.411 l 25.145 12.573 l 13.411 11.734 l 12.573 0 l 11.734 11.734 l 0 12.573 m 41.909 78.789 b 52.805 78.789 51.129 83.818 43.585 83.818 b 35.203 83.818 31.851 78.789 41.909 78.789"
-}
-
-struct Current02AssP1DrawingCase {
-    name: &'static str,
-    duration_cs: &'static str,
-    override_prefix: &'static str,
-    now_ms: i64,
-    shadow: Rect,
-    outline: Rect,
-    character: Rect,
-}
-
-fn assert_current_02ass_p1_drawing_case(case: Current02AssP1DrawingCase) {
-    assert_current_02ass_p1_drawing_case_with_suffix(case, "");
-}
-
-fn assert_current_02ass_p1_drawing_case_with_suffix(
-    case: Current02AssP1DrawingCase,
-    drawing_suffix: &str,
-) {
-    let script = format!(
-        "{}Dialogue: 9,0:00:00.00,0:00:{},ED2,,0,0,0,fx,{{{}}}{}{}\n",
-        current_02ass_ed2_header(),
-        case.duration_cs,
-        case.override_prefix,
-        current_02ass_spark_drawing_path(),
-        drawing_suffix
-    );
-    let track = parse_script_text(&script).expect("02.ass p1 drawing probe should parse");
-    let engine = RenderEngine::new();
-    let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider(&track, &provider, case.now_ms);
-
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Shadow),
-        case.shadow,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 {} p1 drawing shadow allocation should match libass",
-            case.name
-        ),
-    );
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Outline),
-        case.outline,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 {} p1 drawing outline allocation should match libass",
-            case.name
-        ),
-    );
-    assert_rect_near(
-        kind_bounds(&planes, ass::ImageType::Character),
-        case.character,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 {} p1 drawing character allocation should match libass",
-            case.name
-        ),
-    );
-}
-
-struct Current02AssP1DrawingVisibleCase {
-    name: &'static str,
-    duration_cs: &'static str,
-    override_prefix: &'static str,
-    now_ms: i64,
-    suffix: &'static str,
-    shadow: Rect,
-    outline: Rect,
-    character: Rect,
-}
-
-fn assert_current_02ass_p1_drawing_visible_case(case: Current02AssP1DrawingVisibleCase) {
-    let script = format!(
-        "{}Dialogue: 9,0:00:00.00,0:00:{},ED2,,0,0,0,fx,{{{}}}{}{}\n",
-        current_02ass_ed2_header(),
-        case.duration_cs,
-        case.override_prefix,
-        current_02ass_spark_drawing_path(),
-        case.suffix
-    );
-    let track = parse_script_text(&script).expect("02.ass p1 drawing visible probe should parse");
-    let engine = RenderEngine::new();
-    let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider(&track, &provider, case.now_ms);
-
-    assert_rect_near(
-        kind_visible_bounds(&planes, ass::ImageType::Shadow),
-        case.shadow,
-        0,
-        &format!(
-            "02.ass @ 23:12.050 {} p1 drawing shadow visible ink should match libass",
-            case.name
-        ),
-    );
-    assert_rect_near(
-        kind_visible_bounds(&planes, ass::ImageType::Outline),
-        case.outline,
-        0,
-        &format!(
-            "02.ass @ 23:12.050 {} p1 drawing outline visible ink should match libass",
-            case.name
-        ),
-    );
-    assert_rect_near(
-        kind_visible_bounds(&planes, ass::ImageType::Character),
-        case.character,
-        0,
-        &format!(
-            "02.ass @ 23:12.050 {} p1 drawing character visible ink should match libass",
-            case.name
-        ),
-    );
-}
-
-fn assert_current_02ass_static_top_center_fill_only_glyph(text: char, x: f64, character: Rect) {
-    let script = format!(
-        "{}Dialogue: 4,0:00:00.00,0:00:04.21,ED2,,0,0,0,fx,{{\\pos({x:.1},65)\\bord0\\blur0.6\\shad0\\fs70\\fsp0\\an5\\fad(0,400)\\b0}}{text}\n",
-        current_02ass_ed2_header()
-    );
-    assert_rect_near(
-        render_text_kind_bounds_at(&script, 4050, ass::ImageType::Character),
-        character,
-        0,
-        &format!(
-            "02.ass @ 22:56.500 static top-center fill-only blurred {text} character allocation should match libass"
-        ),
     );
 }
 
@@ -1775,9 +1503,12 @@ fn render_frame_applies_anisotropic_borders() {
 
 #[test]
 fn render_frame_distinguishes_be_from_blur() {
-    // libass \be N applies N passes of a light [1,2,1] box blur while \blur
-    // is a gaussian of the given radius; \be1 must be visibly weaker than
-    // \blur1 and the two combine when both are present.
+    // libass \be N applies N passes of a light [1,2,1] box blur (variance
+    // N/2) while \blur is a gaussian of sigma = blur; both combine by
+    // variance addition.  The gaussian implementation quantizes small radii
+    // into shared kernel buckets, so plane padding and ink extent can tie;
+    // the alpha mass that bleeds a fixed distance OUTSIDE the sharp ink is
+    // monotone in sigma and discriminates the kernels reliably.
     let script = |blur_tag: &str| {
         format!(
             "[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(60,40){blur_tag}}}Hi"
@@ -1785,24 +1516,47 @@ fn render_frame_distinguishes_be_from_blur() {
     };
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
-    let ink_width = |script_text: &str| {
+    let render = |script_text: &str| {
         let track = parse_script_text(script_text).expect("blur script parses");
-        let planes = engine.render_frame_with_provider(&track, &provider, 500);
-        visible_bounds(&planes).expect("ink").width()
+        engine.render_frame_with_provider(&track, &provider, 500)
+    };
+    let sharp_ink = visible_bounds(&render(&script(""))).expect("sharp ink");
+    // Sum the alpha in the column band two pixels left of the sharp ink.
+    let left_bleed = |script_text: &str| {
+        let planes = render(script_text);
+        let probe_x = sharp_ink.x_min - 2;
+        planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .map(|plane| {
+                let local_x = probe_x - plane.destination.x;
+                if local_x < 0 || local_x >= plane.size.width {
+                    return 0_u32;
+                }
+                (0..plane.size.height as usize)
+                    .map(|row| {
+                        u32::from(plane.bitmap[row * plane.stride as usize + local_x as usize])
+                    })
+                    .sum()
+            })
+            .sum::<u32>()
     };
 
-    let sharp = ink_width(&script(""));
-    let be1 = ink_width(&script("\\be1"));
-    let blur1 = ink_width(&script("\\blur1"));
-    let both = ink_width(&script("\\be4\\blur1"));
-    assert!(be1 >= sharp, "\\be1 must not shrink ink");
+    let sharp = left_bleed(&script(""));
+    let be1 = left_bleed(&script("\\be1"));
+    let blur1 = left_bleed(&script("\\blur1"));
+    let both = left_bleed(&script("\\be4\\blur1"));
+    assert!(
+        be1 > sharp,
+        "\\be1 must bleed alpha past the sharp edge: sharp={sharp} be1={be1}"
+    );
     assert!(
         blur1 > be1,
-        "\\blur1 spreads further than \\be1: be1={be1} blur1={blur1}"
+        "\\blur1 (sigma 1) spreads more than \\be1 (sigma ~0.7): be1={be1} blur1={blur1}"
     );
     assert!(
         both > blur1,
-        "\\be and \\blur combine: blur1={blur1} both={both}"
+        "\\be4\\blur1 (sigma ~1.7) spreads more than \\blur1: blur1={blur1} both={both}"
     );
 }
 
@@ -3216,7 +2970,7 @@ fn render_frame_hides_outline_for_ko_until_span_ends() {
         planes
             .iter()
             .filter(|plane| plane.kind == ass::ImageType::Outline)
-            .filter_map(|plane| plane_ink_bounds(plane))
+            .filter_map(plane_ink_bounds)
             .fold(0, |acc, rect| acc + rect.width())
     };
     let early_width = outline_ink_width(&early_planes);
