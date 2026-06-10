@@ -760,6 +760,7 @@ dependencies = [
  "rassa-parse",
  "rassa-raster",
  "rassa-shape",
+ "ttf-parser 0.25.1",
 ]
 
 [[package]]

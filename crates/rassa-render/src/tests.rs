@@ -3235,3 +3235,30 @@ fn render_frame_applies_timed_transform_style() {
     assert_ne!(start_fill, end_fill);
     assert!(total_plane_area(&end_planes) > total_plane_area(&start_planes));
 }
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+#[test]
+fn portable_font_vertical_metrics_match_freetype_path() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rassa-test/fixtures/libass/compare");
+    for fixture in [
+        "test/font1.ttf",
+        "test/font2.otf",
+        "broad/font1.ttf",
+        "broad/font2.otf",
+    ] {
+        let path = fixture_root.join(fixture);
+        let data = std::fs::read(&path).expect("fixture font readable");
+        let font = FontMatch {
+            path: Some(path),
+            face_index: Some(0),
+            ..FontMatch::unresolved("fixture", None, FontProviderKind::Fontconfig)
+        };
+        for size_26_6 in [1, 64, 640, 1216, 2400, 7777, 131_072] {
+            let freetype = font_vertical_metrics(&font, size_26_6);
+            let portable = font_vertical_metrics_from_data(&data, 0, size_26_6);
+            assert!(freetype.is_some(), "{fixture} at size {size_26_6}");
+            assert_eq!(freetype, portable, "{fixture} at size {size_26_6}");
+        }
+    }
+}

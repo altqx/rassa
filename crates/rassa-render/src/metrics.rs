@@ -63,8 +63,8 @@ fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> L
             desc: f64::from(metrics.descender_26_6) / 64.0 * scale_y,
         };
     }
-    // No face metrics available (unresolved font path / non-FreeType
-    // platform).  FT_SIZE_REQUEST_TYPE_REAL_DIM guarantees asc + desc ==
+    // No face metrics available (unresolved font path / unparsable font
+    // data).  FT_SIZE_REQUEST_TYPE_REAL_DIM guarantees asc + desc ==
     // font_size, so recover the split from rendered ink and keep the sum.
     let mut ink_ascender = 0_i32;
     if !run.glyphs.is_empty() {
@@ -288,10 +288,106 @@ pub(crate) fn font_vertical_metrics(
 
 #[cfg(any(target_os = "macos", target_arch = "wasm32", not(unix)))]
 pub(crate) fn font_vertical_metrics(
-    _font: &FontMatch,
-    _size_26_6: i32,
+    font: &FontMatch,
+    size_26_6: i32,
 ) -> Option<FontVerticalMetrics> {
-    None
+    let font_path = font.path.as_ref()?;
+    let data = std::fs::read(font_path).ok()?;
+    font_vertical_metrics_from_data(&data, font.face_index.unwrap_or(0), size_26_6)
+}
+
+/// FreeType-free `font_vertical_metrics` used on targets without the
+/// FreeType rasterizer.  Replicates apply_gdi_font_metrics (win → typo →
+/// bbox ascender/descender) and FT_SIZE_REQUEST_TYPE_REAL_DIM scaling with
+/// FreeType's FT_DivFix/FT_MulFix rounding so it matches the FreeType path
+/// bit for bit (asserted by a test on the FreeType targets).
+#[cfg(any(test, target_os = "macos", target_arch = "wasm32", not(unix)))]
+pub(crate) fn font_vertical_metrics_from_data(
+    data: &[u8],
+    face_index: u32,
+    size_26_6: i32,
+) -> Option<FontVerticalMetrics> {
+    let face = ttf_parser::Face::parse(data, face_index).ok()?;
+    let tables = face.tables();
+
+    let hhea = tables.hhea;
+    let mut ascender = i32::from(hhea.ascender);
+    let mut descender = i32::from(hhea.descender);
+    let mut height = ascender - descender + i32::from(hhea.line_gap);
+    if let Some(os2) = tables.os2 {
+        // ttf-parser reads the unsigned spec fields as signed (like libass)
+        // and returns the descender already negated.
+        let win_ascender = i32::from(os2.windows_ascender());
+        let win_descender = i32::from(os2.windows_descender());
+        if win_ascender - win_descender != 0 {
+            ascender = win_ascender;
+            descender = win_descender;
+            height = ascender - descender;
+        }
+    }
+    if ascender - descender == 0 || height == 0 {
+        if let Some(os2) = tables.os2 {
+            let typo_ascender = i32::from(os2.typographic_ascender());
+            let typo_descender = i32::from(os2.typographic_descender());
+            if typo_ascender - typo_descender != 0 {
+                ascender = typo_ascender;
+                descender = typo_descender;
+                height = ascender - descender;
+            }
+        }
+        if ascender - descender == 0 || height == 0 {
+            let bbox = face.global_bounding_box();
+            ascender = i32::from(bbox.y_max);
+            descender = i32::from(bbox.y_min);
+        }
+    }
+
+    // REAL_DIM maps ascender - descender onto the requested height:
+    // y_scale = FT_DivFix(size, asc - desc), values FT_MulFix'ed by it.
+    let units = i64::from(ascender - descender);
+    if units <= 0 {
+        return None;
+    }
+    let y_scale = ((i64::from(size_26_6.max(64)) << 16) + (units >> 1)) / units;
+    let scale = |value: i32| {
+        let product = i64::from(value) * y_scale;
+        ((product + 0x8000 - i64::from(product < 0)) >> 16) as i32
+    };
+
+    let underline = tables
+        .post
+        .map(|post| post.underline_metrics)
+        .and_then(|line| {
+            // FreeType recenters the post table position on the stroke when
+            // loading the face (sfobjs.c): position -= thickness / 2.
+            let position = (i32::from(line.position) - i32::from(line.thickness) / 2) as i16;
+            (position <= 0 && line.thickness > 0).then(|| {
+                let pos = scale(position.into());
+                let size = scale(line.thickness.into());
+                (-pos - size / 2, size)
+            })
+        });
+    let strikeout = tables
+        .os2
+        .map(|os2| os2.strikeout_metrics())
+        .filter(|line| line.position >= 0 && line.thickness > 0)
+        .map(|line| {
+            let pos = scale(line.position.into());
+            let size = scale(line.thickness.into());
+            (-pos - size / 2, size)
+        });
+    let typo_descender = tables
+        .os2
+        .map(|os2| scale(os2.typographic_descender().into()))
+        .unwrap_or(0);
+
+    Some(FontVerticalMetrics {
+        ascender_26_6: scale(ascender),
+        descender_26_6: scale(-descender),
+        underline_26_6: underline,
+        strikeout_26_6: strikeout,
+        typo_descender_26_6: typo_descender,
+    })
 }
 
 /// Combined \be/\blur strength in \blur units.  libass applies \be as N
