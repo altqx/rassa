@@ -15,11 +15,11 @@ pub(crate) fn merge_compatible_event_planes(planes: Vec<ImagePlane>) -> Vec<Imag
     merged
 }
 
+/// libass render_and_combine_glyphs combines bitmaps of the same type and
+/// color only when their rectangles intersect; everything else stays a
+/// separate image.
 pub(crate) fn compatible_plane_merge(a: &ImagePlane, b: &ImagePlane) -> bool {
     if a.kind != b.kind || a.color != b.color || a.stride <= 0 || b.stride <= 0 {
-        return false;
-    }
-    if a.size.height <= 3 || b.size.height <= 3 {
         return false;
     }
     let a_rect = Rect {
@@ -34,19 +34,7 @@ pub(crate) fn compatible_plane_merge(a: &ImagePlane, b: &ImagePlane) -> bool {
         x_max: b.destination.x + b.size.width,
         y_max: b.destination.y + b.size.height,
     };
-    let y_overlap = (a_rect.y_max.min(b_rect.y_max) - a_rect.y_min.max(b_rect.y_min)).max(0);
-    let min_height = a.size.height.min(b.size.height).max(1);
-    if y_overlap * 3 < min_height {
-        return false;
-    }
-    let x_gap = if a_rect.x_max < b_rect.x_min {
-        b_rect.x_min - a_rect.x_max
-    } else if b_rect.x_max < a_rect.x_min {
-        a_rect.x_min - b_rect.x_max
-    } else {
-        0
-    };
-    x_gap <= 24
+    a_rect.intersect(b_rect).is_some()
 }
 
 pub(crate) fn merge_plane_into(target: &mut ImagePlane, plane: ImagePlane) {
@@ -437,101 +425,56 @@ pub(crate) fn interpolate_move_exact(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Compute per-line tops (top = baseline - asc) following libass
+/// ass_render_event (ass_render.c): the event's total text height is the sum
+/// of per-line asc+desc (measure_text), the first baseline is anchored per
+/// valign / \pos base point (get_base_point), and successive baselines step
+/// by desc[i] + asc[i+1] + line_spacing.
 pub(crate) fn compute_vertical_layout(
     track: &ParsedTrack,
-    lines: &[rassa_layout::LayoutLine],
+    metrics: &[LineMetrics],
     alignment: i32,
     margin_v: i32,
     position: Option<(i32, i32)>,
-    source_event: Option<&ParsedEvent>,
-    now_ms: i64,
     config: &RendererConfig,
     render_scale: RenderScale,
 ) -> Vec<i32> {
     let scale_y = style_scale(render_scale.y);
-    if let Some((_, y)) = position {
-        let line_heights = lines
-            .iter()
-            .map(|line| {
-                positioned_layout_line_height_for_line_at(
-                    line,
-                    source_event,
-                    now_ms,
-                    track,
-                    config,
-                    render_scale,
-                    alignment,
-                )
-            })
-            .collect::<Vec<_>>();
-        let total_height: i32 = line_heights.iter().sum();
-        let mut current_y = match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+    let spacing = line_spacing(config);
+    let total = total_text_height(metrics, config);
+
+    let first_top = if let Some((_, y)) = position {
+        let y = f64::from(y);
+        match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
             ass::VALIGN_TOP => y,
-            ass::VALIGN_CENTER => y - total_height / 2,
-            _ => y - total_height,
-        };
-        let positioned_text_bottom_gap = if (alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER))
-            == ass::VALIGN_SUB
-            && lines
-                .iter()
-                .any(|line| line.runs.iter().any(|run| run.drawing.is_none()))
-        {
-            let max_font_size =
-                lines.iter().map(max_text_font_size).fold(0.0_f64, f64::max) * scale_y;
-            let descender_gap = (max_font_size * 0.26).round() as i32;
-            let multiline_gap = (max_font_size * 0.49).round() as i32;
-            Some((descender_gap, multiline_gap))
-        } else {
-            None
-        };
-        if let Some((descender_gap, multiline_gap)) = positioned_text_bottom_gap {
-            current_y -= descender_gap + multiline_gap * (lines.len().saturating_sub(1) as i32);
+            ass::VALIGN_CENTER => y - total / 2.0,
+            _ => y - total,
         }
-        let mut positions = Vec::with_capacity(lines.len());
-        for (line_index, height) in line_heights.into_iter().enumerate() {
-            positions.push(current_y);
-            current_y += height;
-            if line_index + 1 < lines.len() {
-                if let Some((_, multiline_gap)) = positioned_text_bottom_gap {
-                    current_y += multiline_gap;
+    } else {
+        match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+            ass::VALIGN_TOP => f64::from(margin_v) * scale_y,
+            ass::VALIGN_CENTER => (f64::from(track.play_res_y) * scale_y - total) / 2.0,
+            _ => {
+                let scr_bottom = (f64::from(track.play_res_y) - f64::from(margin_v)) * scale_y;
+                let scr_top = 0.0;
+                let line_position = config.line_position.clamp(0.0, 100.0);
+                let mut top =
+                    scr_bottom + (scr_top - scr_bottom) * line_position / 100.0 - total;
+                // libass clips to the top edge when line_position pushes the
+                // subtitle off-screen, but never otherwise.
+                if top < scr_top && line_position > 0.0 {
+                    top = scr_top;
                 }
+                top
             }
         }
-        return positions;
-    }
-    let line_heights = lines
-        .iter()
-        .map(|line| layout_line_height_for_line(line, config, scale_y))
-        .collect::<Vec<_>>();
-    let total_height: i32 = line_heights.iter().sum();
-    let default_start_y = match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
-        ass::VALIGN_TOP => (f64::from(margin_v) * scale_y).round() as i32,
-        ass::VALIGN_CENTER => {
-            ((f64::from(track.play_res_y) * scale_y).round() as i32 - total_height) / 2
-        }
-        _ => ((f64::from(track.play_res_y) * scale_y).round() as i32
-            - (f64::from(margin_v) * scale_y).round() as i32
-            - total_height)
-            .max(0),
     };
 
-    let line_position = config.line_position.clamp(0.0, 100.0);
-    let start_y = if (alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER)) == ass::VALIGN_SUB
-        && line_position > 0.0
-    {
-        let bottom_y = f64::from(default_start_y);
-        let top_y = 0.0;
-        (bottom_y + (top_y - bottom_y) * (line_position / 100.0)).round() as i32
-    } else {
-        default_start_y
-    }
-    .max(0);
-
-    let mut positions = Vec::with_capacity(lines.len());
-    let mut current_y = start_y;
-    for height in line_heights {
-        positions.push(current_y);
-        current_y += height;
+    let mut positions = Vec::with_capacity(metrics.len());
+    let mut current = first_top;
+    for line in metrics {
+        positions.push(current.round() as i32);
+        current += line.height() + spacing;
     }
     positions
 }
@@ -540,21 +483,18 @@ pub(crate) fn compute_vertical_layout(
 pub(crate) fn resolve_vertical_layout(
     track: &ParsedTrack,
     event: &LayoutEvent,
+    metrics: &[LineMetrics],
     effective_position: Option<(i32, i32)>,
     occupied_bounds: &[Rect],
-    source_event: Option<&ParsedEvent>,
-    now_ms: i64,
     config: &RendererConfig,
     render_scale: RenderScale,
 ) -> Vec<i32> {
     let mut vertical_layout = compute_vertical_layout(
         track,
-        &event.lines,
+        metrics,
         event.alignment,
         event.margin_v,
         effective_position,
-        source_event,
-        now_ms,
         config,
         render_scale,
     );
@@ -563,7 +503,11 @@ pub(crate) fn resolve_vertical_layout(
     }
 
     let scale_y = render_scale.y;
-    let line_height = layout_line_height(config, scale_y);
+    let line_height = metrics
+        .first()
+        .map(|line| line.height().round() as i32)
+        .unwrap_or(0)
+        .max(1);
     let shift = match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
         ass::VALIGN_TOP => line_height,
         ass::VALIGN_CENTER => line_height,
@@ -574,12 +518,11 @@ pub(crate) fn resolve_vertical_layout(
         track,
         event,
         &vertical_layout,
+        metrics,
         effective_position,
-        config,
         1.0,
-        scale_y,
     );
-    let frame_height = (f64::from(track.play_res_y) * scale_y).round() as i32;
+    let frame_height = (f64::from(track.play_res_y) * style_scale(scale_y)).round() as i32;
     while occupied_bounds
         .iter()
         .any(|occupied| bounds.intersect(*occupied).is_some())
@@ -591,10 +534,9 @@ pub(crate) fn resolve_vertical_layout(
             track,
             event,
             &vertical_layout,
+            metrics,
             effective_position,
-            config,
             1.0,
-            scale_y,
         );
         if bounds.y_min < 0 || bounds.y_max > frame_height {
             break;
@@ -608,24 +550,28 @@ pub(crate) fn event_bounds(
     track: &ParsedTrack,
     event: &LayoutEvent,
     vertical_layout: &[i32],
+    metrics: &[LineMetrics],
     effective_position: Option<(i32, i32)>,
-    config: &RendererConfig,
     scale_x: f64,
-    scale_y: f64,
 ) -> Rect {
     let mut x_min = i32::MAX;
     let mut y_min = i32::MAX;
     let mut x_max = i32::MIN;
     let mut y_max = i32::MIN;
 
-    for (line, line_top) in event.lines.iter().zip(vertical_layout.iter().copied()) {
+    for ((line, line_top), line_metrics) in event
+        .lines
+        .iter()
+        .zip(vertical_layout.iter().copied())
+        .zip(metrics.iter())
+    {
         let line_width = (f64::from(line.width) * style_scale(scale_x)).round() as i32;
         let origin_x =
             compute_horizontal_origin(track, event, line_width, effective_position, scale_x);
         x_min = x_min.min(origin_x);
         y_min = y_min.min(line_top);
         x_max = x_max.max(origin_x + line_width);
-        y_max = y_max.max(line_top + layout_line_height(config, scale_y));
+        y_max = y_max.max(line_top + line_metrics.height().round() as i32);
     }
 
     if x_min == i32::MAX {
@@ -678,27 +624,23 @@ pub(crate) fn text_decoration_planes(
     planes
 }
 
+/// Composite a run's glyph bitmaps into one plane.  Glyphs sit on the
+/// line baseline: y = ascender - glyph.top, where ascender is the line's
+/// metric ascent (libass: pos.y = baseline; bitmaps offset by glyph top).
 pub(crate) fn combined_image_plane_from_glyphs(
     glyphs: &[RasterGlyph],
-    origin_x: i32,
+    origin_x_26_6: i32,
     line_top: i32,
-    line_metrics: Option<TextLineMetrics>,
+    ascender: Option<i32>,
     color: u32,
     kind: ass::ImageType,
     blur_radius: u32,
 ) -> Option<ImagePlane> {
-    let metrics = line_metrics.unwrap_or_else(|| TextLineMetrics {
-        ascender: glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0),
-        height: None,
-        positioned_center_metric_anchor: false,
-        positioned_center_metric_plane_adjust: false,
-    });
-    let ascender = metrics.ascender;
-    let clip_bottom = metrics
-        .positioned_center_metric_anchor
-        .then_some(metrics.height.map(|height| height + 1))
-        .flatten();
-    let mut pen_x = 0_i32;
+    let ascender =
+        ascender.unwrap_or_else(|| glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0));
+    // libass accumulates the pen in 26.6 units and floors per glyph
+    // (render_and_combine_glyphs: x = pos.x >> 6).
+    let mut pen_x = origin_x_26_6;
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
     let mut max_x = i32::MIN;
@@ -706,25 +648,16 @@ pub(crate) fn combined_image_plane_from_glyphs(
 
     for glyph in glyphs {
         if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
-            pen_x += glyph.advance_x;
+            pen_x += glyph.advance_x_26_6;
             continue;
         }
-        let x_adjust = positioned_metric_glyph_x_adjust(metrics, glyph);
-        let x = pen_x + glyph.left + glyph.offset_x + x_adjust;
-        let top_adjust = positioned_metric_glyph_top_adjust(metrics, glyph);
-        let y = ascender - glyph.top + top_adjust + glyph.offset_y;
-        let glyph_bottom = clip_bottom
-            .map(|bottom| (y + glyph.height).min(bottom))
-            .unwrap_or(y + glyph.height);
-        if glyph_bottom <= y {
-            pen_x += glyph.advance_x;
-            continue;
-        }
+        let x = (pen_x >> 6) + glyph.left + glyph.offset_x;
+        let y = ascender - glyph.top + glyph.offset_y;
         min_x = min_x.min(x);
         min_y = min_y.min(y);
         max_x = max_x.max(x + glyph.width);
-        max_y = max_y.max(glyph_bottom);
-        pen_x += glyph.advance_x;
+        max_y = max_y.max(y + glyph.height);
+        pen_x += glyph.advance_x_26_6;
     }
 
     if min_x == i32::MAX || min_y == i32::MAX || max_x <= min_x || max_y <= min_y {
@@ -734,26 +667,16 @@ pub(crate) fn combined_image_plane_from_glyphs(
     let width = (max_x - min_x) as usize;
     let height = (max_y - min_y) as usize;
     let mut bitmap = vec![0_u8; width * height];
-    pen_x = 0;
+    pen_x = origin_x_26_6;
     for glyph in glyphs {
         if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
-            pen_x += glyph.advance_x;
+            pen_x += glyph.advance_x_26_6;
             continue;
         }
-        let x_adjust = positioned_metric_glyph_x_adjust(metrics, glyph);
-        let x0 = (pen_x + glyph.left + glyph.offset_x + x_adjust - min_x) as usize;
-        let top_adjust = positioned_metric_glyph_top_adjust(metrics, glyph);
-        let glyph_y = ascender - glyph.top + top_adjust + glyph.offset_y;
-        let glyph_bottom = clip_bottom
-            .map(|bottom| (glyph_y + glyph.height).min(bottom))
-            .unwrap_or(glyph_y + glyph.height);
-        if glyph_bottom <= glyph_y {
-            pen_x += glyph.advance_x;
-            continue;
-        }
-        let y0 = (glyph_y - min_y) as usize;
+        let x0 = ((pen_x >> 6) + glyph.left + glyph.offset_x - min_x) as usize;
+        let y0 = (ascender - glyph.top + glyph.offset_y - min_y) as usize;
         let glyph_width = glyph.width as usize;
-        let glyph_height = (glyph_bottom - glyph_y) as usize;
+        let glyph_height = glyph.height as usize;
         let glyph_stride = glyph.stride as usize;
         for y in 0..glyph_height {
             for x in 0..glyph_width {
@@ -762,7 +685,7 @@ pub(crate) fn combined_image_plane_from_glyphs(
                 *dst = (*dst).max(src);
             }
         }
-        pen_x += glyph.advance_x;
+        pen_x += glyph.advance_x_26_6;
     }
 
     let (bitmap, width, height, pad) = blur_bitmap(bitmap, width, height, blur_radius);
@@ -774,7 +697,7 @@ pub(crate) fn combined_image_plane_from_glyphs(
         stride: width as i32,
         color: rgba_color_from_ass(color),
         destination: Point {
-            x: origin_x + min_x - pad as i32,
+            x: min_x - pad as i32,
             y: line_top + min_y - pad as i32,
         },
         kind,
@@ -782,23 +705,3 @@ pub(crate) fn combined_image_plane_from_glyphs(
     })
 }
 
-pub(crate) fn positioned_metric_glyph_top_adjust(
-    metrics: TextLineMetrics,
-    _glyph: &RasterGlyph,
-) -> i32 {
-    if metrics.positioned_center_metric_plane_adjust {
-        3
-    } else {
-        0
-    }
-}
-
-pub(crate) fn positioned_metric_glyph_x_adjust(
-    metrics: TextLineMetrics,
-    glyph: &RasterGlyph,
-) -> i32 {
-    if !metrics.positioned_center_metric_plane_adjust {
-        return 0;
-    }
-    if glyph.left <= 4 { -1 } else { 0 }
-}

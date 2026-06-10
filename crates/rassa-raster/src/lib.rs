@@ -41,6 +41,10 @@ pub struct RasterGlyph {
     pub offset_y: i32,
     pub advance_x: i32,
     pub advance_y: i32,
+    /// Horizontal advance in 26.6 fixed point.  libass accumulates the pen in
+    /// 26.6 units and floors per glyph; rounding each advance to whole pixels
+    /// drifts up to half a pixel per glyph across a run.
+    pub advance_x_26_6: i32,
     pub pixel_mode: RasterPixelMode,
     pub bitmap: Vec<u8>,
 }
@@ -103,6 +107,7 @@ impl Rasterizer {
                 offset_y: (-glyph.y_offset).round() as i32,
                 advance_x: glyph.x_advance.round() as i32,
                 advance_y: glyph.y_advance.round() as i32,
+                advance_x_26_6: (glyph.x_advance * 64.0).round() as i32,
                 ..RasterGlyph::default()
             })
             .collect()
@@ -207,6 +212,7 @@ impl Rasterizer {
                     offset_y: (-glyph.y_offset).round() as i32,
                     advance_x: (advance.x >> 6) as i32,
                     advance_y: (advance.y >> 6) as i32,
+                    advance_x_26_6: advance.x as i32,
                     pixel_mode: classify_pixel_mode(&bitmap),
                     bitmap: copy_bitmap_rows(&bitmap),
                 });
@@ -353,6 +359,7 @@ fn rasterize_freetype_glyphs(
             offset_y: (-glyph.y_offset).round() as i32 + rendered.offset_y,
             advance_x: (advance.x >> 6) as i32,
             advance_y: (advance.y >> 6) as i32,
+            advance_x_26_6: advance.x as i32,
             pixel_mode: RasterPixelMode::Gray,
             bitmap: rendered.bitmap,
         };
@@ -379,6 +386,7 @@ fn glyph_from_cache(glyph: &GlyphInfo, cached: RasterGlyph) -> RasterGlyph {
         offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
         advance_x: cached.advance_x,
         advance_y: cached.advance_y,
+        advance_x_26_6: cached.advance_x_26_6,
         ..cached
     }
 }
@@ -452,6 +460,7 @@ fn rasterize_system_glyphs(
                 offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
                 advance_x: cached.advance_x,
                 advance_y: cached.advance_y,
+                advance_x_26_6: cached.advance_x_26_6,
                 ..cached
             });
             continue;
@@ -481,6 +490,7 @@ fn rasterize_system_glyphs(
             offset_x: glyph.x_offset.round() as i32,
             offset_y: (-glyph.y_offset).round() as i32,
             advance_x: rendered_advance_x(&rendered, glyph),
+            advance_x_26_6: rendered_advance_x(&rendered, glyph) * 64,
             advance_y: rendered_advance_y(&rendered, glyph),
             pixel_mode,
             bitmap,
@@ -540,7 +550,8 @@ fn crossfont_bitmap_to_gray(
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResult<()> {
+pub fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResult<()> {
+    apply_gdi_font_metrics(face);
     let mut request = ffi::FT_Size_RequestRec {
         size_request_type: ffi::FT_SIZE_REQUEST_TYPE_REAL_DIM,
         width: 0,
@@ -560,6 +571,45 @@ fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> RassaResu
         Err(RassaError::new(format!(
             "failed to request freetype real-dim size {size_26_6}: {err}"
         )))
+    }
+}
+
+/// Mirror libass set_font_metrics (ass_font.c): GDI uses OS/2 usWinAscent and
+/// usWinDescent as the face ascender/descender, falling back to the typo
+/// metrics and finally the face bbox.  Must run before FT_Request_Size so
+/// FT_SIZE_REQUEST_TYPE_REAL_DIM scales the em against the win height, which
+/// is what makes an ASS font size mean "line height" like VSFilter.
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+pub fn apply_gdi_font_metrics(face: &mut freetype::Face) {
+    let raw = unsafe { &mut *(face.raw_mut() as *mut ffi::FT_FaceRec) };
+    let os2 = unsafe {
+        ffi::FT_Get_Sfnt_Table(raw as *mut ffi::FT_FaceRec, ffi::ft_sfnt_os2) as *const ffi::TT_OS2
+    };
+    if !os2.is_null() {
+        let os2 = unsafe { &*os2 };
+        // libass reads the unsigned spec fields as signed, mirroring GDI.
+        let win_ascent = os2.usWinAscent as i16;
+        let win_descent = os2.usWinDescent as i16;
+        if i32::from(win_ascent) + i32::from(win_descent) != 0 {
+            raw.ascender = win_ascent;
+            raw.descender = -win_descent;
+            raw.height = raw.ascender - raw.descender;
+        }
+    }
+    if raw.ascender - raw.descender == 0 || raw.height == 0 {
+        if !os2.is_null() {
+            let os2 = unsafe { &*os2 };
+            if os2.sTypoAscender - os2.sTypoDescender != 0 {
+                raw.ascender = os2.sTypoAscender;
+                raw.descender = os2.sTypoDescender;
+                raw.height = raw.ascender - raw.descender;
+            }
+        }
+        if raw.ascender - raw.descender == 0 || raw.height == 0 {
+            raw.ascender = raw.bbox.yMax.clamp(i16::MIN.into(), i16::MAX.into()) as i16;
+            raw.descender = raw.bbox.yMin.clamp(i16::MIN.into(), i16::MAX.into()) as i16;
+            raw.height = raw.ascender - raw.descender;
+        }
     }
 }
 
@@ -711,15 +761,68 @@ fn rasterize_ft_outline(outline: &ffi::FT_Outline, glyph_id: u32) -> RassaResult
         tile_height as usize,
     );
 
-    Ok(OutlineBitmap {
+    // Bitmap row r spans glyph-space y in [y_max - r - 1, y_max - r], so the
+    // top edge of row 0 sits exactly y_max above the baseline.  top must be
+    // y_max itself for callers placing rows at `ascender - top + r`.  The
+    // tile-aligned allocation is an internal detail; crop to ink so bitmap
+    // extents reflect glyph coverage like libass bitmaps do.
+    Ok(trim_outline_bitmap_to_ink(OutlineBitmap {
         width: tile_width,
         height: tile_height,
         stride,
         left: x_min,
-        top: y_max + 1,
-        offset_y: -1,
+        top: y_max,
+        offset_y: 0,
         bitmap,
-    })
+    }))
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn trim_outline_bitmap_to_ink(bitmap: OutlineBitmap) -> OutlineBitmap {
+    if bitmap.width <= 0 || bitmap.height <= 0 || bitmap.stride <= 0 {
+        return bitmap;
+    }
+    let stride = bitmap.stride as usize;
+    let width = bitmap.width as usize;
+    let height = bitmap.height as usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0_usize;
+    let mut max_y = 0_usize;
+    for y in 0..height {
+        let row = &bitmap.bitmap[y * stride..y * stride + width];
+        for (x, value) in row.iter().enumerate() {
+            if *value > 0 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x + 1);
+                max_y = max_y.max(y + 1);
+            }
+        }
+    }
+    if min_x >= max_x || min_y >= max_y {
+        return OutlineBitmap::default();
+    }
+    if min_x == 0 && min_y == 0 && max_x == width && max_y == height {
+        return bitmap;
+    }
+    let new_width = max_x - min_x;
+    let new_height = max_y - min_y;
+    let mut trimmed = vec![0_u8; new_width * new_height];
+    for y in 0..new_height {
+        let src_start = (min_y + y) * stride + min_x;
+        trimmed[y * new_width..(y + 1) * new_width]
+            .copy_from_slice(&bitmap.bitmap[src_start..src_start + new_width]);
+    }
+    OutlineBitmap {
+        width: new_width as i32,
+        height: new_height as i32,
+        stride: new_width as i32,
+        left: bitmap.left + min_x as i32,
+        top: bitmap.top - min_y as i32,
+        offset_y: bitmap.offset_y,
+        bitmap: trimmed,
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]

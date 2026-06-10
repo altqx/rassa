@@ -20,31 +20,6 @@ pub(crate) fn apply_event_clip(
     clipped
 }
 
-pub(crate) fn crop_or_pad_plane_to_rect(plane: ImagePlane, target: Rect) -> ImagePlane {
-    let cropped = crop_plane_to_rect(plane, target).unwrap_or_else(|| ImagePlane {
-        size: Size {
-            width: 0,
-            height: 0,
-        },
-        stride: 0,
-        destination: Point {
-            x: target.x_min,
-            y: target.y_min,
-        },
-        color: RgbaColor(0),
-        bitmap: Vec::new(),
-        kind: ass::ImageType::Character,
-    });
-    let current = plane_rect(&cropped);
-    pad_plane_transparent(
-        cropped,
-        current.x_min - target.x_min,
-        current.y_min - target.y_min,
-        target.x_max - current.x_max,
-        target.y_max - current.y_max,
-    )
-}
-
 pub(crate) fn apply_vector_clip(
     planes: Vec<ImagePlane>,
     clip: &ParsedVectorClip,

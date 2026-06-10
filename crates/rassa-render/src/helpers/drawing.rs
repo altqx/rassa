@@ -30,11 +30,6 @@ pub(crate) fn image_planes_from_absolute_glyphs(
         .collect()
 }
 
-pub(crate) fn drawing_baseline_ascender(style: &ParsedSpanStyle, _render_scale_y: f64) -> i32 {
-    let scale_y = style_scale(style.scale_y);
-    (style.font_size.max(1.0) * scale_y * 0.75).round() as i32
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DrawingPlaneParams {
     pub(crate) origin_x: i32,
@@ -44,7 +39,6 @@ pub(crate) struct DrawingPlaneParams {
     pub(crate) scale_y: f64,
     pub(crate) render_scale: RenderScale,
     pub(crate) baseline_offset: f64,
-    pub(crate) pad_to_libass_geometry: bool,
 }
 
 pub(crate) fn image_plane_from_drawing(
@@ -81,14 +75,15 @@ pub(crate) fn image_plane_from_drawing(
         }
     }
 
-    let pbo_pixels = (params.baseline_offset * params.render_scale.y).round() as i32;
-    let vertical_offset = pbo_pixels.max(0);
+    // \pbo is a signed baseline offset: positive moves the drawing down
+    // (libass: desc = pbo, applied with the drawing's scale).
+    let vertical_offset = (params.baseline_offset * params.render_scale.y).round() as i32;
 
     if !any_visible {
         return None;
     }
 
-    let plane = ImagePlane {
+    Some(ImagePlane {
         size: Size { width, height },
         stride: width,
         color: rgba_color_from_ass(params.color),
@@ -98,56 +93,7 @@ pub(crate) fn image_plane_from_drawing(
         },
         kind: ass::ImageType::Character,
         bitmap,
-    };
-    if params.pad_to_libass_geometry {
-        Some(pad_drawing_plane_to_libass_geometry(plane))
-    } else {
-        Some(plane)
-    }
-}
-
-pub(crate) fn pad_drawing_plane_to_libass_geometry(plane: ImagePlane) -> ImagePlane {
-    let left_pad = 1_i32;
-    let top_pad = 0_i32;
-    let padded_width = align_i32(plane.size.width + left_pad, 16).max(plane.size.width + left_pad);
-    let padded_height = align_i32(plane.size.height + top_pad, 16).max(plane.size.height + top_pad);
-    let right_pad = padded_width - plane.size.width - left_pad;
-    let bottom_pad = padded_height - plane.size.height - top_pad;
-    if left_pad == 0 && top_pad == 0 && right_pad == 0 && bottom_pad == 0 {
-        return plane;
-    }
-
-    let new_stride = padded_width;
-    let mut bitmap = vec![0_u8; (new_stride * padded_height) as usize];
-    let src_stride = plane.stride.max(0) as usize;
-    let dst_stride = new_stride as usize;
-    for row in 0..plane.size.height.max(0) as usize {
-        let src_start = row * src_stride;
-        let dst_start = (row + top_pad as usize) * dst_stride + left_pad as usize;
-        bitmap[dst_start..dst_start + plane.size.width as usize]
-            .copy_from_slice(&plane.bitmap[src_start..src_start + plane.size.width as usize]);
-    }
-
-    ImagePlane {
-        size: Size {
-            width: padded_width,
-            height: padded_height,
-        },
-        stride: new_stride,
-        destination: Point {
-            x: plane.destination.x - left_pad,
-            y: plane.destination.y - top_pad,
-        },
-        bitmap,
-        ..plane
-    }
-}
-
-pub(crate) fn align_i32(value: i32, alignment: i32) -> i32 {
-    if alignment <= 1 {
-        return value;
-    }
-    ((value + alignment - 1) / alignment) * alignment
+    })
 }
 
 pub(crate) fn scaled_drawing_polygons(

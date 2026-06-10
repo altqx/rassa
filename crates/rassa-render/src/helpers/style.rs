@@ -138,25 +138,28 @@ pub(crate) fn apply_text_spacing(
     glyphs: Vec<RasterGlyph>,
     style: &ParsedSpanStyle,
 ) -> Vec<RasterGlyph> {
-    let spacing = text_spacing_advance(style);
-    if spacing == 0 {
+    let spacing_26_6 = text_spacing_advance_26_6(style);
+    if spacing_26_6 == 0 {
         return glyphs;
     }
 
     glyphs
         .into_iter()
         .map(|glyph| RasterGlyph {
-            advance_x: glyph.advance_x + spacing,
+            advance_x: glyph.advance_x + ((spacing_26_6 + 32) >> 6),
+            advance_x_26_6: glyph.advance_x_26_6 + spacing_26_6,
             ..glyph
         })
         .collect()
 }
 
-pub(crate) fn text_spacing_advance(style: &ParsedSpanStyle) -> i32 {
+/// \fsp advance per glyph in 26.6 units; libass adds `double_to_d6(spacing)
+/// * scale_x` to each cluster advance without rounding to whole pixels.
+pub(crate) fn text_spacing_advance_26_6(style: &ParsedSpanStyle) -> i32 {
     if !style.spacing.is_finite() {
         return 0;
     }
-    (style.spacing * style_scale(style.scale_x)).round() as i32
+    (style.spacing * style_scale(style.scale_x) * 64.0).round() as i32
 }
 
 pub(crate) fn renderer_font_scale(config: &RendererConfig) -> f64 {
@@ -217,6 +220,7 @@ pub(crate) fn apply_vertical_font_raster_advances(
         if glyph.advance_x != 0 || glyph.advance_y != 0 {
             glyph.advance_x = advance;
             glyph.advance_y = 0;
+            glyph.advance_x_26_6 = (style.font_size.max(1.0) * 64.0).round() as i32;
         }
     }
     glyphs
@@ -281,74 +285,12 @@ pub(crate) struct RenderScale {
     pub(crate) uniform: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TextLineMetrics {
-    pub(crate) ascender: i32,
-    pub(crate) height: Option<i32>,
-    pub(crate) positioned_center_metric_anchor: bool,
-    pub(crate) positioned_center_metric_plane_adjust: bool,
-}
-
-pub(crate) fn line_raster_ascender(
-    line: &rassa_layout::LayoutLine,
-    source_event: Option<&ParsedEvent>,
-    now_ms: i64,
-    track: &ParsedTrack,
-    config: &RendererConfig,
-    render_scale: RenderScale,
-    use_metric_ascender: bool,
-) -> i32 {
-    let mut metric_ascender = 0_i32;
-    let mut raster_ascender = 0_i32;
-    for run in &line.runs {
-        if run.drawing.is_some() || run.glyphs.is_empty() {
-            continue;
-        }
-        let effective_style = apply_renderer_style_scale(
-            resolve_run_style(run, source_event, now_ms),
-            track,
-            config,
-            render_scale.uniform,
-        );
-        if use_metric_ascender {
-            if let Some(ascender) = font_metric_ascender_for_run(run, &effective_style) {
-                metric_ascender = metric_ascender.max(ascender);
-            }
-        }
-        let rasterizer = Rasterizer::with_options(RasterOptions {
-            size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
-            hinting: config.hinting,
-        });
-        let glyph_infos = scale_glyph_infos(&run.glyphs, render_scale.x, render_scale.y);
-        let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
-            continue;
-        };
-        let raster_glyphs = scale_raster_glyphs(
-            raster_glyphs,
-            effective_style.scale_x,
-            effective_style.scale_y,
-        );
-        let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
-        raster_ascender = raster_ascender.max(
-            raster_glyphs
-                .iter()
-                .map(|glyph| glyph.top)
-                .max()
-                .unwrap_or(0),
-        );
-    }
-    if use_metric_ascender {
-        metric_ascender.max(raster_ascender)
-    } else {
-        raster_ascender
-    }
-}
-
 pub(crate) fn scale_raster_glyph(glyph: RasterGlyph, scale_x: f64, scale_y: f64) -> RasterGlyph {
     if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
         return RasterGlyph {
             advance_x: (f64::from(glyph.advance_x) * scale_x).round() as i32,
             advance_y: (f64::from(glyph.advance_y) * scale_y).round() as i32,
+            advance_x_26_6: (f64::from(glyph.advance_x_26_6) * scale_x).round() as i32,
             ..glyph
         };
     }
@@ -375,6 +317,7 @@ pub(crate) fn scale_raster_glyph(glyph: RasterGlyph, scale_x: f64, scale_y: f64)
         top: (f64::from(glyph.top) * scale_y).round() as i32,
         advance_x: (f64::from(glyph.advance_x) * scale_x).round() as i32,
         advance_y: (f64::from(glyph.advance_y) * scale_y).round() as i32,
+        advance_x_26_6: (f64::from(glyph.advance_x_26_6) * scale_x).round() as i32,
         bitmap,
         ..glyph
     }
