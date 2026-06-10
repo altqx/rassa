@@ -770,6 +770,7 @@ dependencies = [
  "rassa-core",
  "rassa-fonts",
  "rassa-unicode",
+ "ttf-parser 0.25.1",
 ]
 
 [[package]]

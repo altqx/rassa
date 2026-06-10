@@ -14,6 +14,7 @@ harfrust = "0.6.0"
 rassa-core = { path = "../rassa-core", version = "0.6.0" }
 rassa-fonts = { path = "../rassa-fonts", version = "0.6.0" }
 rassa-unicode = { path = "../rassa-unicode", version = "0.6.0" }
+ttf-parser = "0.25.1"
 
 [lib]
 path = "src/lib.rs"

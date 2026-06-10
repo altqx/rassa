@@ -125,11 +125,9 @@ impl LayoutEngine {
         };
         let alignment = parsed_text.alignment.unwrap_or(style.alignment);
         let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment);
-        let lines = if explicit_lines.len() > 1 {
-            explicit_lines
-        } else {
-            wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?
-        };
+        // libass wrap_lines_smart wraps the whole event, treating \N as a
+        // forced break; each explicit segment still auto-wraps on its own.
+        let lines = wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?;
 
         Ok(LayoutEvent {
             event_index,
@@ -457,7 +455,7 @@ fn wrap_layout_line(
     wrap_style: i32,
     language: &str,
 ) -> RassaResult<Vec<LayoutLine>> {
-    if line.width <= max_width || line.text.chars().count() <= 1 {
+    if line.width < max_width || line.text.chars().count() <= 1 {
         return Ok(vec![line]);
     }
 
@@ -466,105 +464,136 @@ fn wrap_layout_line(
     if pieces.len() <= 1 {
         return Ok(vec![line]);
     }
+    let piece_breakable = |piece: &LayoutPiece| {
+        matches!(
+            breaks.get(piece.char_index),
+            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
+        )
+    };
 
-    let mut output = Vec::new();
+    // libass wrap_lines_naive: break at the last breakable character once the
+    // line overflows; a word with no break opportunity overflows and breaks
+    // at the first breakable after it.  Spaces never trigger the overflow
+    // check (they get trimmed).
+    let mut wrapped: Vec<Vec<LayoutPiece>> = Vec::new();
     let mut current: Vec<LayoutPiece> = Vec::new();
     let mut current_width = 0.0_f32;
     let mut last_break_pos: Option<usize> = None;
 
     for piece in pieces.iter().cloned() {
+        let is_whitespace = piece.text.chars().all(char::is_whitespace);
         current_width += piece.width;
         current.push(piece);
-        let char_index = current.last().map(|piece| piece.char_index).unwrap_or(0);
-        if matches!(
-            breaks.get(char_index),
-            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
-        ) {
-            last_break_pos = Some(current.len());
-        }
-
-        if current_width > max_width && current.len() > 1 {
-            let split_at = last_break_pos
-                .filter(|pos| *pos > 0 && *pos < current.len())
-                .unwrap_or(current.len() - 1);
-            let mut remainder = current.split_off(split_at);
-            trim_wrapped_line_edges(&mut current, false);
-            if !current.is_empty() {
-                output.push(line_from_pieces(&line, &current));
+        if current_width >= max_width && !is_whitespace {
+            if let Some(split_at) = last_break_pos.filter(|pos| *pos > 0 && *pos < current.len()) {
+                let mut remainder = current.split_off(split_at);
+                trim_wrapped_line_edges(&mut current, false);
+                if !current.is_empty() {
+                    wrapped.push(current);
+                }
+                trim_wrapped_line_edges(&mut remainder, true);
+                current_width = pieces_width(&remainder);
+                current = remainder;
+                last_break_pos = None;
             }
-            trim_wrapped_line_edges(&mut remainder, true);
-            current_width = pieces_width(&remainder);
-            current = remainder;
-            last_break_pos = last_allowed_break_pos(&current, &breaks);
+        }
+        if current.last().map(|piece| piece_breakable(piece)).unwrap_or(false) {
+            last_break_pos = Some(current.len());
         }
     }
 
     trim_wrapped_line_edges(&mut current, false);
     if !current.is_empty() {
-        output.push(line_from_pieces(&line, &current));
+        wrapped.push(current);
     }
 
-    if wrap_style == 0 && output.len() == 2 {
-        if let Some(balanced) = balanced_two_line_wrap(&line, &pieces, &breaks, max_width) {
-            return Ok(balanced);
+    // libass wrap_lines_rebalance: for wrap styles other than 1, repeatedly
+    // move the last word of a line to the start of the next one whenever it
+    // reduces the width difference of the (soft-broken) pair.  libass treats
+    // styles 0 and 3 identically here (FIXME in ass_render.c).
+    if wrap_style != 1 {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut index = 0;
+            while index + 1 < wrapped.len() {
+                if let Some((left, right)) =
+                    rebalance_pair(&wrapped[index], &wrapped[index + 1], &piece_breakable)
+                {
+                    wrapped[index] = left;
+                    wrapped[index + 1] = right;
+                    changed = true;
+                }
+                index += 1;
+            }
         }
     }
 
-    if output.is_empty() {
+    if wrapped.is_empty() {
         Ok(vec![line])
     } else {
-        Ok(output)
+        Ok(wrapped
+            .iter()
+            .map(|pieces| line_from_pieces(&line, pieces))
+            .collect())
     }
 }
 
-fn balanced_two_line_wrap(
-    source: &LayoutLine,
-    pieces: &[LayoutPiece],
-    breaks: &[LineBreakOpportunity],
-    max_width: f32,
-) -> Option<Vec<LayoutLine>> {
-    let mut prefix_widths = Vec::with_capacity(pieces.len() + 1);
-    prefix_widths.push(0.0_f32);
-    for piece in pieces {
-        prefix_widths.push(prefix_widths.last().copied().unwrap_or(0.0) + piece.width);
+/// Try moving the last word of `left` to the front of `right`, accepting the
+/// move when it reduces the absolute width difference of the pair (libass
+/// wrap_lines_rebalance).
+fn rebalance_pair(
+    left: &[LayoutPiece],
+    right: &[LayoutPiece],
+    piece_breakable: &dyn Fn(&LayoutPiece) -> bool,
+) -> Option<(Vec<LayoutPiece>, Vec<LayoutPiece>)> {
+    // Find the start of the last word: rewind over trailing whitespace, then
+    // to the piece after the last break opportunity.
+    let mut word_start = left.len();
+    while word_start > 0 && left[word_start - 1].text.chars().all(char::is_whitespace) {
+        word_start -= 1;
     }
-    let total = prefix_widths.last().copied().unwrap_or(0.0);
-    let mut best: Option<(usize, f32)> = None;
-    for index in 1..pieces.len() {
-        let previous = &pieces[index - 1];
-        if !matches!(
-            breaks.get(previous.char_index),
-            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
-        ) {
-            continue;
-        }
-        let left_width = prefix_widths[index];
-        let right_width = total - left_width;
-        if left_width <= 0.0
-            || right_width <= 0.0
-            || left_width > max_width
-            || right_width > max_width
-        {
-            continue;
-        }
-        let score = (left_width - right_width).abs();
-        if best.is_none_or(|(_, best_score)| score < best_score) {
-            best = Some((index, score));
-        }
+    let word_end = word_start;
+    while word_start > 0 && !piece_breakable(&left[word_start - 1]) {
+        word_start -= 1;
     }
-
-    let (split_at, _) = best?;
-    let mut first = pieces[..split_at].to_vec();
-    let mut second = pieces[split_at..].to_vec();
-    trim_wrapped_line_edges(&mut first, false);
-    trim_wrapped_line_edges(&mut second, true);
-    if first.is_empty() || second.is_empty() {
+    if word_start == 0 || word_end == 0 {
+        // Merging line breaks is never beneficial (libass comment).
         return None;
     }
-    Some(vec![
-        line_from_pieces(source, &first),
-        line_from_pieces(source, &second),
-    ])
+
+    let trimmed_width = |pieces: &[LayoutPiece]| {
+        let mut end = pieces.len();
+        while end > 0 && pieces[end - 1].text.chars().all(char::is_whitespace) {
+            end -= 1;
+        }
+        let mut start = 0;
+        while start < end && pieces[start].text.chars().all(char::is_whitespace) {
+            start += 1;
+        }
+        pieces_width(&pieces[start..end])
+    };
+
+    let l1 = trimmed_width(left);
+    let l2 = trimmed_width(right);
+    let new_left = &left[..word_start];
+    let moved = &left[word_start..];
+    let l1_new = trimmed_width(new_left);
+    let l2_new = trimmed_width(moved) + l2;
+
+    if (l1_new - l2_new).abs() < (l1 - l2).abs() {
+        let mut new_left = new_left.to_vec();
+        trim_wrapped_line_edges(&mut new_left, false);
+        let mut new_right = moved.to_vec();
+        new_right.extend(right.iter().cloned());
+        trim_wrapped_line_edges(&mut new_right, true);
+        if new_left.is_empty() || new_right.is_empty() {
+            return None;
+        }
+        Some((new_left, new_right))
+    } else {
+        None
+    }
 }
 
 fn line_to_pieces(line: &LayoutLine) -> Vec<LayoutPiece> {
@@ -946,8 +975,16 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
 
-        assert!(layout.lines.len() > 1);
-        assert!(layout.lines.iter().all(|line| line.width <= 4.0));
+        // libass wrap_lines_naive breaks only at break opportunities; a word
+        // wider than the wrap width overflows and breaks at the next space.
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma", "delta"],
+        );
         assert!(layout.lines.iter().all(|line| !line.text.starts_with(' ')));
         assert!(layout.lines.iter().all(|line| !line.text.ends_with(' ')));
     }
@@ -969,11 +1006,15 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta",
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
 
-        assert!(
-            layout.lines.len() > 1,
+        // libass wrap_lines_naive never splits inside a word: each word
+        // overflows its 4px line and breaks at the following space.
+        assert_eq!(
+            layout.lines.len(),
+            2,
             "missing PlayRes should still use ASS default resolution for wrapping"
         );
-        assert!(layout.lines.iter().all(|line| line.width <= 4.0));
+        assert_eq!(layout.lines[0].text, "alpha");
+        assert_eq!(layout.lines[1].text, "beta");
     }
 
     #[test]

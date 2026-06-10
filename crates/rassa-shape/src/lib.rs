@@ -275,11 +275,16 @@ impl ShapeEngine {
         }
 
         let glyph_buffer = shaper.shape(buffer, &[]);
+        // VSFilter/libass scale the em against the GDI font height
+        // (FT_SIZE_REQUEST_TYPE_REAL_DIM after set_font_metrics), not
+        // units_per_em, so an ASS font size means "line height".
         let units_per_em = shaper.units_per_em().max(1) as f32;
+        let gdi_height = gdi_font_height_units(bytes.as_slice(), font.face_index.unwrap_or(0))
+            .unwrap_or(units_per_em);
         let scale = font_size
             .filter(|size| size.is_finite() && *size > 0.0)
             .unwrap_or(1.0)
-            / units_per_em;
+            / gdi_height;
         let glyph_infos = glyph_buffer.glyph_infos();
         let glyph_positions = glyph_buffer.glyph_positions();
         if glyph_infos.len() != glyph_positions.len() {
@@ -301,6 +306,34 @@ impl ShapeEngine {
                 .collect(),
         )
     }
+}
+
+/// Font height in design units the way GDI (and libass set_font_metrics)
+/// derives it: OS/2 usWinAscent + usWinDescent read as signed shorts,
+/// falling back to the hhea metrics, the typo metrics, and the head bbox.
+fn gdi_font_height_units(bytes: &[u8], face_index: u32) -> Option<f32> {
+    let face = ttf_parser::Face::parse(bytes, face_index).ok()?;
+    if let Some(os2) = face.tables().os2 {
+        let win_height = i32::from(os2.windows_ascender()) - i32::from(os2.windows_descender());
+        if win_height != 0 {
+            return Some(win_height as f32);
+        }
+    }
+    let hhea = face.tables().hhea;
+    let hhea_height = i32::from(hhea.ascender) - i32::from(hhea.descender);
+    if hhea_height != 0 {
+        return Some(hhea_height as f32);
+    }
+    if let Some(os2) = face.tables().os2 {
+        let typo_height =
+            i32::from(os2.typographic_ascender()) - i32::from(os2.typographic_descender());
+        if typo_height != 0 {
+            return Some(typo_height as f32);
+        }
+    }
+    let bbox = face.global_bounding_box();
+    let bbox_height = i32::from(bbox.y_max) - i32::from(bbox.y_min);
+    (bbox_height != 0).then_some(bbox_height as f32)
 }
 
 fn convert_direction(direction: BidiDirection) -> Direction {
