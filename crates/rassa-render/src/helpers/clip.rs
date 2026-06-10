@@ -49,10 +49,11 @@ pub(crate) fn mask_plane_with_vector_clip(
         for column in 0..width {
             let global_x = plane.destination.x + column as i32;
             let global_y = plane.destination.y + row as i32;
-            let inside = clip
-                .polygons
-                .iter()
-                .any(|polygon| point_in_polygon(global_x, global_y, polygon));
+            let inside = point_in_drawing_polygons_at(
+                f64::from(global_x) + 0.5,
+                f64::from(global_y) + 0.5,
+                &clip.polygons,
+            );
             let keep = if inverse { !inside } else { inside };
             let index = row * stride + column;
             if !keep {
@@ -73,8 +74,7 @@ pub(crate) fn mask_plane_with_vector_clip(
     if inverse {
         return Some(masked);
     }
-    crop_plane_to_bitmap_bounds(masked, min_x, min_y, max_x, max_y, 4, 2, 12, 14)
-        .map(|plane| pad_plane_transparent(plane, 4, 1, 0, 13))
+    crop_plane_to_bitmap_bounds(masked, min_x, min_y, max_x, max_y, 0, 0, 0, 0)
 }
 
 pub(crate) fn drawing_pixel_coverage(x: i32, y: i32, polygons: &[Vec<Point>]) -> u8 {
@@ -94,6 +94,10 @@ pub(crate) fn drawing_pixel_coverage(x: i32, y: i32, polygons: &[Vec<Point>]) ->
     }
 }
 
+/// libass rasterizes drawings (and vector clips) with its standard
+/// nonzero-winding rasterizer (ass_rasterizer.c get_fill_flags: solid when
+/// the winding count is non-zero); holes require opposite-direction
+/// subpaths, not even-odd alternation.
 pub(crate) fn point_in_drawing_polygons_at(
     sample_x: f64,
     sample_y: f64,
@@ -101,22 +105,17 @@ pub(crate) fn point_in_drawing_polygons_at(
 ) -> bool {
     polygons
         .iter()
-        .filter(|polygon| point_in_polygon_at(sample_x, sample_y, polygon))
-        .count()
-        % 2
-        == 1
+        .map(|polygon| polygon_winding_at(sample_x, sample_y, polygon))
+        .sum::<i32>()
+        != 0
 }
 
-pub(crate) fn point_in_polygon(x: i32, y: i32, polygon: &[Point]) -> bool {
-    point_in_polygon_at(x as f64 + 0.5, y as f64 + 0.5, polygon)
-}
-
-pub(crate) fn point_in_polygon_at(sample_x: f64, sample_y: f64, polygon: &[Point]) -> bool {
+pub(crate) fn polygon_winding_at(sample_x: f64, sample_y: f64, polygon: &[Point]) -> i32 {
     if polygon.len() < 3 {
-        return false;
+        return 0;
     }
 
-    let mut inside = false;
+    let mut winding = 0;
     let mut previous = polygon[polygon.len() - 1];
 
     for &current in polygon {
@@ -130,13 +129,13 @@ pub(crate) fn point_in_polygon_at(sample_x: f64, sample_y: f64, polygon: &[Point
                 / (previous_y - current_y)
                 + current_x;
             if sample_x < x_intersection {
-                inside = !inside;
+                winding += if current_y > previous_y { 1 } else { -1 };
             }
         }
         previous = current;
     }
 
-    inside
+    winding
 }
 
 pub(crate) fn clip_plane(plane: ImagePlane, clip_rect: Rect) -> Option<ImagePlane> {

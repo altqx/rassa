@@ -3157,23 +3157,38 @@ fn render_frame_renders_drawing_plane() {
 }
 
 #[test]
-fn render_frame_renders_drawing_holes_with_even_odd_fill() {
-    let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\p1}m 0 0 l 20 0 20 20 0 20 m 5 5 l 15 5 15 15 5 15").expect("script should parse");
+fn render_frame_renders_drawing_holes_with_nonzero_winding() {
+    // libass rasterizes drawings with its nonzero-winding rasterizer
+    // (ass_rasterizer.c): nested same-direction squares fill solid, while an
+    // opposite-direction inner square punches a hole.
+    let script = |inner: &str| {
+        format!("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(10,10)\\p1}}m 0 0 l 20 0 20 20 0 20 {inner}")
+    };
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider(&track, &provider, 500);
-    let plane = planes
-        .iter()
-        .find(|plane| plane.kind == ass::ImageType::Character)
-        .expect("drawing plane");
-    let center_x = 10 - (plane.destination.x - 10);
-    let center_y = 10 - (plane.destination.y - 10);
+    let center_alpha = |script_text: &str| {
+        let track = parse_script_text(script_text).expect("drawing script parses");
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let plane = planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Character)
+            .expect("drawing plane")
+            .clone();
+        let local_x = 20 - plane.destination.x;
+        let local_y = 20 - plane.destination.y;
+        plane.bitmap[local_y as usize * plane.stride as usize + local_x as usize]
+    };
+
+    let same_direction = center_alpha(&script("m 5 5 l 15 5 15 15 5 15"));
     assert_eq!(
-        plane.bitmap[center_y as usize * plane.stride as usize + center_x as usize],
-        0,
-        "nested drawing contours should punch libass-like hollow holes instead of union-filling"
+        same_direction, 255,
+        "same-direction nested squares fill solid under nonzero winding"
     );
-    assert!(plane.bitmap.contains(&255));
+    let opposite_direction = center_alpha(&script("m 5 5 l 5 15 15 15 15 5"));
+    assert_eq!(
+        opposite_direction, 0,
+        "an opposite-direction inner square leaves a hole under nonzero winding"
+    );
 }
 
 #[test]
