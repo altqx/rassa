@@ -2881,7 +2881,11 @@ fn render_frame_applies_full_fade_alpha() {
 
 #[test]
 fn render_frame_switches_karaoke_fill_after_elapsed_span() {
-    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k50}Ka").expect("script should parse");
+    // libass ass_parse.c process_karaoke_effects: \k sets tm_end = tm_start,
+    // so a syllable turns primary at its START.  At 200ms the first \k50
+    // syllable (start 0) is already primary while the second (start 500ms)
+    // is still secondary; at 700ms both are primary.
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k50}Ka{\\k50}ra").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
     let early_planes = engine.render_frame_with_provider(&track, &provider, 200);
@@ -2890,12 +2894,20 @@ fn render_frame_switches_karaoke_fill_after_elapsed_span() {
     assert!(
         early_planes
             .iter()
-            .any(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x6655_4400)
+            .any(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x3322_1100),
+        "an active \\k syllable is primary from its start time"
+    );
+    assert!(
+        early_planes
+            .iter()
+            .any(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x6655_4400),
+        "an upcoming \\k syllable stays secondary until it starts"
     );
     assert!(
         late_planes
             .iter()
-            .any(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x3322_1100)
+            .all(|plane| plane.kind != ass::ImageType::Character || plane.color.0 == 0x3322_1100),
+        "all syllables are primary once started"
     );
 }
 
@@ -2919,22 +2931,78 @@ fn render_frame_sweeps_karaoke_fill_during_active_span() {
 }
 
 #[test]
+fn render_frame_reverses_kf_sweep_for_flipped_rotation() {
+    // libass ass_parse.c process_karaoke_effects: when fmod(\\frz, 360) lies
+    // in (90, 270), \\kf fills right-to-left with swapped colors in glyph
+    // space, so after the 180-degree rotation the sweep still appears
+    // left-to-right on screen.  Without the reversal the flipped sweep would
+    // appear right-to-left.
+    let script = |frz: &str| {
+        format!("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{{\\an5\\pos(120,50){frz}\\kf100}}Kara")
+    };
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let half_centers = |script_text: &str| {
+        let track = parse_script_text(script_text).expect("kf script should parse");
+        let planes = engine.render_frame_with_provider(&track, &provider, 500);
+        let center = |color: u32| {
+            let rects = planes
+                .iter()
+                .filter(|plane| {
+                    plane.kind == ass::ImageType::Character && plane.color.0 == color
+                })
+                .filter_map(plane_ink_bounds)
+                .collect::<Vec<_>>();
+            let min = rects.iter().map(|rect| rect.x_min).min()?;
+            let max = rects.iter().map(|rect| rect.x_max).max()?;
+            Some((min + max) / 2)
+        };
+        (center(0x3322_1100), center(0x6655_4400))
+    };
+
+    let (upright_primary, upright_secondary) = half_centers(&script(""));
+    assert!(
+        upright_primary.expect("upright primary half")
+            < upright_secondary.expect("upright secondary half"),
+        "an upright \\kf fills left-to-right at the midpoint"
+    );
+
+    let (flipped_primary, flipped_secondary) = half_centers(&script("\\frz180"));
+    assert!(
+        flipped_primary.expect("flipped primary half")
+            < flipped_secondary.expect("flipped secondary half"),
+        "the \\frz180 \\kf sweep still appears left-to-right on screen thanks to the libass right-to-left reversal"
+    );
+}
+
+#[test]
 fn render_frame_hides_outline_for_ko_until_span_ends() {
-    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H000A0B0C,&H00000000,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\ko50}Ko").expect("script should parse");
+    // libass render_text: a \ko outline is skipped only while
+    // effect_timing <= 0, i.e. before the syllable starts.  The first \ko50
+    // syllable's outline is visible from t=0; the second (start 500ms) has
+    // no outline at 200ms and gains it at 700ms.
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H000A0B0C,&H00000000,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\ko50}Ko{\\ko50}ra").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
     let early_planes = engine.render_frame_with_provider(&track, &provider, 200);
     let late_planes = engine.render_frame_with_provider(&track, &provider, 700);
 
-    assert!(
-        !early_planes
+    let outline_ink_width = |planes: &[ImagePlane]| {
+        planes
             .iter()
-            .any(|plane| plane.kind == ass::ImageType::Outline)
+            .filter(|plane| plane.kind == ass::ImageType::Outline)
+            .filter_map(|plane| plane_ink_bounds(plane))
+            .fold(0, |acc, rect| acc + rect.width())
+    };
+    let early_width = outline_ink_width(&early_planes);
+    let late_width = outline_ink_width(&late_planes);
+    assert!(
+        early_width > 0,
+        "a started \\ko syllable keeps its outline from t=0"
     );
     assert!(
-        late_planes
-            .iter()
-            .any(|plane| plane.kind == ass::ImageType::Outline)
+        late_width > early_width,
+        "the second \\ko syllable's outline appears once it starts: early={early_width} late={late_width}"
     );
 }
 

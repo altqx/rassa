@@ -169,7 +169,9 @@ pub(crate) fn resolve_run_fill_color(
         return style.primary_colour;
     };
     let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
-    if elapsed >= karaoke.start_ms + karaoke.duration_ms {
+    // libass ass_parse.c process_karaoke_effects: for \k and \ko,
+    // tm_end = tm_start, so the fill switches to primary at syllable START.
+    if elapsed >= karaoke.start_ms {
         style.primary_colour
     } else {
         style.secondary_colour
@@ -191,7 +193,9 @@ pub(crate) fn karaoke_hides_outline(
         return false;
     };
     let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
-    elapsed < karaoke.start_ms + karaoke.duration_ms
+    // libass render_text skips the outline only while effect_timing <= 0,
+    // i.e. before the syllable starts (ass_render.c).
+    elapsed < karaoke.start_ms
 }
 
 pub(crate) fn apply_karaoke_to_character_planes(
@@ -212,10 +216,12 @@ pub(crate) fn apply_karaoke_to_character_planes(
     let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
     let relative = elapsed - karaoke.start_ms;
     match karaoke.mode {
+        // \k and \ko: libass sets tm_end = tm_start, so the whole syllable
+        // is primary from its start time onward.
         ParsedKaraokeMode::FillSwap | ParsedKaraokeMode::OutlineToggle => planes
             .into_iter()
             .map(|mut plane| {
-                plane.color = rgba_color_from_ass(if relative >= karaoke.duration_ms {
+                plane.color = rgba_color_from_ass(if relative >= 0 {
                     style.primary_colour
                 } else {
                     style.secondary_colour
@@ -224,11 +230,21 @@ pub(crate) fn apply_karaoke_to_character_planes(
             })
             .collect(),
         ParsedKaraokeMode::Sweep => {
+            // libass process_karaoke_effects: when fmod(frz, 360) lies in
+            // (90, 270) the fill sweeps right-to-left with swapped colors.
+            // C fmod keeps the sign of frz, so negative angles never reverse.
+            let frz = style.rotation_z % 360.0;
+            let reversed = frz > 90.0 && frz < 270.0;
+            let (filled_colour, pending_colour) = if reversed {
+                (style.secondary_colour, style.primary_colour)
+            } else {
+                (style.primary_colour, style.secondary_colour)
+            };
             if relative <= 0 {
                 return planes
                     .into_iter()
                     .map(|mut plane| {
-                        plane.color = rgba_color_from_ass(style.secondary_colour);
+                        plane.color = rgba_color_from_ass(pending_colour);
                         plane
                     })
                     .collect();
@@ -237,26 +253,29 @@ pub(crate) fn apply_karaoke_to_character_planes(
                 return planes
                     .into_iter()
                     .map(|mut plane| {
-                        plane.color = rgba_color_from_ass(style.primary_colour);
+                        plane.color = rgba_color_from_ass(filled_colour);
                         plane
                     })
                     .collect();
             }
 
-            let progress = f64::from(relative) / f64::from(karaoke.duration_ms.max(1));
+            let mut progress = f64::from(relative) / f64::from(karaoke.duration_ms.max(1));
+            if reversed {
+                progress = 1.0 - progress;
+            }
             let split_x = run_origin_x + (f64::from(run_width.max(0)) * progress).round() as i32;
             let mut result = Vec::new();
             for plane in planes {
                 if let Some(mut left) =
                     clip_plane_horizontally(&plane, plane.destination.x, split_x)
                 {
-                    left.color = rgba_color_from_ass(style.primary_colour);
+                    left.color = rgba_color_from_ass(filled_colour);
                     result.push(left);
                 }
                 if let Some(mut right) =
                     clip_plane_horizontally(&plane, split_x, plane.destination.x + plane.size.width)
                 {
-                    right.color = rgba_color_from_ass(style.secondary_colour);
+                    right.color = rgba_color_from_ass(pending_colour);
                     result.push(right);
                 }
             }
