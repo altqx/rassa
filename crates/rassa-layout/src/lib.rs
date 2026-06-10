@@ -497,7 +497,7 @@ fn wrap_layout_line(
                 last_break_pos = None;
             }
         }
-        if current.last().map(|piece| piece_breakable(piece)).unwrap_or(false) {
+        if current.last().map(&piece_breakable).unwrap_or(false) {
             last_break_pos = Some(current.len());
         }
     }
@@ -673,19 +673,6 @@ fn trim_wrapped_line_edges(pieces: &mut Vec<LayoutPiece>, trim_leading: bool) {
 
 fn pieces_width(pieces: &[LayoutPiece]) -> f32 {
     pieces.iter().map(|piece| piece.width).sum()
-}
-
-fn last_allowed_break_pos(
-    pieces: &[LayoutPiece],
-    breaks: &[LineBreakOpportunity],
-) -> Option<usize> {
-    pieces.iter().enumerate().rev().find_map(|(index, piece)| {
-        matches!(
-            breaks.get(piece.char_index),
-            Some(LineBreakOpportunity::Allowed | LineBreakOpportunity::Mandatory)
-        )
-        .then_some(index + 1)
-    })
 }
 
 fn line_from_pieces(source: &LayoutLine, pieces: &[LayoutPiece]) -> LayoutLine {

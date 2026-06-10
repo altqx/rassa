@@ -229,50 +229,6 @@ pub(crate) fn crop_plane_to_bitmap_bounds(
     )
 }
 
-pub(crate) fn pad_plane_transparent(
-    plane: ImagePlane,
-    pad_left: i32,
-    pad_top: i32,
-    pad_right: i32,
-    pad_bottom: i32,
-) -> ImagePlane {
-    let pad_left = pad_left.max(0);
-    let pad_top = pad_top.max(0);
-    let pad_right = pad_right.max(0);
-    let pad_bottom = pad_bottom.max(0);
-    if pad_left == 0 && pad_top == 0 && pad_right == 0 && pad_bottom == 0 {
-        return plane;
-    }
-
-    let width = plane.size.width.max(0);
-    let height = plane.size.height.max(0);
-    let new_width = width + pad_left + pad_right;
-    let new_height = height + pad_top + pad_bottom;
-    let mut bitmap = vec![0_u8; (new_width * new_height).max(0) as usize];
-    let src_stride = plane.stride.max(0) as usize;
-    let dst_stride = new_width.max(0) as usize;
-    for row in 0..height as usize {
-        let src_start = row * src_stride;
-        let dst_start = (row + pad_top as usize) * dst_stride + pad_left as usize;
-        bitmap[dst_start..dst_start + width as usize]
-            .copy_from_slice(&plane.bitmap[src_start..src_start + width as usize]);
-    }
-
-    ImagePlane {
-        size: Size {
-            width: new_width,
-            height: new_height,
-        },
-        stride: new_width,
-        destination: Point {
-            x: plane.destination.x - pad_left,
-            y: plane.destination.y - pad_top,
-        },
-        bitmap,
-        ..plane
-    }
-}
-
 pub(crate) fn crop_plane_to_rect(plane: ImagePlane, rect: Rect) -> Option<ImagePlane> {
     let plane_rect = plane_rect(&plane);
     let rect = plane_rect.intersect(rect)?;
