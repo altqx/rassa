@@ -133,7 +133,10 @@ pub(crate) fn resolve_animated_clip_rect(
         f64::from(base.y_max),
     ];
     for transform in animated {
-        let target = transform.style.clip_rect.expect("filtered to clip transforms");
+        let target = transform
+            .style
+            .clip_rect
+            .expect("filtered to clip transforms");
         let start_ms = transform.start_ms.max(0);
         let end_ms = transform
             .end_ms

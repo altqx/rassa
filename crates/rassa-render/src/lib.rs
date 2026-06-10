@@ -331,19 +331,16 @@ impl RenderEngine {
                         // libass places a drawing's ink box so its bottom sits
                         // at baseline + pbo (drawing asc = height - pbo,
                         // desc = pbo); the plane top is baseline - height + pbo.
-                        let drawing_scale_y = style_scale(effective_style.scale_y)
-                            * style_scale(render_scale_y);
+                        let drawing_scale_y =
+                            style_scale(effective_style.scale_y) * style_scale(render_scale_y);
                         let drawing_height = drawing
                             .bounds()
-                            .map(|bounds| {
-                                f64::from((bounds.height() - 1).max(0)) * drawing_scale_y
-                            })
+                            .map(|bounds| f64::from((bounds.height() - 1).max(0)) * drawing_scale_y)
                             .unwrap_or_default();
                         let baseline = line_top + line_ascender;
                         let drawing_top = baseline - drawing_height.round() as i32;
-                        let pbo_script =
-                            drawing_pbo_script_pixels(&effective_style, drawing)
-                                * style_scale(effective_style.scale_y);
+                        let pbo_script = drawing_pbo_script_pixels(&effective_style, drawing)
+                            * style_scale(effective_style.scale_y);
                         if let Some(mut plane) = image_plane_from_drawing(
                             drawing,
                             DrawingPlaneParams {
@@ -373,8 +370,7 @@ impl RenderEngine {
                             if drawing_fill_blur > 0 {
                                 plane = blur_image_plane(plane, drawing_fill_blur);
                             }
-                            if effective_style.border_x > 0.0 || effective_style.border_y > 0.0
-                            {
+                            if effective_style.border_x > 0.0 || effective_style.border_y > 0.0 {
                                 let outline_glyph = plane_to_raster_glyph(&plane);
                                 let rasterizer = Rasterizer::with_options(RasterOptions {
                                     size_26_6: 64,
@@ -392,8 +388,7 @@ impl RenderEngine {
                                     radius_for(effective_style.border_x),
                                     radius_for(effective_style.border_y),
                                 );
-                                let drawing_blur =
-                                    effective_blur_strength(&effective_style);
+                                let drawing_blur = effective_blur_strength(&effective_style);
                                 if drawing_blur > 0.0 {
                                     outline_glyphs = rasterizer.blur_glyphs(
                                         &outline_glyphs,
@@ -418,8 +413,7 @@ impl RenderEngine {
                                 let mut shadow_glyph = plane_to_raster_glyph(
                                     character_planes.last().expect("drawing plane"),
                                 );
-                                let drawing_blur =
-                                    effective_blur_strength(&effective_style);
+                                let drawing_blur = effective_blur_strength(&effective_style);
                                 if drawing_blur > 0.0 {
                                     shadow_glyph = rasterizer
                                         .blur_glyphs(
@@ -466,8 +460,9 @@ impl RenderEngine {
                         );
                         // run.width already includes \fscx (layout applies the
                         // style scale when measuring the drawing).
-                        let drawing_advance_26_6 =
-                            (f64::from(run.width) * render_scale_x * 64.0).round().max(0.0) as i32;
+                        let drawing_advance_26_6 = (f64::from(run.width) * render_scale_x * 64.0)
+                            .round()
+                            .max(0.0) as i32;
                         line_pen_x_26_6 += drawing_advance_26_6;
                         continue;
                     }
@@ -482,8 +477,11 @@ impl RenderEngine {
                         line_pen_x_26_6 += (run.width * 64.0).round() as i32;
                         continue;
                     };
-                    let raster_glyphs =
-                        apply_vertical_font_raster_advances(raster_glyphs, &effective_style, &run.font);
+                    let raster_glyphs = apply_vertical_font_raster_advances(
+                        raster_glyphs,
+                        &effective_style,
+                        &run.font,
+                    );
                     let raster_glyphs = scale_raster_glyphs(
                         raster_glyphs,
                         effective_style.scale_x,
@@ -745,8 +743,7 @@ impl RenderEngine {
             // libass combines bitmaps of the same type and color within an
             // event (render_and_combine_glyphs); merge unconditionally.
             event_planes = merge_compatible_event_planes(event_planes);
-            if let Some(clip_rect) =
-                resolve_animated_clip_rect(event, track, source_event, now_ms)
+            if let Some(clip_rect) = resolve_animated_clip_rect(event, track, source_event, now_ms)
             {
                 let clip_rect = scale_clip_rect(clip_rect, &mapping);
                 let clip_rect = if event.inverse_clip {

@@ -189,9 +189,23 @@ pub(crate) fn event_mapping(
     let content_h = f64::from(track.play_res_y.max(1)) * style_scale(scale_y);
     // libass ass_reconfigure: aspect-fit the content into the full frame.
     let (fit_w, fit_h) = if content_w * frame_h >= content_h * frame_w {
-        (frame_w, if content_w > 0.0 { content_h * frame_w / content_w } else { frame_h })
+        (
+            frame_w,
+            if content_w > 0.0 {
+                content_h * frame_w / content_w
+            } else {
+                frame_h
+            },
+        )
     } else {
-        (if content_h > 0.0 { content_w * frame_h / content_h } else { frame_w }, frame_h)
+        (
+            if content_h > 0.0 {
+                content_w * frame_h / content_h
+            } else {
+                frame_w
+            },
+            frame_h,
+        )
     };
     EventMapping {
         explicit,

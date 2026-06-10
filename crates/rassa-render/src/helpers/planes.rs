@@ -292,16 +292,12 @@ pub(crate) fn compute_vertical_layout(
     } else {
         match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
             ass::VALIGN_TOP => mapping.y_top(f64::from(margin_v)),
-            ass::VALIGN_CENTER => {
-                mapping.y_center(f64::from(track.play_res_y) / 2.0) - total / 2.0
-            }
+            ass::VALIGN_CENTER => mapping.y_center(f64::from(track.play_res_y) / 2.0) - total / 2.0,
             _ => {
-                let scr_bottom =
-                    mapping.y_sub(f64::from(track.play_res_y) - f64::from(margin_v));
+                let scr_bottom = mapping.y_sub(f64::from(track.play_res_y) - f64::from(margin_v));
                 let scr_top = mapping.y_top(0.0);
                 let line_position = config.line_position.clamp(0.0, 100.0);
-                let mut top =
-                    scr_bottom + (scr_top - scr_bottom) * line_position / 100.0 - total;
+                let mut top = scr_bottom + (scr_top - scr_bottom) * line_position / 100.0 - total;
                 // libass clips to the top edge when line_position pushes the
                 // subtitle off-screen, but never otherwise.
                 if top < scr_top && line_position > 0.0 {
@@ -394,7 +390,8 @@ pub(crate) fn fix_collisions(
         let Some(cached) = cache.get(&record.event_index).copied() else {
             continue;
         };
-        if cached.height() != bounds.height() || used.iter().any(|rect| rects_overlap(cached, *rect))
+        if cached.height() != bounds.height()
+            || used.iter().any(|rect| rects_overlap(cached, *rect))
         {
             cache.remove(&record.event_index);
             continue;
@@ -585,4 +582,3 @@ pub(crate) fn combined_image_plane_from_glyphs(
         bitmap,
     })
 }
-

@@ -1,5 +1,7 @@
 use super::*;
-use rassa_fonts::{FontProvider, FontProviderKind, FontQuery, FontconfigProvider, NullFontProvider};
+use rassa_fonts::{
+    FontProvider, FontProviderKind, FontQuery, FontconfigProvider, NullFontProvider,
+};
 use rassa_parse::parse_script_text;
 
 fn config(
@@ -1628,8 +1630,8 @@ fn render_frame_renders_underline_and_strikeout_decorations() {
                     continue;
                 }
                 let stride = plane.stride as usize;
-                let row_pixels = &plane.bitmap
-                    [local_y as usize * stride..local_y as usize * stride + plane.size.width as usize];
+                let row_pixels = &plane.bitmap[local_y as usize * stride
+                    ..local_y as usize * stride + plane.size.width as usize];
                 covered += row_pixels.iter().filter(|value| **value > 0).count() as i32;
             }
             covered >= ink.width() * 9 / 10
@@ -1724,7 +1726,9 @@ fn render_frame_applies_anisotropic_borders() {
     // libass strokes borders with independent x/y radii: \xbord4\ybord0
     // grows ink horizontally only (ass_outline stroker / get_outline_glyph).
     let script = |bord: &str| {
-        format!("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00010203,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(40,40){bord}}}Hi")
+        format!(
+            "[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00010203,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(40,40){bord}}}Hi"
+        )
     };
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -1743,10 +1747,9 @@ fn render_frame_applies_anisotropic_borders() {
             })
     };
 
-    let fill = bounds(&script("\\xbord4\\ybord0"), ass::ImageType::Character)
-        .expect("fill ink");
-    let outline = bounds(&script("\\xbord4\\ybord0"), ass::ImageType::Outline)
-        .expect("outline ink");
+    let fill = bounds(&script("\\xbord4\\ybord0"), ass::ImageType::Character).expect("fill ink");
+    let outline =
+        bounds(&script("\\xbord4\\ybord0"), ass::ImageType::Outline).expect("outline ink");
     assert!(
         (outline.width() - (fill.width() + 8)).abs() <= 1,
         "\\xbord4 grows outline ink 4px per horizontal side: fill={fill:?} outline={outline:?}"
@@ -1756,10 +1759,10 @@ fn render_frame_applies_anisotropic_borders() {
         "\\ybord0 must not grow outline ink vertically: fill={fill:?} outline={outline:?}"
     );
 
-    let outline_v = bounds(&script("\\xbord0\\ybord4"), ass::ImageType::Outline)
-        .expect("vertical outline ink");
-    let fill_v = bounds(&script("\\xbord0\\ybord4"), ass::ImageType::Character)
-        .expect("vertical fill ink");
+    let outline_v =
+        bounds(&script("\\xbord0\\ybord4"), ass::ImageType::Outline).expect("vertical outline ink");
+    let fill_v =
+        bounds(&script("\\xbord0\\ybord4"), ass::ImageType::Character).expect("vertical fill ink");
     assert!(
         (outline_v.height() - (fill_v.height() + 8)).abs() <= 1,
         "\\ybord4 grows outline ink 4px per vertical side: fill={fill_v:?} outline={outline_v:?}"
@@ -1776,7 +1779,9 @@ fn render_frame_distinguishes_be_from_blur() {
     // is a gaussian of the given radius; \be1 must be visibly weaker than
     // \blur1 and the two combine when both are present.
     let script = |blur_tag: &str| {
-        format!("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(60,40){blur_tag}}}Hi")
+        format!(
+            "[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(60,40){blur_tag}}}Hi"
+        )
     };
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -1811,9 +1816,7 @@ fn render_frame_emits_background_box_for_border_style_4() {
     let provider = FontconfigProvider::new();
     let planes = engine.render_frame_with_provider(&track, &provider, 500);
 
-    let background = planes
-        .first()
-        .expect("BorderStyle 4 event renders planes");
+    let background = planes.first().expect("BorderStyle 4 event renders planes");
     assert_eq!(
         background.color.0, 0x1111_1100,
         "the background box is drawn first in the back colour"
@@ -2056,7 +2059,9 @@ fn render_frame_interpolates_animated_clip_rect() {
     let provider = FontconfigProvider::new();
     let width_at = |now_ms: i64| {
         let planes = engine.render_frame_with_provider(&track, &provider, now_ms);
-        visible_bounds(&planes).map(|rect| rect.width()).unwrap_or(0)
+        visible_bounds(&planes)
+            .map(|rect| rect.width())
+            .unwrap_or(0)
     };
 
     let start = width_at(10);
@@ -2195,7 +2200,9 @@ fn render_frame_remaps_events_into_full_frame_when_margins_used() {
     // a positioned event still maps onto the content area offset by the
     // margins.
     let script = |text: &str| {
-        format!("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{text}")
+        format!(
+            "[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{text}"
+        )
     };
     let margin_config = config(
         100,
@@ -2443,10 +2450,7 @@ fn render_frame_applies_drawing_baseline_offset() {
     let shifted_drawing = drawing_plane(&pbo_track("\\pbo12"));
     let negative_drawing = drawing_plane(&pbo_track("\\pbo-12"));
 
-    assert_eq!(
-        pbo5_drawing.destination.x,
-        baseline_drawing.destination.x
-    );
+    assert_eq!(pbo5_drawing.destination.x, baseline_drawing.destination.x);
     assert_eq!(
         pbo5_drawing.destination.y,
         baseline_drawing.destination.y + 5,
@@ -2793,9 +2797,7 @@ fn collision_positions_stay_stable_across_frames_like_libass() {
     let second_y = |planes: &[ImagePlane]| {
         planes
             .iter()
-            .filter(|plane| {
-                plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000
-            })
+            .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
             .map(|plane| plane.destination.y)
             .min()
             .expect("second event plane")
@@ -3161,7 +3163,9 @@ fn render_frame_reverses_kf_sweep_for_flipped_rotation() {
     // left-to-right on screen.  Without the reversal the flipped sweep would
     // appear right-to-left.
     let script = |frz: &str| {
-        format!("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{{\\an5\\pos(120,50){frz}\\kf100}}Kara")
+        format!(
+            "[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{{\\an5\\pos(120,50){frz}\\kf100}}Kara"
+        )
     };
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -3171,9 +3175,7 @@ fn render_frame_reverses_kf_sweep_for_flipped_rotation() {
         let center = |color: u32| {
             let rects = planes
                 .iter()
-                .filter(|plane| {
-                    plane.kind == ass::ImageType::Character && plane.color.0 == color
-                })
+                .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == color)
                 .filter_map(plane_ink_bounds)
                 .collect::<Vec<_>>();
             let min = rects.iter().map(|rect| rect.x_min).min()?;
@@ -3280,9 +3282,21 @@ fn blurred_vector_drawing_expands_fill_plane_like_libass() {
     let plane = &planes[0];
     // \blur6 pads the plane by the blur kernel; per-point polygon scaling can
     // round the unblurred extent by a pixel or two vs libass.
-    assert!((plane.destination.y - 650).abs() <= 4, "y={}", plane.destination.y);
-    assert!((plane.size.width - 788).abs() <= 4, "width={}", plane.size.width);
-    assert!((plane.size.height - 372).abs() <= 4, "height={}", plane.size.height);
+    assert!(
+        (plane.destination.y - 650).abs() <= 4,
+        "y={}",
+        plane.destination.y
+    );
+    assert!(
+        (plane.size.width - 788).abs() <= 4,
+        "width={}",
+        plane.size.width
+    );
+    assert!(
+        (plane.size.height - 372).abs() <= 4,
+        "height={}",
+        plane.size.height
+    );
 }
 
 #[test]
@@ -3312,7 +3326,9 @@ fn render_frame_renders_drawing_holes_with_nonzero_winding() {
     // (ass_rasterizer.c): nested same-direction squares fill solid, while an
     // opposite-direction inner square punches a hole.
     let script = |inner: &str| {
-        format!("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(10,10)\\p1}}m 0 0 l 20 0 20 20 0 20 {inner}")
+        format!(
+            "[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(10,10)\\p1}}m 0 0 l 20 0 20 20 0 20 {inner}"
+        )
     };
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -3465,4 +3481,3 @@ fn render_frame_applies_timed_transform_style() {
     assert_ne!(start_fill, end_fill);
     assert!(total_plane_area(&end_planes) > total_plane_area(&start_planes));
 }
-

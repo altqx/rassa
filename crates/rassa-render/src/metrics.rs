@@ -72,11 +72,8 @@ fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> L
             size_26_6,
             hinting: context.config.hinting,
         });
-        let glyph_infos = scale_glyph_infos(
-            &run.glyphs,
-            context.render_scale.x,
-            context.render_scale.y,
-        );
+        let glyph_infos =
+            scale_glyph_infos(&run.glyphs, context.render_scale.x, context.render_scale.y);
         if let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) {
             ink_ascender = raster_glyphs
                 .iter()
@@ -221,7 +218,8 @@ pub(crate) fn rendered_text_alignment_width(
             width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
             continue;
         };
-        let raster_glyphs = apply_vertical_font_raster_advances(raster_glyphs, &effective_style, &run.font);
+        let raster_glyphs =
+            apply_vertical_font_raster_advances(raster_glyphs, &effective_style, &run.font);
         let raster_glyphs = scale_raster_glyphs(
             raster_glyphs,
             effective_style.scale_x,
