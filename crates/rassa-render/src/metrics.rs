@@ -11,6 +11,9 @@ pub(crate) struct FontVerticalMetrics {
     /// Strikeout (top offset relative baseline, negative above, thickness)
     /// from OS/2 yStrikeoutPosition/ySize.
     pub(crate) strikeout_26_6: Option<(i32, i32)>,
+    /// OS/2 sTypoDescender scaled (negative below baseline); libass uses it
+    /// to offset rotated @font glyphs (DECO_ROTATE), 0 without an OS/2 table.
+    pub(crate) typo_descender_26_6: i32,
 }
 
 /// Per-line ascent/descent in device pixels, mirroring libass
@@ -218,7 +221,7 @@ pub(crate) fn rendered_text_alignment_width(
             width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
             continue;
         };
-        let raster_glyphs = apply_vertical_font_raster_advances(raster_glyphs, &effective_style);
+        let raster_glyphs = apply_vertical_font_raster_advances(raster_glyphs, &effective_style, &run.font);
         let raster_glyphs = scale_raster_glyphs(
             raster_glyphs,
             effective_style.scale_x,
@@ -271,12 +274,17 @@ pub(crate) fn font_vertical_metrics(
             let size = scale(os2.yStrikeoutSize.into());
             (-pos - size / 2, size)
         });
+    let typo_descender = (!os2.is_null())
+        .then(|| unsafe { &*os2 })
+        .map(|os2| scale(os2.sTypoDescender.into()))
+        .unwrap_or(0);
 
     Some(FontVerticalMetrics {
         ascender_26_6: ascender,
         descender_26_6: descender,
         underline_26_6: underline,
         strikeout_26_6: strikeout,
+        typo_descender_26_6: typo_descender,
     })
 }
 

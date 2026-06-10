@@ -1,5 +1,5 @@
 use super::*;
-use rassa_fonts::{FontProvider, FontQuery, FontconfigProvider, NullFontProvider};
+use rassa_fonts::{FontProvider, FontProviderKind, FontQuery, FontconfigProvider, NullFontProvider};
 use rassa_parse::parse_script_text;
 
 fn config(
@@ -3201,10 +3201,17 @@ fn render_frame_hides_outline_for_ko_until_span_ends() {
 
 #[test]
 fn vertical_font_raster_advances_rotate_bitmap_like_libass_vertical_faces() {
+    // libass DECO_ROTATE (ass_get_glyph_outline + ass_outline_rotate_90):
+    // point (x, y) -> (offs.x + y, offs.y - x), offs = (vertAdvance +
+    // typoDescender, -typoDescender).  Without face metrics (unresolved
+    // font), typoDescender = 0 and vertAdvance falls back to the font size,
+    // so left' = fs + top - height = 50 + 9 - 3 = 56, top' = -left = -4.
     let glyph = RasterGlyph {
         width: 2,
         height: 3,
         stride: 2,
+        left: 4,
+        top: 9,
         offset_x: 1,
         offset_y: 2,
         advance_x: 7,
@@ -3216,18 +3223,20 @@ fn vertical_font_raster_advances_rotate_bitmap_like_libass_vertical_faces() {
         font_size: 50.0,
         ..ParsedSpanStyle::default()
     };
+    let font = FontMatch::unresolved("Vertical", None, FontProviderKind::Null);
 
-    let glyphs = apply_vertical_font_raster_advances(vec![glyph], &style);
+    let glyphs = apply_vertical_font_raster_advances(vec![glyph], &style, &font);
     let rotated = &glyphs[0];
 
     assert_eq!(rotated.width, 3);
     assert_eq!(rotated.height, 2);
     assert_eq!(rotated.stride, 3);
     assert_eq!(rotated.bitmap, vec![5, 3, 1, 6, 4, 2]);
-    assert_eq!(rotated.offset_x, 13);
-    assert_eq!(rotated.offset_y, 20);
+    assert_eq!(rotated.left, 56);
+    assert_eq!(rotated.top, -4);
     assert_eq!(rotated.advance_x, 50);
     assert_eq!(rotated.advance_y, 0);
+    assert_eq!(rotated.advance_x_26_6, 50 * 64);
 }
 
 #[test]

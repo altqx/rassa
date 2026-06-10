@@ -269,23 +269,42 @@ pub(crate) fn scale_glyph_infos(
         .collect()
 }
 
+/// Rotate @font glyphs the way libass does (ass_get_glyph_outline with
+/// DECO_ROTATE + ass_outline_rotate_90): the outline point (x, y) maps to
+/// (offs.x + y, offs.y - x) with offs = (vertAdvance + typoDescender,
+/// -typoDescender), and the advance becomes the vertical advance.  In
+/// bitmap terms (left L, top T, height H) the rotated glyph sits at
+/// left' = offs.x + T - H, top' = offs.y - L.
 pub(crate) fn apply_vertical_font_raster_advances(
     mut glyphs: Vec<RasterGlyph>,
     style: &ParsedSpanStyle,
+    font: &FontMatch,
 ) -> Vec<RasterGlyph> {
     if !style.font_name.starts_with('@') {
         return glyphs;
     }
-    let advance = style.font_size.round().max(1.0) as i32;
-    let vertical_origin_shift = (style.font_size * 0.35).round() as i32;
+    let size_26_6 = (style.font_size.max(1.0) * 64.0).round() as i32;
+    let typo_descender = font_vertical_metrics(font, size_26_6)
+        .map(|metrics| f64::from(metrics.typo_descender_26_6) / 64.0)
+        .unwrap_or(0.0);
     for glyph in &mut glyphs {
+        let vert_advance = if glyph.vert_advance_26_6 > 0 {
+            f64::from(glyph.vert_advance_26_6) / 64.0
+        } else {
+            style.font_size.max(1.0)
+        };
+        let offs_x = vert_advance + typo_descender;
+        let offs_y = -typo_descender;
+        let old_left = glyph.left;
+        let old_top = glyph.top;
+        let old_height = glyph.height;
         rotate_raster_glyph_clockwise(glyph);
-        glyph.offset_x += (style.font_size * 0.24).round() as i32;
-        glyph.offset_y += vertical_origin_shift;
+        glyph.left = offs_x.round() as i32 + old_top - old_height;
+        glyph.top = offs_y.round() as i32 - old_left;
         if glyph.advance_x != 0 || glyph.advance_y != 0 {
-            glyph.advance_x = advance;
+            glyph.advance_x = vert_advance.round() as i32;
             glyph.advance_y = 0;
-            glyph.advance_x_26_6 = (style.font_size.max(1.0) * 64.0).round() as i32;
+            glyph.advance_x_26_6 = (vert_advance * 64.0).round() as i32;
         }
     }
     glyphs

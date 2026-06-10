@@ -45,6 +45,9 @@ pub struct RasterGlyph {
     /// 26.6 units and floors per glyph; rounding each advance to whole pixels
     /// drifts up to half a pixel per glyph across a run.
     pub advance_x_26_6: i32,
+    /// Vertical advance in 26.6 fixed point (FT_Glyph_Metrics.vertAdvance),
+    /// used by libass for rotated @font glyphs (DECO_ROTATE).
+    pub vert_advance_26_6: i32,
     pub pixel_mode: RasterPixelMode,
     pub bitmap: Vec<u8>,
 }
@@ -227,6 +230,7 @@ impl Rasterizer {
                     advance_x: (advance.x >> 6) as i32,
                     advance_y: (advance.y >> 6) as i32,
                     advance_x_26_6: advance.x as i32,
+                    vert_advance_26_6: slot.metrics().vertAdvance as i32,
                     pixel_mode: classify_pixel_mode(&bitmap),
                     bitmap: copy_bitmap_rows(&bitmap),
                 });
@@ -360,6 +364,7 @@ fn rasterize_freetype_glyphs(
         let slot = face.glyph();
         maybe_embolden_slot(slot, font.synthetic_bold);
         let advance = slot.advance();
+        let vert_advance = slot.metrics().vertAdvance as i32;
         let rendered = render_slot_to_gray_bitmap(slot, glyph.glyph_id)?;
         let rendered = RasterGlyph {
             glyph_id: glyph.glyph_id,
@@ -374,6 +379,7 @@ fn rasterize_freetype_glyphs(
             advance_x: (advance.x >> 6) as i32,
             advance_y: (advance.y >> 6) as i32,
             advance_x_26_6: advance.x as i32,
+            vert_advance_26_6: vert_advance,
             pixel_mode: RasterPixelMode::Gray,
             bitmap: rendered.bitmap,
         };
@@ -401,6 +407,7 @@ fn glyph_from_cache(glyph: &GlyphInfo, cached: RasterGlyph) -> RasterGlyph {
         advance_x: cached.advance_x,
         advance_y: cached.advance_y,
         advance_x_26_6: cached.advance_x_26_6,
+        vert_advance_26_6: cached.vert_advance_26_6,
         ..cached
     }
 }
@@ -475,6 +482,7 @@ fn rasterize_system_glyphs(
                 advance_x: cached.advance_x,
                 advance_y: cached.advance_y,
                 advance_x_26_6: cached.advance_x_26_6,
+                vert_advance_26_6: cached.vert_advance_26_6,
                 ..cached
             });
             continue;
@@ -505,6 +513,7 @@ fn rasterize_system_glyphs(
             offset_y: (-glyph.y_offset).round() as i32,
             advance_x: rendered_advance_x(&rendered, glyph),
             advance_x_26_6: rendered_advance_x(&rendered, glyph) * 64,
+            vert_advance_26_6: 0,
             advance_y: rendered_advance_y(&rendered, glyph),
             pixel_mode,
             bitmap,

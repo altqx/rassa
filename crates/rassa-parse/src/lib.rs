@@ -3456,6 +3456,42 @@ Style: Default,Arial,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,-1,-2,-3,
     }
 
     #[test]
+    fn karaoke_word_continues_across_override_blocks() {
+        // libass karaoke words are delimited by karaoke tags only
+        // (ass_parse.c process_karaoke_effects last_boundary): a style
+        // override block without a karaoke tag does not start a new word,
+        // so both spans share the same syllable timing.
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\k50}ab{\\b1}cd", &base_style, &[]);
+
+        let spans = &parsed.lines[0].spans;
+        assert_eq!(spans.len(), 2);
+        let first = spans[0].karaoke.expect("first span carries karaoke");
+        let second = spans[1].karaoke.expect("karaoke word continues after \\b1");
+        assert_eq!(first.start_ms, 0);
+        assert_eq!(first.duration_ms, 500);
+        assert_eq!(second.start_ms, first.start_ms);
+        assert_eq!(second.duration_ms, first.duration_ms);
+    }
+
+    #[test]
+    fn karaoke_zero_duration_advances_skip_timing_like_vsfilter() {
+        // VSFilter/libass: \k123\k0 accumulates the unconsumed timing into
+        // effect_skip_timing, advancing the next word's start time.
+        let base_style = ParsedStyle::default();
+        let parsed = parse_dialogue_text("{\\k100}A{\\k0}B{\\k50}C", &base_style, &[]);
+
+        let spans = &parsed.lines[0].spans;
+        assert_eq!(spans.len(), 3);
+        let a = spans[0].karaoke.expect("A karaoke");
+        let b = spans[1].karaoke.expect("B karaoke");
+        let c = spans[2].karaoke.expect("C karaoke");
+        assert_eq!((a.start_ms, a.duration_ms), (0, 1000));
+        assert_eq!((b.start_ms, b.duration_ms), (1000, 0));
+        assert_eq!((c.start_ms, c.duration_ms), (1000, 500));
+    }
+
+    #[test]
     fn transform_clip_tag_is_not_misclassified_as_colour() {
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\t(0,100,\\clip(0,0,10,10))}Text", &base_style, &[]);

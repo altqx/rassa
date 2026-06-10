@@ -462,7 +462,7 @@ impl RenderEngine {
                         continue;
                     };
                     let raster_glyphs =
-                        apply_vertical_font_raster_advances(raster_glyphs, &effective_style);
+                        apply_vertical_font_raster_advances(raster_glyphs, &effective_style, &run.font);
                     let raster_glyphs = scale_raster_glyphs(
                         raster_glyphs,
                         effective_style.scale_x,
