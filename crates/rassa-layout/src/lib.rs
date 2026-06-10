@@ -79,6 +79,17 @@ impl LayoutEngine {
         provider: &P,
         shaping_mode: ShapingMode,
     ) -> RassaResult<LayoutEvent> {
+        self.layout_track_event_with_options(track, event_index, provider, shaping_mode, false)
+    }
+
+    pub fn layout_track_event_with_options<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        event_index: usize,
+        provider: &P,
+        shaping_mode: ShapingMode,
+        wrap_unicode: bool,
+    ) -> RassaResult<LayoutEvent> {
         let event = track
             .events
             .get(event_index)
@@ -127,7 +138,13 @@ impl LayoutEngine {
         let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment);
         // libass wrap_lines_smart wraps the whole event, treating \N as a
         // forced break; each explicit segment still auto-wraps on its own.
-        let lines = wrap_layout_lines(explicit_lines, max_width, wrap_style, &track.language)?;
+        let lines = wrap_layout_lines(
+            explicit_lines,
+            max_width,
+            wrap_style,
+            &track.language,
+            wrap_unicode,
+        )?;
 
         Ok(LayoutEvent {
             event_index,
@@ -233,6 +250,13 @@ fn layout_line_from_text<P: FontProvider>(
             span.style.font_weight,
         );
         for (chunk_text, chunk_font) in shaped_chunks {
+            // libass ass_resolve_base_direction: \fe-1 enables bidi base
+            // auto-detection; any other encoding forces an LTR base.
+            let base_direction = if span.style.encoding == -1 {
+                BidiDirection::Neutral
+            } else {
+                BidiDirection::LeftToRight
+            };
             let shaped = shaper.shape_text(
                 provider,
                 &ShapeRequest::new(&chunk_text, &chunk_font.family)
@@ -240,6 +264,7 @@ fn layout_line_from_text<P: FontProvider>(
                     .with_optional_weight(font_query_weight(span.style.font_weight))
                     .with_language(language)
                     .with_font_size(span.style.font_size as f32)
+                    .with_base_direction(base_direction)
                     .with_mode(shaping_mode),
             )?;
             for shaped_run in shaped.runs {
@@ -429,6 +454,7 @@ fn wrap_layout_lines(
     max_width: f32,
     wrap_style: i32,
     language: &str,
+    wrap_unicode: bool,
 ) -> RassaResult<Vec<LayoutLine>> {
     if wrap_style == 2 || max_width <= 0.0 || !max_width.is_finite() {
         return Ok(lines);
@@ -436,7 +462,13 @@ fn wrap_layout_lines(
 
     let mut wrapped = Vec::new();
     for line in lines {
-        wrapped.extend(wrap_layout_line(line, max_width, wrap_style, language)?);
+        wrapped.extend(wrap_layout_line(
+            line,
+            max_width,
+            wrap_style,
+            language,
+            wrap_unicode,
+        )?);
     }
     Ok(wrapped)
 }
@@ -454,12 +486,28 @@ fn wrap_layout_line(
     max_width: f32,
     wrap_style: i32,
     language: &str,
+    wrap_unicode: bool,
 ) -> RassaResult<Vec<LayoutLine>> {
     if line.width < max_width || line.text.chars().count() <= 1 {
         return Ok(vec![line]);
     }
 
-    let breaks = classify_line_breaks(&line.text, Some(language))?;
+    // libass ALLOWBREAK: with ASS_FEATURE_WRAP_UNICODE off (the default),
+    // only ASCII spaces are break opportunities.
+    let breaks = if wrap_unicode {
+        classify_line_breaks(&line.text, Some(language))?
+    } else {
+        line.text
+            .chars()
+            .map(|character| {
+                if character == ' ' {
+                    LineBreakOpportunity::Allowed
+                } else {
+                    LineBreakOpportunity::Prohibited
+                }
+            })
+            .collect()
+    };
     let pieces = line_to_pieces(&line);
     if pieces.len() <= 1 {
         return Ok(vec![line]);
@@ -1150,12 +1198,22 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
         );
         let engine = LayoutEngine::new();
         let provider = NullFontProvider;
-        let layout = engine
+        // libass only breaks inside CJK text when ASS_FEATURE_WRAP_UNICODE is
+        // enabled; the default is ASCII-space-only breaking.
+        let unicode = engine
+            .layout_track_event_with_options(&track, 0, &provider, ShapingMode::Simple, true)
+            .expect("layout should succeed");
+        assert!(unicode.lines.len() > 1);
+        assert!(unicode.lines.iter().all(|line| line.width <= 2.0));
+
+        let default = engine
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
-
-        assert!(layout.lines.len() > 1);
-        assert!(layout.lines.iter().all(|line| line.width <= 2.0));
+        assert_eq!(
+            default.lines.len(),
+            1,
+            "without ASS_FEATURE_WRAP_UNICODE the spaceless CJK line overflows unbroken"
+        );
     }
 
     #[test]

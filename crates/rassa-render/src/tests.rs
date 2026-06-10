@@ -1789,6 +1789,58 @@ fn render_frame_distinguishes_be_from_blur() {
 }
 
 #[test]
+fn render_frame_emits_background_box_for_border_style_4() {
+    // libass add_background (ass_render.c): BorderStyle 4 draws one solid
+    // box in the back colour behind the whole event, expanded by positive
+    // shadow offsets, and suppresses the shadow bitmaps themselves.
+    let track = parse_script_text("[Script Info]\nPlayResX: 500\nPlayResY: 160\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,DejaVu Sans,30,&H00FFFFFF,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,4,0,4,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Box,,0000,0000,0000,,{\\an5\\pos(250,80)}Background").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 500);
+
+    let background = planes
+        .first()
+        .expect("BorderStyle 4 event renders planes");
+    assert_eq!(
+        background.color.0, 0x1111_1100,
+        "the background box is drawn first in the back colour"
+    );
+    let text_ink = planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character)
+        .filter_map(plane_ink_bounds)
+        .reduce(|a, b| Rect {
+            x_min: a.x_min.min(b.x_min),
+            y_min: a.y_min.min(b.y_min),
+            x_max: a.x_max.max(b.x_max),
+            y_max: a.y_max.max(b.y_max),
+        })
+        .expect("text ink");
+    let bg = plane_rect(background);
+    assert!(
+        bg.x_min <= text_ink.x_min
+            && bg.y_min <= text_ink.y_min
+            && bg.x_max >= text_ink.x_max
+            && bg.y_max >= text_ink.y_max,
+        "the background box covers the text: bg={bg:?} ink={text_ink:?}"
+    );
+    // The line box is 30 tall; \shad4 expands the box but produces no
+    // offset shadow copy of the glyphs.
+    assert!(
+        bg.height() >= 30 + 8,
+        "the box is expanded by the shadow size: {bg:?}"
+    );
+    assert_eq!(
+        planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Shadow)
+            .count(),
+        1,
+        "no glyph shadow bitmaps besides the background box"
+    );
+}
+
+#[test]
 fn render_frame_emits_opaque_box_for_border_style_3() {
     let track = parse_script_text("[Script Info]\nPlayResX: 500\nPlayResY: 160\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,DejaVu Sans,30,&H00000000,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,3,2,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Box,,0000,0000,0000,,{\\an5\\pos(250,80)}BorderStyle=3 opaque box").expect("script should parse");
     let engine = RenderEngine::new();

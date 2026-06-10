@@ -45,8 +45,20 @@ pub struct UnicodePipeline;
 
 impl UnicodePipeline {
     pub fn analyze_text(&self, text: &str, language: Option<&str>) -> RassaResult<UnicodeAnalysis> {
+        self.analyze_text_with_base(text, language, BidiDirection::Neutral)
+    }
+
+    /// Analyze with an explicit base paragraph direction.  libass resolves
+    /// the base from the \fe encoding (ass_resolve_base_direction): -1 maps
+    /// to auto-detection, everything else forces LTR.
+    pub fn analyze_text_with_base(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        base_direction: BidiDirection,
+    ) -> RassaResult<UnicodeAnalysis> {
         let break_analysis = analyze_breaks(text, language)?;
-        let bidi_analysis = analyze_bidi(text)?;
+        let bidi_analysis = analyze_bidi_with_base(text, base_direction)?;
         let segments = segment_by_mandatory_breaks(text, &break_analysis);
 
         Ok(UnicodeAnalysis {
@@ -67,15 +79,27 @@ impl UnicodePipeline {
 }
 
 pub fn analyze_bidi(text: &str) -> RassaResult<BidiAnalysis> {
+    analyze_bidi_with_base(text, BidiDirection::Neutral)
+}
+
+pub fn analyze_bidi_with_base(
+    text: &str,
+    base_direction: BidiDirection,
+) -> RassaResult<BidiAnalysis> {
     if text.is_empty() {
         return Ok(BidiAnalysis::default());
     }
 
-    Ok(analyze_bidi_with_unicode_bidi(text))
+    Ok(analyze_bidi_with_unicode_bidi(text, base_direction))
 }
 
-fn analyze_bidi_with_unicode_bidi(text: &str) -> BidiAnalysis {
-    let bidi_info = BidiInfo::new(text, None);
+fn analyze_bidi_with_unicode_bidi(text: &str, base_direction: BidiDirection) -> BidiAnalysis {
+    let base_level = match base_direction {
+        BidiDirection::LeftToRight => Some(unicode_bidi::Level::ltr()),
+        BidiDirection::RightToLeft => Some(unicode_bidi::Level::rtl()),
+        _ => None,
+    };
+    let bidi_info = BidiInfo::new(text, base_level);
     let Some(paragraph) = bidi_info.paragraphs.first() else {
         return BidiAnalysis::default();
     };
@@ -200,7 +224,7 @@ mod tests {
 
     #[test]
     fn bidi_fallback_reorders_rtl_runs() {
-        let analysis = analyze_bidi_with_unicode_bidi("abc אבג");
+        let analysis = analyze_bidi_with_unicode_bidi("abc אבג", BidiDirection::Neutral);
 
         assert_eq!(analysis.direction, BidiDirection::LeftToRight);
         assert_eq!(analysis.visual_text, "abc גבא");
@@ -210,7 +234,7 @@ mod tests {
 
     #[test]
     fn bidi_fallback_detects_rtl_paragraph_direction() {
-        let analysis = analyze_bidi_with_unicode_bidi("אבג abc");
+        let analysis = analyze_bidi_with_unicode_bidi("אבג abc", BidiDirection::Neutral);
 
         assert_eq!(analysis.direction, BidiDirection::RightToLeft);
         assert_ne!(analysis.visual_text, "אבג abc");

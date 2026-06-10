@@ -1216,7 +1216,11 @@ pub unsafe extern "C" fn ass_render_frame(
     } else {
         cached
     };
-    let renderer_config = renderer_config(renderer, parsed);
+    // ASS_FEATURE_WRAP_UNICODE = 3 (ass_types.h)
+    let wrap_unicode = track_state_ref(track)
+        .map(|state| state.features.get(3).copied().unwrap_or(false))
+        .unwrap_or(false);
+    let renderer_config = renderer_config(renderer, parsed, wrap_unicode);
     let font_provider_signature = font_provider_cache_signature(renderer, track_ref.library);
     let track_generation = track_state_ref(track)
         .map(|state| state.cache_generation)
@@ -1731,7 +1735,11 @@ fn wrap_default_font_path(
     }
 }
 
-fn renderer_config(renderer: &ASS_Renderer, track: &ParsedTrack) -> RendererConfig {
+fn renderer_config(
+    renderer: &ASS_Renderer,
+    track: &ParsedTrack,
+    wrap_unicode: bool,
+) -> RendererConfig {
     RendererConfig {
         frame: Size {
             width: if renderer.frame_width > 0 {
@@ -1771,6 +1779,7 @@ fn renderer_config(renderer: &ASS_Renderer, track: &ParsedTrack) -> RendererConf
             value if value == ass::ShapingLevel::Complex as c_int => ass::ShapingLevel::Complex,
             _ => ass::ShapingLevel::Complex,
         },
+        wrap_unicode,
     }
 }
 

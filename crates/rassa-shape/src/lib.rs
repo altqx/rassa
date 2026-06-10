@@ -68,6 +68,9 @@ pub struct ShapeRequest {
     pub language: Option<String>,
     pub mode: ShapingMode,
     pub font_size: Option<f32>,
+    /// Base paragraph direction; libass forces LTR unless \fe-1 requests
+    /// auto-detection (ass_resolve_base_direction).
+    pub base_direction: Option<BidiDirection>,
 }
 
 impl ShapeRequest {
@@ -80,6 +83,7 @@ impl ShapeRequest {
             language: None,
             mode: ShapingMode::Simple,
             font_size: None,
+            base_direction: None,
         }
     }
 
@@ -105,6 +109,11 @@ impl ShapeRequest {
 
     pub fn with_mode(mut self, mode: ShapingMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_base_direction(mut self, base_direction: BidiDirection) -> Self {
+        self.base_direction = Some(base_direction);
         self
     }
 
@@ -210,9 +219,11 @@ impl ShapeEngine {
         provider: &P,
         request: &ShapeRequest,
     ) -> RassaResult<ShapedText> {
-        let analysis = self
-            .unicode
-            .analyze_text(&request.text, request.language.as_deref())?;
+        let analysis = self.unicode.analyze_text_with_base(
+            &request.text,
+            request.language.as_deref(),
+            request.base_direction.unwrap_or(BidiDirection::Neutral),
+        )?;
         let font = provider.resolve(&FontQuery {
             family: request.family.clone(),
             style: request.style.clone(),

@@ -190,6 +190,10 @@ pub struct RendererConfig {
     pub line_position: f64,
     pub hinting: ass::Hinting,
     pub shaping: ass::ShapingLevel,
+    /// Unicode line breaking (libass ASS_FEATURE_WRAP_UNICODE).  libass
+    /// defaults to breaking at ASCII spaces only; Unicode breaking is an
+    /// opt-in feature.
+    pub wrap_unicode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

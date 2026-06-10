@@ -93,7 +93,13 @@ impl RenderEngine {
             .into_iter()
             .filter_map(|index| {
                 self.layout
-                    .layout_track_event_with_mode(track, index, provider, shaping_mode)
+                    .layout_track_event_with_options(
+                        track,
+                        index,
+                        provider,
+                        shaping_mode,
+                        config.wrap_unicode,
+                    )
                     .ok()
             })
             .collect();
@@ -196,6 +202,8 @@ impl RenderEngine {
             let mut event_right = i32::MIN;
             let mut event_border_x = 0_i32;
             let mut event_border_y = 0_i32;
+            let mut event_back_colour = style.back_colour;
+            let mut event_shadow = (0.0_f64, 0.0_f64);
             for ((line, line_top), line_metric) in event
                 .lines
                 .iter()
@@ -244,6 +252,8 @@ impl RenderEngine {
                         event_border_y =
                             event_border_y.max(effective_style.border_y.round().max(0.0) as i32);
                     }
+                    event_back_colour = effective_style.back_colour;
+                    event_shadow = (effective_style.shadow_x, effective_style.shadow_y);
                     let run_origin_x_26_6 = origin_x_26_6 + line_pen_x_26_6;
                     let run_origin_x = run_origin_x_26_6 >> 6;
                     let run_shadow_start = shadow_planes.len();
@@ -377,8 +387,9 @@ impl RenderEngine {
                                 ));
                             }
                             character_planes.push(plane);
-                            if effective_style.shadow_x.abs() > f64::EPSILON
-                                || effective_style.shadow_y.abs() > f64::EPSILON
+                            if style.border_style != 4
+                                && (effective_style.shadow_x.abs() > f64::EPSILON
+                                    || effective_style.shadow_y.abs() > f64::EPSILON)
                             {
                                 let rasterizer = Rasterizer::with_options(RasterOptions {
                                     size_26_6: 64,
@@ -463,8 +474,11 @@ impl RenderEngine {
                     let has_outline = style.border_style != 3
                         && (effective_style.border_x > 0.0 || effective_style.border_y > 0.0)
                         && !karaoke_hides_outline(run, source_event, now_ms);
-                    let has_shadow = effective_style.shadow_x.abs() > f64::EPSILON
-                        || effective_style.shadow_y.abs() > f64::EPSILON;
+                    // libass render_text skips shadow bitmaps entirely for
+                    // BorderStyle 4 (the background box replaces them).
+                    let has_shadow = style.border_style != 4
+                        && (effective_style.shadow_x.abs() > f64::EPSILON
+                            || effective_style.shadow_y.abs() > f64::EPSILON);
                     let fill_blur = if has_outline || has_shadow {
                         0
                     } else {
@@ -594,9 +608,7 @@ impl RenderEngine {
                             ));
                         }
                     }
-                    if effective_style.shadow_x.abs() > f64::EPSILON
-                        || effective_style.shadow_y.abs() > f64::EPSILON
-                    {
+                    if has_shadow {
                         let shadow_glyphs = outlined_shadow_source_glyphs
                             .as_deref()
                             .unwrap_or(&raster_glyphs);
@@ -692,6 +704,19 @@ impl RenderEngine {
                 }
             }
 
+            // libass EventImages: top = device_y - lines[0].asc - border_top,
+            // height = text height + borders, width = bbox + 2 * border_x.
+            let event_line_box = (!event.lines.is_empty() && event_left < event_right).then(|| {
+                let total_height = total_text_height(&line_metrics, config).round() as i32;
+                Rect {
+                    x_min: event_left - event_border_x,
+                    y_min: vertical_layout.first().copied().unwrap_or(0) - event_border_y,
+                    x_max: event_right + event_border_x,
+                    y_max: vertical_layout.first().copied().unwrap_or(0)
+                        + total_height
+                        + event_border_y,
+                }
+            });
             let mut event_planes = shadow_planes;
             event_planes.extend(outline_planes);
             event_planes.extend(character_planes);
@@ -711,22 +736,43 @@ impl RenderEngine {
             } else if let Some(vector_clip) = &event.vector_clip {
                 event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
             }
+            if style.border_style == 4 {
+                if let Some(rect) = event_line_box {
+                    // libass add_background: the event box expanded by the
+                    // positive shadow offsets, clamped to the frame, filled
+                    // with the final back colour and drawn first.
+                    let size_x = if event_shadow.0 > 0.0 {
+                        event_shadow.0.round() as i32
+                    } else {
+                        0
+                    };
+                    let size_y = if event_shadow.1 > 0.0 {
+                        event_shadow.1.round() as i32
+                    } else {
+                        0
+                    };
+                    let frame = frame_clip_rect(track, config, event, effective_position);
+                    let background = Rect {
+                        x_min: (rect.x_min - size_x).clamp(frame.x_min, frame.x_max),
+                        y_min: (rect.y_min - size_y).clamp(frame.y_min, frame.y_max),
+                        x_max: (rect.x_max + size_x).clamp(frame.x_min, frame.x_max),
+                        y_max: (rect.y_max + size_y).clamp(frame.y_min, frame.y_max),
+                    };
+                    if background.width() > 0 && background.height() > 0 {
+                        event_planes.insert(
+                            0,
+                            solid_plane_from_rect(
+                                background,
+                                event_back_colour,
+                                ass::ImageType::Shadow,
+                            ),
+                        );
+                    }
+                }
+            }
             if let Some(fade) = event.fade {
                 event_planes = apply_fade_to_planes(event_planes, fade, source_event, now_ms);
             }
-            // libass EventImages: top = device_y - lines[0].asc - border_top,
-            // height = text height + borders, width = bbox + 2 * border_x.
-            let event_line_box = (!event.lines.is_empty() && event_left < event_right).then(|| {
-                let total_height = total_text_height(&line_metrics, config).round() as i32;
-                Rect {
-                    x_min: event_left - event_border_x,
-                    y_min: vertical_layout.first().copied().unwrap_or(0) - event_border_y,
-                    x_max: event_right + event_border_x,
-                    y_max: vertical_layout.first().copied().unwrap_or(0)
-                        + total_height
-                        + event_border_y,
-                }
-            });
             event_planes = apply_effect_to_planes(
                 event_planes,
                 source_event,
