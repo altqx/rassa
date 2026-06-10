@@ -122,6 +122,20 @@ fn move_interpolation_swaps_reversed_times_like_libass() {
 
 #[test]
 fn scaled_clip_rect_rounds_edges_like_libass() {
+    let mapping = EventMapping {
+        explicit: true,
+        use_margins: false,
+        scale_x: 0.5,
+        scale_y: 1.5,
+        margin_left: 0.0,
+        margin_top: 0.0,
+        frame_w: 960.0,
+        frame_h: 1620.0,
+        fit_w: 960.0,
+        fit_h: 1620.0,
+        play_res_x: 1920.0,
+        play_res_y: 1080.0,
+    };
     assert_eq!(
         scale_clip_rect(
             Rect {
@@ -130,8 +144,7 @@ fn scaled_clip_rect_rounds_edges_like_libass() {
                 x_max: 1261,
                 y_max: 48,
             },
-            0.5,
-            1.5,
+            &mapping,
         ),
         Rect {
             x_min: 330,
@@ -2174,39 +2187,56 @@ fn render_frame_clips_to_frame_bounds() {
 }
 
 #[test]
-fn render_frame_applies_margin_clip_when_enabled() {
-    let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Hi").expect("script should parse");
+fn render_frame_remaps_events_into_full_frame_when_margins_used() {
+    // libass use_margins (ass_render.c x2scr_left/y2scr family): margins do
+    // NOT hard-clip normal subtitles; instead the content frame is
+    // aspect-fitted into the full frame, so a top-aligned subtitle anchors
+    // at the very top of the frame (inside the top margin/black bar), while
+    // a positioned event still maps onto the content area offset by the
+    // margins.
+    let script = |text: &str| {
+        format!("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{text}")
+    };
+    let margin_config = config(
+        100,
+        120,
+        rassa_core::Margins {
+            top: 10,
+            bottom: 10,
+            left: 0,
+            right: 0,
+        },
+        true,
+    );
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
-    let planes = engine.render_frame_with_provider_and_config(
-        &track,
-        &provider,
-        500,
-        &config(
-            100,
-            100,
-            rassa_core::Margins {
-                top: 10,
-                bottom: 10,
-                left: 10,
-                right: 10,
-            },
-            true,
-        ),
+
+    let normal_track = parse_script_text(&script("Hi")).expect("script should parse");
+    let normal =
+        engine.render_frame_with_provider_and_config(&normal_track, &provider, 500, &margin_config);
+    let normal_top = visible_bounds(&normal).expect("normal subtitle ink").y_min;
+    // Content is 100x100 fitted into the 100x120 frame: fit_h = 100 with no
+    // vertical offset for toptitles, so the line box top sits at y = 0, well
+    // inside the 10px top margin.
+    assert!(
+        normal_top < 10,
+        "a top-aligned normal subtitle anchors inside the top margin under use_margins; got y_min={normal_top}"
     );
 
-    assert!(!planes.is_empty());
-    assert!(planes.iter().all(|plane| plane.destination.x >= 10));
-    assert!(planes.iter().all(|plane| plane.destination.y >= 10));
-    assert!(
-        planes
-            .iter()
-            .all(|plane| plane.destination.x + plane.size.width <= 90)
+    let positioned_track =
+        parse_script_text(&script("{\\an8\\pos(50,0)}Hi")).expect("script should parse");
+    let positioned = engine.render_frame_with_provider_and_config(
+        &positioned_track,
+        &provider,
+        500,
+        &margin_config,
     );
+    let positioned_top = visible_bounds(&positioned).expect("positioned ink").y_min;
+    // \pos maps onto the content frame offset by the top margin, and
+    // explicit events clip to the content area.
     assert!(
-        planes
-            .iter()
-            .all(|plane| plane.destination.y + plane.size.height <= 90)
+        positioned_top >= 10,
+        "a positioned event maps into the margin-offset content area; got y_min={positioned_top}"
     );
 }
 

@@ -23,8 +23,7 @@ pub(crate) fn apply_effect_to_planes(
     track: &ParsedTrack,
     config: &RendererConfig,
     now_ms: i64,
-    scale_x: f64,
-    scale_y: f64,
+    mapping: &EventMapping,
     line_box: Option<Rect>,
 ) -> Vec<ImagePlane> {
     let Some(event) = source_event else {
@@ -49,16 +48,18 @@ pub(crate) fn apply_effect_to_planes(
         let Some(delay) = values.first().copied() else {
             return planes;
         };
-        let scale_x = style_scale(scale_x);
         let delay = scaled_effect_delay(delay, effect_delay_scale.x);
         let shift = elapsed / delay;
         let left_to_right = values.get(1).copied().unwrap_or(0) != 0;
         // libass ass_render_event: SCROLL_RL puts the text box's left edge at
-        // PlayResX - shift; SCROLL_LR puts its right edge at shift.
+        // x2scr_pos(PlayResX - shift); SCROLL_LR puts its right edge at
+        // x2scr_pos(shift).
         let target_left = if left_to_right {
-            (shift * scale_x).round() as i32 - (bounds.x_max - bounds.x_min)
+            mapping.map_x_pos(shift).round() as i32 - (bounds.x_max - bounds.x_min)
         } else {
-            (f64::from(track.play_res_x) * scale_x - shift * scale_x).round() as i32
+            mapping
+                .map_x_pos(f64::from(track.play_res_x) - shift)
+                .round() as i32
         };
         return translate_planes(
             planes,
@@ -75,20 +76,19 @@ pub(crate) fn apply_effect_to_planes(
         if values.len() < 3 {
             return planes;
         }
-        let scale_y = style_scale(scale_y);
         let delay = scaled_effect_delay(values[2], effect_delay_scale.y);
         let shift = elapsed / delay;
         let y0 = values[0].min(values[1]);
         let y1 = values[0].max(values[1]);
-        let clip_y0 = (f64::from(y0) * scale_y).round() as i32;
-        let clip_y1 = (f64::from(y1) * scale_y).round() as i32;
-        // libass: SCROLL_BT anchors the box top at y1 - shift, SCROLL_TB the
-        // box bottom at y0 + shift, then clips to y0..y1.
+        let clip_y0 = mapping.map_y_pos(f64::from(y0)).round() as i32;
+        let clip_y1 = mapping.map_y_pos(f64::from(y1)).round() as i32;
+        // libass: SCROLL_BT anchors the box top at y2scr(y1 - shift),
+        // SCROLL_TB the box bottom at y2scr(y0 + shift), clipped to y0..y1.
         let target_offset = if scroll_up {
-            let target_top = (f64::from(y1) * scale_y - shift * scale_y).round() as i32;
+            let target_top = mapping.map_y_pos(f64::from(y1) - shift).round() as i32;
             target_top - bounds.y_min
         } else {
-            let target_bottom = (f64::from(y0) * scale_y + shift * scale_y).round() as i32;
+            let target_bottom = mapping.map_y_pos(f64::from(y0) + shift).round() as i32;
             target_bottom - bounds.y_max
         };
         let translated = translate_planes(

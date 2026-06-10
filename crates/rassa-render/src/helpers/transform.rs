@@ -46,6 +46,7 @@ pub(crate) struct RunTransformContext<'a> {
     pub(crate) event: &'a LayoutEvent,
     pub(crate) effective_position: Option<(i32, i32)>,
     pub(crate) render_scale: RenderScale,
+    pub(crate) mapping: &'a EventMapping,
 }
 
 pub(crate) fn apply_run_transform_to_recent_planes(
@@ -69,8 +70,7 @@ pub(crate) fn apply_run_transform_to_recent_planes(
         context.event,
         &recent_planes,
         context.effective_position,
-        context.render_scale.x,
-        context.render_scale.y,
+        context.mapping,
     );
     let shear_base = planes_bounds(&recent_planes)
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
@@ -96,16 +96,15 @@ pub(crate) fn event_transform_origin(
     event: &LayoutEvent,
     planes: &[ImagePlane],
     effective_position: Option<(i32, i32)>,
-    scale_x: f64,
-    scale_y: f64,
+    mapping: &EventMapping,
 ) -> (f64, f64) {
     if let Some((x, y)) = event.origin_exact {
-        return ((x * scale_x).round(), (y * scale_y).round());
+        return (mapping.map_x_pos(x).round(), mapping.map_y_pos(y).round());
     }
     if let Some((x, y)) = event.origin {
         return (
-            (f64::from(x) * scale_x).round(),
-            (f64::from(y) * scale_y).round(),
+            mapping.map_x_pos(f64::from(x)).round(),
+            mapping.map_y_pos(f64::from(y)).round(),
         );
     }
     if let Some((x, y)) = effective_position {

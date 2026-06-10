@@ -95,50 +95,39 @@ pub(crate) fn translate_planes(mut planes: Vec<ImagePlane>, offset: Point) -> Ve
     planes
 }
 
-pub(crate) fn scale_clip_rect(rect: Rect, scale_x: f64, scale_y: f64) -> Rect {
-    let scale_x = style_scale(scale_x);
-    let scale_y = style_scale(scale_y);
+/// \clip coordinates map like positioned coordinates (libass
+/// x2scr_pos_scaled / y2scr_pos: content scale plus margin offsets).
+pub(crate) fn scale_clip_rect(rect: Rect, mapping: &EventMapping) -> Rect {
     Rect {
-        x_min: (f64::from(rect.x_min) * scale_x).round() as i32,
-        y_min: (f64::from(rect.y_min) * scale_y).round() as i32,
-        x_max: (f64::from(rect.x_max) * scale_x).round() as i32,
-        y_max: (f64::from(rect.y_max) * scale_y).round() as i32,
+        x_min: mapping.map_x_pos(f64::from(rect.x_min)).round() as i32,
+        y_min: mapping.map_y_pos(f64::from(rect.y_min)).round() as i32,
+        x_max: mapping.map_x_pos(f64::from(rect.x_max)).round() as i32,
+        y_max: mapping.map_y_pos(f64::from(rect.y_max)).round() as i32,
     }
 }
 
+/// libass clip policy (ass_render_event): normal events under use_margins
+/// clip only to the full frame; everything else (use_margins off, or
+/// explicit events) clips to the content area between the margins.
 pub(crate) fn frame_clip_rect(
     track: &ParsedTrack,
     config: &RendererConfig,
-    event: &LayoutEvent,
-    effective_position: Option<(i32, i32)>,
+    explicit: bool,
 ) -> Rect {
-    let frame_width = if config.frame.width > 0 {
-        config.frame.width
-    } else {
-        track.play_res_x.max(0)
-    };
-    let frame_height = if config.frame.height > 0 {
-        config.frame.height
-    } else {
-        track.play_res_y.max(0)
-    };
-    if config.use_margins
-        && effective_position.is_none()
-        && event.clip_rect.is_none()
-        && event.vector_clip.is_none()
-    {
-        Rect {
-            x_min: config.margins.left.max(0),
-            y_min: config.margins.top.max(0),
-            x_max: (frame_width - config.margins.right).max(0),
-            y_max: (frame_height - config.margins.bottom).max(0),
-        }
-    } else {
+    let frame = frame_size(track, config);
+    if config.use_margins && !explicit {
         Rect {
             x_min: 0,
             y_min: 0,
-            x_max: frame_width,
-            y_max: frame_height,
+            x_max: frame.width.max(0),
+            y_max: frame.height.max(0),
+        }
+    } else {
+        Rect {
+            x_min: config.margins.left.max(0),
+            y_min: config.margins.top.max(0),
+            x_max: (frame.width - config.margins.right).max(0),
+            y_max: (frame.height - config.margins.bottom).max(0),
         }
     }
 }
@@ -148,9 +137,8 @@ pub(crate) fn compute_horizontal_origin(
     event: &LayoutEvent,
     line_width: i32,
     effective_position: Option<(i32, i32)>,
-    scale_x: f64,
+    mapping: &EventMapping,
 ) -> i32 {
-    let scale_x = style_scale(scale_x);
     if let Some((x, _)) = effective_position {
         return match event.alignment & 0x3 {
             ass::HALIGN_LEFT => x,
@@ -158,27 +146,25 @@ pub(crate) fn compute_horizontal_origin(
             _ => x - (line_width + 1) / 2,
         };
     }
-    let frame_width = (f64::from(track.play_res_x) * scale_x).round() as i32;
-    let margin_l = (f64::from(event.margin_l) * scale_x).round() as i32;
-    let margin_r = (f64::from(event.margin_r) * scale_x).round() as i32;
+    // libass: left edge = x2scr_left(MarginL), right edge =
+    // x2scr_right(PlayResX - MarginR); halign anchors within them.
+    let left_edge = mapping.x_left(f64::from(event.margin_l));
+    let right_edge = mapping.x_right(f64::from(track.play_res_x) - f64::from(event.margin_r));
     match event.alignment & 0x3 {
-        ass::HALIGN_LEFT => margin_l,
-        ass::HALIGN_RIGHT => (frame_width - margin_r - line_width).max(0),
-        _ => ((margin_l + frame_width - margin_r - line_width) / 2).max(0),
+        ass::HALIGN_LEFT => left_edge.round() as i32,
+        ass::HALIGN_RIGHT => right_edge.round() as i32 - line_width,
+        _ => ((left_edge + right_edge).round() as i32 - line_width) / 2,
     }
 }
 
 pub(crate) fn scale_position(
     position: Option<(i32, i32)>,
-    scale_x: f64,
-    scale_y: f64,
+    mapping: &EventMapping,
 ) -> Option<(i32, i32)> {
-    let scale_x = style_scale(scale_x);
-    let scale_y = style_scale(scale_y);
     position.map(|(x, y)| {
         (
-            (f64::from(x) * scale_x).round() as i32,
-            (f64::from(y) * scale_y).round() as i32,
+            mapping.map_x_pos(f64::from(x)).round() as i32,
+            mapping.map_y_pos(f64::from(y)).round() as i32,
         )
     })
 }
@@ -291,9 +277,8 @@ pub(crate) fn compute_vertical_layout(
     margin_v: i32,
     position: Option<(i32, i32)>,
     config: &RendererConfig,
-    render_scale: RenderScale,
+    mapping: &EventMapping,
 ) -> Vec<i32> {
-    let scale_y = style_scale(render_scale.y);
     let spacing = line_spacing(config);
     let total = total_text_height(metrics, config);
 
@@ -306,11 +291,14 @@ pub(crate) fn compute_vertical_layout(
         }
     } else {
         match alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
-            ass::VALIGN_TOP => f64::from(margin_v) * scale_y,
-            ass::VALIGN_CENTER => (f64::from(track.play_res_y) * scale_y - total) / 2.0,
+            ass::VALIGN_TOP => mapping.y_top(f64::from(margin_v)),
+            ass::VALIGN_CENTER => {
+                mapping.y_center(f64::from(track.play_res_y) / 2.0) - total / 2.0
+            }
             _ => {
-                let scr_bottom = (f64::from(track.play_res_y) - f64::from(margin_v)) * scale_y;
-                let scr_top = 0.0;
+                let scr_bottom =
+                    mapping.y_sub(f64::from(track.play_res_y) - f64::from(margin_v));
+                let scr_top = mapping.y_top(0.0);
                 let line_position = config.line_position.clamp(0.0, 100.0);
                 let mut top =
                     scr_bottom + (scr_top - scr_bottom) * line_position / 100.0 - total;

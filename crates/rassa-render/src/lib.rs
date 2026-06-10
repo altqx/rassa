@@ -173,14 +173,34 @@ impl RenderEngine {
             let mut character_planes = Vec::new();
             let mut opaque_box_rects = Vec::new();
             let mut clip_mask_bleed = 0;
-            let effective_position = scale_position(
-                resolve_event_position(track, event, now_ms),
-                render_scale_x,
-                render_scale_y,
-            );
             let effect_disables_collision = source_event
                 .map(transition_effect_disables_collision)
                 .unwrap_or(false);
+            // libass "explicit" (ass_event_has_hard_overrides + evt_type):
+            // positioned/moved events, or any event carrying \clip, \iclip,
+            // \org, \pbo or \p, plus transition effects.
+            let event_is_explicit = event.position.is_some()
+                || event.position_exact.is_some()
+                || event.movement.is_some()
+                || event.movement_exact.is_some()
+                || event.clip_rect.is_some()
+                || event.vector_clip.is_some()
+                || event.origin.is_some()
+                || event.origin_exact.is_some()
+                || effect_disables_collision
+                || event.lines.iter().any(|line| {
+                    line.runs.iter().any(|run| {
+                        run.drawing.is_some()
+                            || (run.style.pbo.is_finite() && run.style.pbo != 0.0)
+                            || run
+                                .transforms
+                                .iter()
+                                .any(|transform| transform.style.clip_rect.is_some())
+                    })
+                });
+            let mapping = event_mapping(track, config, event_is_explicit);
+            let effective_position =
+                scale_position(resolve_event_position(track, event, now_ms), &mapping);
             let metrics_context = LineMetricsContext {
                 track,
                 config,
@@ -196,7 +216,7 @@ impl RenderEngine {
                 event.margin_v,
                 effective_position,
                 config,
-                render_scale_all,
+                &mapping,
             );
             let mut event_left = i32::MAX;
             let mut event_right = i32::MIN;
@@ -231,7 +251,7 @@ impl RenderEngine {
                     event,
                     scaled_line_width,
                     effective_position,
-                    render_scale_x,
+                    &mapping,
                 );
                 event_left = event_left.min(origin_x);
                 event_right = event_right.max(origin_x + scaled_line_width);
@@ -441,6 +461,7 @@ impl RenderEngine {
                                 event,
                                 effective_position,
                                 render_scale: render_scale_all,
+                                mapping: &mapping,
                             },
                         );
                         // run.width already includes \fscx (layout applies the
@@ -638,6 +659,7 @@ impl RenderEngine {
                             event,
                             effective_position,
                             render_scale: render_scale_all,
+                            mapping: &mapping,
                         },
                     );
                     line_pen_x_26_6 += run_advance_26_6;
@@ -661,7 +683,7 @@ impl RenderEngine {
                         event,
                         box_line_width,
                         effective_position,
-                        render_scale_x,
+                        &mapping,
                     );
                     opaque_box_rects.push(Rect {
                         x_min: box_origin_x - box_padding,
@@ -726,7 +748,7 @@ impl RenderEngine {
             if let Some(clip_rect) =
                 resolve_animated_clip_rect(event, track, source_event, now_ms)
             {
-                let clip_rect = scale_clip_rect(clip_rect, render_scale_x, render_scale_y);
+                let clip_rect = scale_clip_rect(clip_rect, &mapping);
                 let clip_rect = if event.inverse_clip {
                     expand_rect(clip_rect, clip_mask_bleed)
                 } else {
@@ -751,7 +773,7 @@ impl RenderEngine {
                     } else {
                         0
                     };
-                    let frame = frame_clip_rect(track, config, event, effective_position);
+                    let frame = frame_clip_rect(track, config, event_is_explicit);
                     let background = Rect {
                         x_min: (rect.x_min - size_x).clamp(frame.x_min, frame.x_max),
                         y_min: (rect.y_min - size_y).clamp(frame.y_min, frame.y_max),
@@ -779,18 +801,12 @@ impl RenderEngine {
                 track,
                 config,
                 now_ms,
-                render_scale_x,
-                render_scale_y,
+                &mapping,
                 event_line_box,
             );
-            let render_offset = output_offset(config);
-            event_planes = translate_planes(event_planes, render_offset);
-            let collision_rect = event_line_box.map(|rect| Rect {
-                x_min: rect.x_min + render_offset.x,
-                y_min: rect.y_min + render_offset.y,
-                x_max: rect.x_max + render_offset.x,
-                y_max: rect.y_max + render_offset.y,
-            });
+            // Coordinates are already in final screen space: the per-event
+            // mapping folds the margin offsets in.
+            let collision_rect = event_line_box;
             rendered_events.push(RenderedEvent {
                 event_index: event.event_index,
                 planes: event_planes,
@@ -803,7 +819,7 @@ impl RenderEngine {
                 } else {
                     1
                 },
-                frame_clip: frame_clip_rect(track, config, event, effective_position),
+                frame_clip: frame_clip_rect(track, config, event_is_explicit),
             });
         }
 
