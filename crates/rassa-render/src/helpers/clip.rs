@@ -20,6 +20,28 @@ pub(crate) fn apply_event_clip(
     clipped
 }
 
+/// Map a vector `\clip`/`\iclip` drawing from script (PlayRes) coordinates into
+/// render space, mirroring how `scale_clip_rect` and position tags are scaled.
+/// libass scales clip drawings by the same frame transform as glyph positions;
+/// without this the polygon stays in the PlayRes corner and clips everything.
+pub(crate) fn scale_vector_clip(clip: &ParsedVectorClip, mapping: &EventMapping) -> ParsedVectorClip {
+    ParsedVectorClip {
+        scale: clip.scale,
+        polygons: clip
+            .polygons
+            .iter()
+            .map(|poly| {
+                poly.iter()
+                    .map(|point| Point {
+                        x: mapping.map_x_pos(f64::from(point.x)).round() as i32,
+                        y: mapping.map_y_pos(f64::from(point.y)).round() as i32,
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
 pub(crate) fn apply_vector_clip(
     planes: Vec<ImagePlane>,
     clip: &ParsedVectorClip,

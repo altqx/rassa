@@ -252,14 +252,27 @@ pub(crate) fn font_vertical_metrics(
     let ascender = scale(face.ascender().into());
     let descender = scale((-face.descender()).into());
 
-    // libass ass_get_glyph_outline: underline from the post table when
-    // underlinePosition <= 0 and underlineThickness > 0.
-    let raw = unsafe { &*(face.raw() as *const ffi::FT_FaceRec) };
-    let underline = (raw.underline_position <= 0 && raw.underline_thickness > 0).then(|| {
-        let pos = scale(raw.underline_position.into());
-        let size = scale(raw.underline_thickness.into());
-        (-pos - size / 2, size)
-    });
+    // libass ass_get_glyph_outline: underline from the *raw* post table when
+    // underlinePosition <= 0 and underlineThickness > 0, scaled with the exact
+    // ((val * y_scale + 0x8000) >> 16) arithmetic libass uses (ass_font.c:769).
+    // Note: this reads TT_Postscript (the raw post values), NOT
+    // FT_FaceRec.underline_position, which FreeType has already recentered by
+    // -thickness/2 at face load (sfobjs.c). Using the recentered value here and
+    // then applying -size/2 again double-recenters the bar ~thickness/2 lower.
+    let scale_libass =
+        |value: i32| ((i64::from(value) * metrics.y_scale + 0x8000) >> 16) as i32;
+    let post = unsafe {
+        ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_post)
+            as *const ffi::TT_Postscript
+    };
+    let underline = (!post.is_null())
+        .then(|| unsafe { &*post })
+        .filter(|ps| ps.underlinePosition <= 0 && ps.underlineThickness > 0)
+        .map(|ps| {
+            let pos = scale_libass(ps.underlinePosition.into());
+            let size = scale_libass(ps.underlineThickness.into());
+            (-pos - size / 2, size)
+        });
     let os2 = unsafe {
         ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_os2)
             as *const ffi::TT_OS2
@@ -268,8 +281,9 @@ pub(crate) fn font_vertical_metrics(
         .then(|| unsafe { &*os2 })
         .filter(|os2| os2.yStrikeoutPosition >= 0 && os2.yStrikeoutSize > 0)
         .map(|os2| {
-            let pos = scale(os2.yStrikeoutPosition.into());
-            let size = scale(os2.yStrikeoutSize.into());
+            // Same exact arithmetic libass uses (ass_font.c:782).
+            let pos = scale_libass(os2.yStrikeoutPosition.into());
+            let size = scale_libass(os2.yStrikeoutSize.into());
             (-pos - size / 2, size)
         });
     let typo_descender = (!os2.is_null())
@@ -353,27 +367,29 @@ pub(crate) fn font_vertical_metrics_from_data(
         let product = i64::from(value) * y_scale;
         ((product + 0x8000 - i64::from(product < 0)) >> 16) as i32
     };
+    // Decoration bars use libass's exact rounding (ass_font.c:769): a plain
+    // arithmetic shift of (val * y_scale + 0x8000), with NO negative-bias
+    // adjustment, on the *raw* post/OS-2 values.
+    let scale_deco = |value: i32| ((i64::from(value) * y_scale + 0x8000) >> 16) as i32;
 
     let underline = tables
         .post
         .map(|post| post.underline_metrics)
-        .and_then(|line| {
-            // FreeType recenters the post table position on the stroke when
-            // loading the face (sfobjs.c): position -= thickness / 2.
-            let position = (i32::from(line.position) - i32::from(line.thickness) / 2) as i16;
-            (position <= 0 && line.thickness > 0).then(|| {
-                let pos = scale(position.into());
-                let size = scale(line.thickness.into());
-                (-pos - size / 2, size)
-            })
+        .filter(|line| line.position <= 0 && line.thickness > 0)
+        .map(|line| {
+            // Raw post-table position (not FreeType's recentered face value);
+            // libass recenters exactly once via -pos - size/2.
+            let pos = scale_deco(line.position.into());
+            let size = scale_deco(line.thickness.into());
+            (-pos - size / 2, size)
         });
     let strikeout = tables
         .os2
         .map(|os2| os2.strikeout_metrics())
         .filter(|line| line.position >= 0 && line.thickness > 0)
         .map(|line| {
-            let pos = scale(line.position.into());
-            let size = scale(line.thickness.into());
+            let pos = scale_deco(line.position.into());
+            let size = scale_deco(line.thickness.into());
             (-pos - size / 2, size)
         });
     let typo_descender = tables
@@ -414,17 +430,6 @@ pub(crate) fn renderer_blur_radius(blur: f64) -> u32 {
     (blur * 4.0).ceil().max(1.0) as u32
 }
 
-pub(crate) fn style_clip_bleed(style: &ParsedSpanStyle) -> i32 {
-    let border_bleed = style.border_x.max(style.border_y).max(style.border) * 4.0;
-    let shadow_bleed = style
-        .shadow_x
-        .abs()
-        .max(style.shadow_y.abs())
-        .max(style.shadow);
-    let blur_bleed = renderer_blur_radius(effective_blur_strength(style)) as f64;
-    (border_bleed + shadow_bleed + blur_bleed).ceil().max(0.0) as i32
-}
-
 pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {
     Rect {
         x_min: rect.x_min - amount_x.max(0),
@@ -434,14 +439,3 @@ pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {
     }
 }
 
-pub(crate) fn expand_rect(rect: Rect, amount: i32) -> Rect {
-    if amount <= 0 {
-        return rect;
-    }
-    Rect {
-        x_min: rect.x_min - amount,
-        y_min: rect.y_min - amount,
-        x_max: rect.x_max + amount,
-        y_max: rect.y_max + amount,
-    }
-}

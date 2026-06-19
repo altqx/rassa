@@ -271,11 +271,33 @@ fn glyph_cache() -> &'static Mutex<HashMap<GlyphCacheKey, RasterGlyph>> {
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+/// Mirror libass ass_face_is_postscript (ass_font.c): CFF/Type1-based faces
+/// take a gentler synthetic-italic slant than TrueType.
+fn face_is_postscript(face: &freetype::Face) -> bool {
+    unsafe extern "C" {
+        fn FT_Get_Font_Format(face: ffi::FT_Face) -> *const core::ffi::c_char;
+    }
+    unsafe {
+        let ptr = FT_Get_Font_Format(face.raw() as *const ffi::FT_FaceRec as ffi::FT_Face);
+        if ptr.is_null() {
+            return false;
+        }
+        matches!(
+            core::ffi::CStr::from_ptr(ptr).to_bytes(),
+            b"CFF" | b"Type 1" | b"CID Type 1"
+        )
+    }
+}
+
 fn apply_synthetic_style_transform(face: &freetype::Face, synthetic_italic: bool) {
     if synthetic_italic {
+        // Match libass ass_glyph_italicize (ass_font.c): TrueType faces shear by
+        // 0x05700 (~tan 18.77deg), PostScript (CFF/Type1) faces by 0x02d24
+        // (~tan 10deg).
+        let xy = if face_is_postscript(face) { 0x02d24 } else { 0x05700 };
         let mut matrix = Matrix {
             xx: 0x10000,
-            xy: 0x05000,
+            xy,
             yx: 0,
             yy: 0x10000,
         };
@@ -286,10 +308,23 @@ fn apply_synthetic_style_transform(face: &freetype::Face, synthetic_italic: bool
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn maybe_embolden_slot(slot: &GlyphSlot, synthetic_bold: bool) {
-    if synthetic_bold {
-        unsafe {
-            ffi::FT_GlyphSlot_Embolden(slot.raw() as *const _ as *mut _);
+    if !synthetic_bold {
+        return;
+    }
+    // Match libass ass_glyph_embolden (ass_font.c): emboldening strength is
+    // FT_MulFix(units_per_EM, y_scale) / 64, applied to the outline. FreeType's
+    // FT_GlyphSlot_Embolden uses /24, which over-emboldens by 64/24 ~= 2.67x.
+    unsafe {
+        let raw = slot.raw() as *const ffi::FT_GlyphSlotRec as *mut ffi::FT_GlyphSlotRec;
+        if (*raw).format != ffi::FT_GLYPH_FORMAT_OUTLINE {
+            ffi::FT_GlyphSlot_Embolden(raw);
+            return;
         }
+        let face = (*raw).face;
+        let strength =
+            ffi::FT_MulFix(ffi::FT_Long::from((*face).units_per_EM), (*(*face).size).metrics.y_scale)
+                / 64;
+        ffi::FT_Outline_Embolden(&mut (*raw).outline, strength);
     }
 }
 

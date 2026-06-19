@@ -172,7 +172,6 @@ impl RenderEngine {
             let mut outline_planes = Vec::new();
             let mut character_planes = Vec::new();
             let mut opaque_box_rects = Vec::new();
-            let mut clip_mask_bleed = 0;
             let effect_disables_collision = source_event
                 .map(transition_effect_disables_collision)
                 .unwrap_or(false);
@@ -265,7 +264,6 @@ impl RenderEngine {
                         config,
                         render_scale,
                     );
-                    clip_mask_bleed = clip_mask_bleed.max(style_clip_bleed(&effective_style));
                     if run.drawing.is_none() {
                         event_border_x =
                             event_border_x.max(effective_style.border_x.round().max(0.0) as i32);
@@ -456,6 +454,7 @@ impl RenderEngine {
                                 effective_position,
                                 render_scale: render_scale_all,
                                 mapping: &mapping,
+                                shear_pivot_y: Some(f64::from(line_top)),
                             },
                         );
                         // run.width already includes \fscx (layout applies the
@@ -658,6 +657,7 @@ impl RenderEngine {
                             effective_position,
                             render_scale: render_scale_all,
                             mapping: &mapping,
+                            shear_pivot_y: Some(f64::from(line_top)),
                         },
                     );
                     line_pen_x_26_6 += run_advance_26_6;
@@ -746,14 +746,13 @@ impl RenderEngine {
             if let Some(clip_rect) = resolve_animated_clip_rect(event, track, source_event, now_ms)
             {
                 let clip_rect = scale_clip_rect(clip_rect, &mapping);
-                let clip_rect = if event.inverse_clip {
-                    expand_rect(clip_rect, clip_mask_bleed)
-                } else {
-                    clip_rect
-                };
+                // libass render_and_apply_clip uses the exact clip rectangle for
+                // both \clip and \iclip; it does not bleed the inverse region by
+                // the border/shadow extent.
                 event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
             } else if let Some(vector_clip) = &event.vector_clip {
-                event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
+                let vector_clip = scale_vector_clip(vector_clip, &mapping);
+                event_planes = apply_vector_clip(event_planes, &vector_clip, event.inverse_clip);
             }
             if style.border_style == 4 {
                 if let Some(rect) = event_line_box {
@@ -791,6 +790,12 @@ impl RenderEngine {
             }
             if let Some(fade) = event.fade {
                 event_planes = apply_fade_to_planes(event_planes, fade, source_event, now_ms);
+            } else if planes_have_translucent_fill(&event_planes) {
+                // libass leaves FILTER_FILL_IN_BORDER clear when the primary or
+                // secondary colour is translucent, carving the fill out of the
+                // border so the two do not double-composite. The fade path above
+                // already does this when a fade is present.
+                carve_fill_out_of_outline(&mut event_planes);
             }
             event_planes = apply_effect_to_planes(
                 event_planes,

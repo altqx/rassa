@@ -47,6 +47,10 @@ pub(crate) struct RunTransformContext<'a> {
     pub(crate) effective_position: Option<(i32, i32)>,
     pub(crate) render_scale: RenderScale,
     pub(crate) mapping: &'a EventMapping,
+    /// Screen-space y of the run's ascender line (baseline - ascender).
+    /// libass calc_transform_matrix anchors the \fax/\fay shear at the
+    /// glyph cell top (outline y = -asc), not the rendered ink bbox top.
+    pub(crate) shear_pivot_y: Option<f64>,
 }
 
 pub(crate) fn apply_run_transform_to_recent_planes(
@@ -72,9 +76,16 @@ pub(crate) fn apply_run_transform_to_recent_planes(
         context.effective_position,
         context.mapping,
     );
-    let shear_base = planes_bounds(&recent_planes)
+    let bounds_base = planes_bounds(&recent_planes)
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
         .unwrap_or(origin);
+    // libass shears the outline about the glyph cell top (outline y = -asc),
+    // i.e. the run's ascender line in screen space; only the ink bbox top is
+    // used as a fallback when the ascender line is unavailable.
+    let shear_base = (
+        bounds_base.0,
+        context.shear_pivot_y.unwrap_or(bounds_base.1),
+    );
     let transform_slice = |planes: &mut Vec<ImagePlane>, start: usize| {
         let tail = planes.split_off(start);
         planes.extend(transform_event_planes(
@@ -112,10 +123,21 @@ pub(crate) fn event_transform_origin(
     }
     planes_bounds(planes)
         .map(|bounds| {
-            (
-                f64::from(bounds.x_min + bounds.x_max) / 2.0,
-                f64::from(bounds.y_min + bounds.y_max) / 2.0,
-            )
+            // libass calculate_rotation_params + get_base_point (ass_render.c):
+            // with neither \org nor an explicit position, rotation/shear pivots
+            // about the alignment base point of the bounding box, not its
+            // geometric center (only \an4/5/6 + \an2/5/8 land on the center).
+            let x = match event.alignment & 0x3 {
+                ass::HALIGN_LEFT => f64::from(bounds.x_min),
+                ass::HALIGN_RIGHT => f64::from(bounds.x_max),
+                _ => f64::from(bounds.x_min + bounds.x_max) / 2.0,
+            };
+            let y = match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+                ass::VALIGN_TOP => f64::from(bounds.y_min),
+                ass::VALIGN_CENTER => f64::from(bounds.y_min + bounds.y_max) / 2.0,
+                _ => f64::from(bounds.y_max),
+            };
+            (x, y)
         })
         .unwrap_or((0.0, 0.0))
 }
@@ -316,9 +338,10 @@ impl ProjectiveMatrix {
         let z4_dy = x2_dy * sy + z3_dy * cy;
         let z4_c = x2_c * sy + z3_c * cy;
 
-        // libass applies 3D perspective in its 26.6-ish outline coordinate space;
-        // convert the camera distance back to output pixels before warping planes.
-        let dist = 22_400.0 / 64.0 / render_scale_y.max(f64::EPSILON);
+        // libass calc_transform_matrix: dist = 20000 * blur_scale_y in 26.6
+        // outline units; blur_scale_y is frame_height/PlayResY, i.e. our
+        // render_scale_y, so in output pixels dist = 20000/64 * render_scale_y.
+        let dist = 20_000.0 / 64.0 * render_scale_y.max(f64::EPSILON);
 
         let x_num_dx = dist * x4_dx + origin_x * z4_dx;
         let x_num_dy = dist * x4_dy + origin_x * z4_dy;

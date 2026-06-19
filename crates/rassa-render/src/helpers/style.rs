@@ -65,16 +65,22 @@ pub(crate) fn resolve_run_style(
         if let Some(color) = transform.style.back_colour {
             style.back_colour = interpolate_color(style.back_colour, color, progress);
         }
+        // The parser expands \bord into border + border_x + border_y, so all
+        // three can be present in one transform. Interpolate border_x/border_y
+        // from the base (pre-\bord) values rather than the value \bord just
+        // wrote, otherwise a plain \t(\bord) compounds and overshoots.
+        let base_border_x = style.border_x;
+        let base_border_y = style.border_y;
         if let Some(border) = transform.style.border {
             style.border = interpolate_f64(style.border, border, progress);
             style.border_x = style.border;
             style.border_y = style.border;
         }
         if let Some(border_x) = transform.style.border_x {
-            style.border_x = interpolate_f64(style.border_x, border_x, progress);
+            style.border_x = interpolate_f64(base_border_x, border_x, progress);
         }
         if let Some(border_y) = transform.style.border_y {
-            style.border_y = interpolate_f64(style.border_y, border_y, progress);
+            style.border_y = interpolate_f64(base_border_y, border_y, progress);
         }
         if let Some(blur) = transform.style.blur {
             style.blur = interpolate_f64(style.blur, blur, progress);

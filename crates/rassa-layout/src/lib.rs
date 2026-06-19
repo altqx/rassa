@@ -260,7 +260,11 @@ fn layout_line_from_text<P: FontProvider>(
             let shaped = shaper.shape_text(
                 provider,
                 &ShapeRequest::new(&chunk_text, &chunk_font.family)
-                    .with_style(chunk_font.style.clone().unwrap_or_default())
+                    .with_style(
+                        font_style_name(&span.style)
+                            .or_else(|| chunk_font.style.clone())
+                            .unwrap_or_default(),
+                    )
                     .with_optional_weight(font_query_weight(span.style.font_weight))
                     .with_language(language)
                     .with_font_size(span.style.font_size as f32)

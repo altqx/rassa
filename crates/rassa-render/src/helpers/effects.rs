@@ -7,6 +7,17 @@ pub(crate) fn apply_fade_to_planes(
     now_ms: i64,
 ) -> Vec<ImagePlane> {
     let fade_alpha = compute_fad_alpha(fade, source_event, now_ms);
+    // libass (ass_render.c:2513) only sets FILTER_FILL_IN_BORDER when the base
+    // primary/secondary alpha are opaque AND `info->fade == 0`. While a fade is
+    // active it leaves the flag clear, so ass_fix_outline (ass_bitmap.c:205)
+    // carves the glyph fill out of the border bitmap. Without this carve the
+    // border interior double-blends with the fill under the semi-transparent
+    // fade alpha, leaving rassa more opaque than libass mid-fade. The base
+    // translucency case (non-fade \alpha/\1a/\2a) is carved in the main path.
+    let mut planes = planes;
+    if fade_alpha != 0 || planes_have_translucent_fill(&planes) {
+        carve_fill_out_of_outline(&mut planes);
+    }
     planes
         .into_iter()
         .map(|mut plane| {
@@ -14,6 +25,58 @@ pub(crate) fn apply_fade_to_planes(
             plane
         })
         .collect()
+}
+
+/// Mirror of libass `ass_fix_outline` (ass_bitmap.c:205): subtract the glyph
+/// fill coverage `g` from the border coverage `o` so the border becomes a
+/// hollow ring (`o = o > g ? o - g/2 : 0`). Operates per-pixel on the overlap
+/// of each Outline plane with each Character plane, addressed in shared screen
+/// space via plane `destination`.
+/// A fill is translucent when any character (fill) plane carries a non-zero
+/// colour alpha (libass `_a(c[0])`/`_a(c[1])`; 0 == opaque). Karaoke unswept
+/// syllables surface their secondary colour the same way.
+pub(crate) fn planes_have_translucent_fill(planes: &[ImagePlane]) -> bool {
+    planes
+        .iter()
+        .any(|plane| plane.kind == ass::ImageType::Character && (plane.color.0 & 0xFF) != 0)
+}
+
+pub(crate) fn carve_fill_out_of_outline(planes: &mut [ImagePlane]) {
+    let fills: Vec<(Point, Size, i32, Vec<u8>)> = planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character)
+        .map(|plane| (plane.destination, plane.size, plane.stride, plane.bitmap.clone()))
+        .collect();
+    if fills.is_empty() {
+        return;
+    }
+    for outline in planes
+        .iter_mut()
+        .filter(|plane| plane.kind == ass::ImageType::Outline)
+    {
+        for (fill_dst, fill_size, fill_stride, fill_bitmap) in &fills {
+            let left = outline.destination.x.max(fill_dst.x);
+            let top = outline.destination.y.max(fill_dst.y);
+            let right =
+                (outline.destination.x + outline.size.width).min(fill_dst.x + fill_size.width);
+            let bottom =
+                (outline.destination.y + outline.size.height).min(fill_dst.y + fill_size.height);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            for y in top..bottom {
+                let o_row = ((y - outline.destination.y) * outline.stride) as usize;
+                let g_row = ((y - fill_dst.y) * fill_stride) as usize;
+                for x in left..right {
+                    let o_idx = o_row + (x - outline.destination.x) as usize;
+                    let g_idx = g_row + (x - fill_dst.x) as usize;
+                    let g = fill_bitmap[g_idx];
+                    let o = outline.bitmap[o_idx];
+                    outline.bitmap[o_idx] = if o > g { o - g / 2 } else { 0 };
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

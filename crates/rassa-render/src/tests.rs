@@ -1858,48 +1858,6 @@ fn render_frame_applies_inverse_rectangular_clip() {
 }
 
 #[test]
-fn inverse_clip_bleed_covers_outline_growth_to_prevent_stray_glyph_leakage() {
-    let style = ParsedSpanStyle {
-        border: 5.0,
-        border_x: 5.0,
-        border_y: 5.0,
-        shadow: 0.0,
-        shadow_x: 0.0,
-        shadow_y: 0.0,
-        blur: 0.0,
-        be: 0.0,
-        ..ParsedSpanStyle::default()
-    };
-    let clip = Rect {
-        x_min: 20,
-        y_min: 0,
-        x_max: 24,
-        y_max: 10,
-    };
-    let glyph = ImagePlane {
-        size: Size {
-            width: 44,
-            height: 10,
-        },
-        stride: 44,
-        color: RgbaColor(0x00FF_FFFF),
-        destination: Point { x: 0, y: 0 },
-        kind: ass::ImageType::Outline,
-        bitmap: vec![255; 440],
-    };
-
-    let expanded = expand_rect(clip, style_clip_bleed(&style));
-    let parts = inverse_clip_plane(glyph, expanded);
-
-    assert!(
-        parts
-            .iter()
-            .all(|plane| plane.destination.x + plane.size.width <= 0 || plane.destination.x >= 44),
-        "inverse clip must mask outline bleed around the nominal clip, got {parts:?}"
-    );
-}
-
-#[test]
 fn render_frame_applies_vector_clip() {
     let track = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(0,0)\\clip(m 0 0 l 32 0 32 32 0 32)}Hi").expect("script should parse");
     let engine = RenderEngine::new();
