@@ -429,7 +429,10 @@ RASSA_LIBASS_BUILD_DIR=/path/to/libass-build/libass \
 This deliberately does not require pixel equality: Rassa has its own
 rasterizer. It compares track/event timing, visibility, image kind and colour
 sets, stable image-kind ordering, and per-kind visible geometry with a
-documented 3% axis tolerance for raster support differences. Filter to a
+documented 3% axis tolerance for raster support differences. It also runs
+tighter 1080p drawing/transform probes and a full 24 fps, progress-aware reveal
+curve comparison for the rotated Japanese karaoke fixture; these catch
+animation failures that a single reference PNG cannot expose. Filter to a
 fixture family or produce a diagnostic-only report with:
 
 ```sh

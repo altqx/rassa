@@ -7,6 +7,13 @@ pub(crate) struct EventTransform {
     pub(crate) rotation_z: f64,
     pub(crate) shear_x: f64,
     pub(crate) shear_y: f64,
+    /// libass stores `\\fax` / `\\fay` in unscaled glyph coordinates and
+    /// converts them to the already-scaled outline coordinate system before
+    /// applying the transform matrix.  Rassa transforms device-space planes,
+    /// so retain the effective run scale here to make that conversion.
+    pub(crate) scale_x: f64,
+    pub(crate) scale_y: f64,
+    pub(crate) pixel_aspect: f64,
 }
 
 impl EventTransform {
@@ -23,13 +30,16 @@ impl EventTransform {
     }
 }
 
-pub(crate) fn style_transform(style: &ParsedSpanStyle) -> EventTransform {
+pub(crate) fn style_transform(style: &ParsedSpanStyle, pixel_aspect: f64) -> EventTransform {
     EventTransform {
         rotation_x: style.rotation_x,
         rotation_y: style.rotation_y,
         rotation_z: style.rotation_z,
         shear_x: style.shear_x,
         shear_y: style.shear_y,
+        scale_x: style.scale_x,
+        scale_y: style.scale_y,
+        pixel_aspect,
     }
 }
 
@@ -53,7 +63,10 @@ pub(crate) struct RunTransformContext<'a> {
     /// different point and leaves a nominally vertical event laid out along
     /// its original horizontal baseline.
     pub(crate) event_layout_bounds: Option<Rect>,
-    pub(crate) render_scale: RenderScale,
+    /// libass's `blur_scale_y`, used for the perspective camera distance.
+    /// This normally equals the script-to-frame Y scale, but differs when
+    /// storage/LayoutRes is explicitly set.
+    pub(crate) projection_scale_y: f64,
     pub(crate) mapping: &'a EventMapping,
     /// Screen-space x of the run's baseline start. libass resets cumulative
     /// `\fay` baseline shear at run boundaries and measures every glyph
@@ -106,7 +119,7 @@ pub(crate) fn apply_run_transform_to_recent_planes(
             context.transform,
             origin,
             shear_base,
-            context.render_scale.y,
+            context.projection_scale_y,
         ));
     };
     transform_slice(shadow_planes, starts.shadow);
@@ -163,7 +176,7 @@ pub(crate) fn transform_event_planes(
     transform: EventTransform,
     origin: (f64, f64),
     shear_base: (f64, f64),
-    render_scale_y: f64,
+    projection_scale_y: f64,
 ) -> Vec<ImagePlane> {
     if planes.is_empty() || transform.is_identity() {
         return planes;
@@ -175,7 +188,7 @@ pub(crate) fn transform_event_planes(
         origin.1,
         shear_base.0,
         shear_base.1,
-        render_scale_y,
+        projection_scale_y,
     );
     if matrix.is_identity() {
         return planes;
@@ -299,7 +312,7 @@ impl ProjectiveMatrix {
         transform: EventTransform,
         origin_x: f64,
         origin_y: f64,
-        render_scale_y: f64,
+        projection_scale_y: f64,
     ) -> Self {
         Self::from_ass_transform_at_origin_with_shear_base(
             transform,
@@ -307,7 +320,7 @@ impl ProjectiveMatrix {
             origin_y,
             origin_x,
             origin_y,
-            render_scale_y,
+            projection_scale_y,
         )
     }
 
@@ -317,7 +330,7 @@ impl ProjectiveMatrix {
         origin_y: f64,
         shear_base_x: f64,
         shear_base_y: f64,
-        render_scale_y: f64,
+        projection_scale_y: f64,
     ) -> Self {
         let frx = transform.rotation_x.to_radians();
         let fry = transform.rotation_y.to_radians();
@@ -328,20 +341,30 @@ impl ProjectiveMatrix {
         let cy = fry.cos();
         let sz = -frz.sin();
         let cz = frz.cos();
-        let shear_x = finite_or_zero(transform.shear_x);
+        let scale_x = style_scale(transform.scale_x);
+        let scale_y = style_scale(transform.scale_y);
+        let pixel_aspect = style_scale(transform.pixel_aspect);
+        // libass calc_transform_matrix operates on an outline already scaled
+        // by fscx/fscy, hence converts the ASS shear parameters into that
+        // coordinate system first.  Omitting this ratio makes anisotropically
+        // scaled `\\fax`/`\\fay` geometry diverge dramatically.
+        let shear_x = finite_or_zero(transform.shear_x) * scale_x / scale_y * pixel_aspect;
         // Screen coordinates grow downwards. This positive sign implements
         // libass apply_baseline_shear + calc_transform_matrix: positive \fay
         // lowers each glyph by its cumulative x advance (including every
         // glyph and offset inside a multi-glyph HarfBuzz cluster).
-        let shear_y = finite_or_zero(transform.shear_y);
+        let shear_y = finite_or_zero(transform.shear_y) * scale_y / scale_x / pixel_aspect;
         let shear_x_const = shear_x * (origin_y - shear_base_y);
         let shear_y_const = shear_y * (origin_x - shear_base_x);
 
-        let x2_dx = cz + shear_x * sz;
+        // Apply the two-axis shear first, then rotate around Z exactly like
+        // libass's x1/y1 -> x2/y2 matrix multiplication.  The cross terms
+        // deliberately use the *other* shear axis here.
+        let x2_dx = cz - shear_y * sz;
         let x2_dy = shear_x * cz - sz;
         let x2_c = shear_x_const * cz - shear_y_const * sz;
         let y2_dx = sz + shear_y * cz;
-        let y2_dy = cz - shear_y * sz;
+        let y2_dy = shear_x * sz + cz;
         let y2_c = shear_x_const * sz + shear_y_const * cz;
 
         let y3_dx = y2_dx * cx;
@@ -359,9 +382,9 @@ impl ProjectiveMatrix {
         let z4_c = x2_c * sy + z3_c * cy;
 
         // libass calc_transform_matrix: dist = 20000 * blur_scale_y in 26.6
-        // outline units; blur_scale_y is frame_height/PlayResY, i.e. our
-        // render_scale_y, so in output pixels dist = 20000/64 * render_scale_y.
-        let dist = 20_000.0 / 64.0 * render_scale_y.max(f64::EPSILON);
+        // outline units. `projection_scale_y` is that storage/LayoutRes-based
+        // blur scale, so in output pixels dist = 20000/64 * projection_scale_y.
+        let dist = 20_000.0 / 64.0 * projection_scale_y.max(f64::EPSILON);
 
         let x_num_dx = dist * x4_dx + origin_x * z4_dx;
         let x_num_dy = dist * x4_dy + origin_x * z4_dy;
@@ -374,7 +397,7 @@ impl ProjectiveMatrix {
         let y_const = origin_y * dist + dist * y3_c + origin_y * z4_c
             - y_num_dx * origin_x
             - y_num_dy * origin_y;
-        let w_const = dist - z4_dx * origin_x - z4_dy * origin_y - z4_c;
+        let w_const = dist - z4_dx * origin_x - z4_dy * origin_y + z4_c;
 
         Self {
             m: [

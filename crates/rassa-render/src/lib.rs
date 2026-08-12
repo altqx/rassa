@@ -6,10 +6,11 @@ use rassa_core::{ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size, ass};
 use rassa_fonts::{FontMatch, FontProvider, FontconfigProvider};
 use rassa_layout::{LayoutEngine, LayoutEvent, LayoutFeatures, LayoutGlyphRun};
 use rassa_parse::{
-    ParsedAxisTransform, ParsedColourTransform, ParsedDrawing, ParsedEvent, ParsedFade,
-    ParsedFontSizeTransform, ParsedKaraokeMode, ParsedLinearTransform, ParsedMovement,
+    LIBASS_OUTLINE_MAX_D6, ParsedAxisTransform, ParsedColourTransform, ParsedDrawing, ParsedEvent,
+    ParsedFade, ParsedFontSizeTransform, ParsedKaraokeMode, ParsedLinearTransform, ParsedMovement,
     ParsedMovementExact, ParsedRectF64, ParsedScaleTransform, ParsedSpanStyle, ParsedTrack,
-    ParsedVectorClip, libass_outline_coordinate_from_f64, libass_outline_point_is_valid,
+    ParsedVectorClip, libass_drawing_scale_base, libass_outline_coordinate_from_f64,
+    libass_outline_point_is_valid, parse_dialogue_vector_clip_d6, parse_drawing_polygons_d6,
 };
 use rassa_raster::{RasterGlyph, RasterOptions, Rasterizer};
 use rassa_shape::{GlyphInfo, ShapingMode};
@@ -188,6 +189,8 @@ impl RenderEngine {
             let event_is_explicit = event.hard_override || effect_disables_collision;
             let event_font_scale = renderer_font_scale_for_event(config, event_is_explicit);
             let mapping = event_mapping(track, config, event_is_explicit);
+            let projection_scale_y =
+                renderer_projection_scale_y(track, config, event_font_scale, &mapping);
             let effective_position =
                 scale_position(resolve_event_position(track, event, now_ms), &mapping);
             let metrics_context = LineMetricsContext {
@@ -322,7 +325,8 @@ impl RenderEngine {
                     let run_shadow_start = shadow_planes.len();
                     let run_outline_start = outline_planes.len();
                     let run_character_start = character_planes.len();
-                    let run_transform = style_transform(&effective_style);
+                    let run_transform =
+                        style_transform(&effective_style, effective_pixel_aspect(track, config));
                     if style.border_style == 3 && (run.drawing.is_some() || !run.glyphs.is_empty())
                     {
                         // OUTLINE_BOX is produced per style run in libass. In
@@ -378,38 +382,42 @@ impl RenderEngine {
                         }
                     }
                     if let Some(drawing) = &run.drawing {
+                        let drawing_polygons = scaled_drawing_polygons(
+                            drawing,
+                            &run.text,
+                            effective_style.scale_x,
+                            effective_style.scale_y,
+                            render_scale_all.x,
+                            render_scale_all.y,
+                        );
                         // libass places a drawing's ink box so its bottom sits
                         // at baseline + pbo (drawing asc = height - pbo,
                         // desc = pbo); the plane top is baseline - height + pbo.
-                        let drawing_scale_y =
-                            style_scale(effective_style.scale_y) * style_scale(render_scale_y);
-                        let drawing_height = drawing
-                            .bounds()
-                            .map(|bounds| f64::from((bounds.height() - 1).max(0)) * drawing_scale_y)
+                        let drawing_height = drawing_polygons
+                            .as_deref()
+                            .and_then(drawing_height_from_d6)
                             .unwrap_or_default();
-                        let drawing_height =
-                            libass_outline_coordinate_from_f64(drawing_height).unwrap_or(0);
                         let baseline = line_top.saturating_add(line_ascender);
                         let drawing_top = baseline.saturating_sub(drawing_height);
                         let pbo_script = drawing_pbo_script_pixels(&effective_style, drawing)
                             * style_scale(effective_style.scale_y);
-                        if let Some(mut plane) = image_plane_from_drawing(
-                            drawing,
-                            DrawingPlaneParams {
-                                origin_x: run_origin_x,
-                                line_top: drawing_top,
-                                color: resolve_run_fill_color(
-                                    run,
-                                    &effective_style,
-                                    source_event,
-                                    now_ms,
-                                ),
-                                scale_x: effective_style.scale_x,
-                                scale_y: effective_style.scale_y,
-                                render_scale: render_scale_all,
-                                baseline_offset: pbo_script,
-                            },
-                        ) {
+                        if let Some(mut plane) = drawing_polygons.as_deref().and_then(|polygons| {
+                            image_plane_from_drawing(
+                                polygons,
+                                DrawingPlaneParams {
+                                    origin_x: run_origin_x,
+                                    line_top: drawing_top,
+                                    color: resolve_run_fill_color(
+                                        run,
+                                        &effective_style,
+                                        source_event,
+                                        now_ms,
+                                    ),
+                                    render_scale_y: render_scale_all.y,
+                                    baseline_offset: pbo_script,
+                                },
+                            )
+                        }) {
                             let drawing_fill_blur = if effective_style.border_x > 0.0
                                 || effective_style.border_y > 0.0
                                 || effective_style.shadow_x.abs() > f64::EPSILON
@@ -497,7 +505,7 @@ impl RenderEngine {
                                 event,
                                 effective_position,
                                 event_layout_bounds,
-                                render_scale: render_scale_all,
+                                projection_scale_y,
                                 mapping: &mapping,
                                 shear_pivot_x: Some(f64::from(run_origin_x_26_6) / 64.0),
                                 shear_pivot_y: Some(f64::from(line_top)),
@@ -608,12 +616,12 @@ impl RenderEngine {
                         );
                         if run.karaoke.is_some() {
                             let fill_planes = maybe_fill_plane.into_iter().collect();
-                            let vertical_sweep = run.karaoke.is_some_and(|karaoke| {
+                            let quarter_turn_sweep = run.karaoke.is_some_and(|karaoke| {
                                 karaoke.mode == ParsedKaraokeMode::Sweep
                                     && (effective_style.rotation_z.abs() % 180.0 - 90.0).abs()
                                         < f64::EPSILON
                             });
-                            if vertical_sweep {
+                            if quarter_turn_sweep {
                                 character_planes.extend(fill_planes);
                             } else {
                                 character_planes.extend(apply_karaoke_to_character_planes(
@@ -712,7 +720,7 @@ impl RenderEngine {
                             event,
                             effective_position,
                             event_layout_bounds,
-                            render_scale: render_scale_all,
+                            projection_scale_y,
                             mapping: &mapping,
                             shear_pivot_x: Some(f64::from(run_origin_x_26_6) / 64.0),
                             shear_pivot_y: Some(f64::from(line_top)),
@@ -722,12 +730,13 @@ impl RenderEngine {
                         && (effective_style.rotation_z.abs() % 180.0 - 90.0).abs() < f64::EPSILON
                     {
                         let transformed = character_planes.split_off(run_character_start);
-                        let swept = apply_vertical_karaoke_sweep_after_transform(
+                        let swept = apply_quarter_turn_karaoke_sweep_after_transform(
                             transformed,
                             run,
                             &effective_style,
                             source_event,
                             now_ms,
+                            run_advance_26_6 >> 6,
                         );
                         character_planes.extend(swept);
                     }
@@ -778,7 +787,17 @@ impl RenderEngine {
                 if let Some(vector_clip) = &event.vector_clip {
                     // A failed outline transform makes libass skip vector
                     // clipping altogether, for both regular and inverse clips.
-                    if let Some(vector_clip) = scale_vector_clip(vector_clip, &mapping) {
+                    if let Some(exact_clip) =
+                        source_event.and_then(|source| parse_dialogue_vector_clip_d6(&source.text))
+                    {
+                        if let Some(vector_clip) = scale_vector_clip_d6(&exact_clip, &mapping) {
+                            event_planes = apply_vector_clip_d6(
+                                event_planes,
+                                &vector_clip,
+                                event.vector_clip_inverse,
+                            );
+                        }
+                    } else if let Some(vector_clip) = scale_vector_clip(vector_clip, &mapping) {
                         event_planes = apply_vector_clip(
                             event_planes,
                             &vector_clip,

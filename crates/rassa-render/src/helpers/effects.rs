@@ -418,52 +418,13 @@ pub(crate) fn clip_plane_horizontally(
     })
 }
 
-pub(crate) fn clip_plane_vertically(
-    plane: &ImagePlane,
-    clip_top: i32,
-    clip_bottom: i32,
-) -> Option<ImagePlane> {
-    let plane_top = plane.destination.y;
-    let plane_bottom = plane.destination.y + plane.size.height;
-    let top = clip_top.max(plane_top);
-    let bottom = clip_bottom.min(plane_bottom);
-    if bottom <= top || plane.size.width <= 0 || plane.size.height <= 0 {
-        return None;
-    }
-
-    let start_row = (top - plane_top) as usize;
-    let new_height = (bottom - top) as usize;
-    let width = plane.size.width as usize;
-    let stride = plane.stride as usize;
-    let mut bitmap = vec![0_u8; width * new_height];
-    for row in 0..new_height {
-        let source_row = (start_row + row) * stride;
-        bitmap[row * width..(row + 1) * width]
-            .copy_from_slice(&plane.bitmap[source_row..source_row + width]);
-    }
-
-    Some(ImagePlane {
-        size: Size {
-            width: plane.size.width,
-            height: new_height as i32,
-        },
-        stride: plane.size.width,
-        color: plane.color,
-        destination: Point {
-            x: plane.destination.x,
-            y: top,
-        },
-        kind: plane.kind,
-        bitmap,
-    })
-}
-
-pub(crate) fn apply_vertical_karaoke_sweep_after_transform(
+pub(crate) fn apply_quarter_turn_karaoke_sweep_after_transform(
     planes: Vec<ImagePlane>,
     run: &LayoutGlyphRun,
     style: &ParsedSpanStyle,
     source_event: Option<&ParsedEvent>,
     now_ms: i64,
+    run_width: i32,
 ) -> Vec<ImagePlane> {
     let Some(karaoke) = run
         .karaoke
@@ -475,32 +436,42 @@ pub(crate) fn apply_vertical_karaoke_sweep_after_transform(
         return planes;
     };
     let relative = karaoke_elapsed_ms(event, now_ms) - i64::from(karaoke.start_ms);
-    if relative <= 0 || relative >= i64::from(karaoke.duration_ms) {
+    if relative < 0 || relative >= i64::from(karaoke.duration_ms) {
         return planes;
     }
-    let frz = style.rotation_z % 360.0;
-    if (frz - 270.0).abs() > f64::EPSILON && (frz + 90.0).abs() > f64::EPSILON {
-        return planes;
-    }
+    let progress = relative as f64 / f64::from(karaoke.duration_ms.max(1));
+    // libass keeps the \kf colour boundary screen-horizontal even after a
+    // quarter-turn transform.  The boundary starts at the leftmost
+    // transformed outline and advances by the syllable's untransformed
+    // logical width; it does not turn into a vertical wipe.  Rassa's fill
+    // bitmaps are trimmed to visible coverage, so retain the same one-column
+    // primary sliver used by the upright sweep path at progress zero.
+    let sweep_start_x = planes
+        .iter()
+        .filter_map(plane_ink_bounds)
+        .map(|bounds| bounds.x_min)
+        .min()
+        .map(|x| x.saturating_add(1))
+        .unwrap_or_else(|| {
+            planes
+                .iter()
+                .map(|plane| plane.destination.x)
+                .min()
+                .unwrap_or(0)
+        });
+    let split_x =
+        sweep_start_x.saturating_add((f64::from(run_width.max(0)) * progress).round() as i32);
     let mut result = Vec::new();
     for plane in planes {
-        let Some(_) = plane_ink_bounds(&plane) else {
-            continue;
-        };
-        let split_y = if frz > 0.0 {
-            plane.destination.y + plane.size.height
-        } else {
-            plane.destination.y
-        };
-        if let Some(mut top) = clip_plane_vertically(&plane, plane.destination.y, split_y) {
-            top.color = rgba_color_from_ass(style.primary_colour);
-            result.push(top);
+        if let Some(mut left) = clip_plane_horizontally(&plane, plane.destination.x, split_x) {
+            left.color = rgba_color_from_ass(style.primary_colour);
+            result.push(left);
         }
-        if let Some(mut bottom) =
-            clip_plane_vertically(&plane, split_y, plane.destination.y + plane.size.height)
+        if let Some(mut right) =
+            clip_plane_horizontally(&plane, split_x, plane.destination.x + plane.size.width)
         {
-            bottom.color = rgba_color_from_ass(style.secondary_colour);
-            result.push(bottom);
+            right.color = rgba_color_from_ass(style.secondary_colour);
+            result.push(right);
         }
     }
     result

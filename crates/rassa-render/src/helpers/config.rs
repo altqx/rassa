@@ -147,6 +147,32 @@ pub(crate) fn renderer_blur_scales(
     )
 }
 
+/// Vertical scale libass uses for the 3D projection camera distance.
+///
+/// `calc_transform_matrix` uses `blur_scale_y`, whose source height follows
+/// the event's font screen: normal margin-placed events use the aspect-fitted
+/// height, while explicit events use the full content height.  Its denominator
+/// is storage/LayoutRes rather than PlayRes.
+pub(crate) fn renderer_projection_scale_y(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    font_scale: f64,
+    mapping: &EventMapping,
+) -> f64 {
+    let layout = filter_layout_resolution(track, config);
+    let font_scale = if font_scale.is_finite() {
+        font_scale.max(0.0)
+    } else {
+        1.0
+    };
+    let font_screen_height = if !mapping.explicit && mapping.use_margins {
+        mapping.fit_h
+    } else {
+        f64::from(frame_content_size(track, config).height.max(1))
+    };
+    style_scale(font_screen_height / f64::from(layout.height.max(1))) * font_scale
+}
+
 pub(crate) fn frame_size(track: &ParsedTrack, config: &RendererConfig) -> Size {
     Size {
         width: if config.frame.width > 0 {

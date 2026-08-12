@@ -2390,6 +2390,163 @@ fn projective_transform_keeps_frx_and_fry_axes_distinct() {
 }
 
 #[test]
+fn projective_transform_rescales_ass_shear_for_anisotropic_fsc() {
+    let fax = ProjectiveMatrix::from_ass_transform_at_origin(
+        EventTransform {
+            shear_x: 0.4,
+            scale_x: 2.0,
+            scale_y: 0.5,
+            pixel_aspect: 2.0,
+            ..EventTransform::default()
+        },
+        0.0,
+        0.0,
+        1.0,
+    );
+    let fay = ProjectiveMatrix::from_ass_transform_at_origin(
+        EventTransform {
+            shear_y: 0.4,
+            scale_x: 2.0,
+            scale_y: 0.5,
+            pixel_aspect: 2.0,
+            ..EventTransform::default()
+        },
+        0.0,
+        0.0,
+        1.0,
+    );
+
+    let (fax_x, fax_y) = fax.transform_point(0.0, 10.0);
+    let (fay_x, fay_y) = fay.transform_point(100.0, 0.0);
+    assert!((fax_x - 32.0).abs() < 1.0e-6 && (fax_y - 10.0).abs() < 1.0e-6);
+    assert!((fay_x - 100.0).abs() < 1.0e-6 && (fay_y - 5.0).abs() < 1.0e-6);
+}
+
+#[test]
+fn projective_transform_composes_shear_rotation_and_offcenter_org_like_libass() {
+    let matrix = ProjectiveMatrix::from_ass_transform_at_origin_with_shear_base(
+        EventTransform {
+            rotation_x: 30.0,
+            rotation_y: -20.0,
+            rotation_z: 15.0,
+            shear_x: 0.2,
+            scale_x: 1.75,
+            scale_y: 0.6,
+            ..EventTransform::default()
+        },
+        120.0,
+        160.0,
+        80.0,
+        80.0,
+        1.0,
+    );
+    let corners = [
+        ((80.0, 80.0), (81.975_914, 110.276_864)),
+        ((255.0, 80.0), (236.595_498, 67.328_567)),
+        ((255.0, 104.0), (257.791_992, 79.568_907)),
+        ((80.0, 104.0), (93.873_252, 123.198_758)),
+    ];
+
+    for ((x, y), (expected_x, expected_y)) in corners {
+        let (actual_x, actual_y) = matrix.transform_point(x, y);
+        assert!((actual_x - expected_x).abs() < 1.0e-5);
+        assert!((actual_y - expected_y).abs() < 1.0e-5);
+    }
+}
+
+#[test]
+fn high_resolution_projective_drawing_uses_storage_camera_distance() {
+    let track = parse_script_text(include_str!(
+        "../../rassa-test/fixtures/libass/compare/edge/vector_transform.ass"
+    ))
+    .expect("vector transform fixture should parse");
+    let config = RendererConfig {
+        frame: Size {
+            width: 1920,
+            height: 1080,
+        },
+        storage: Size {
+            width: 1920,
+            height: 1080,
+        },
+        ..RendererConfig::default()
+    };
+    let planes = RenderEngine::new().render_frame_with_provider_and_config(
+        &track,
+        &NullFontProvider,
+        500,
+        &config,
+    );
+    let projected = planes
+        .into_iter()
+        .filter(|plane| plane.destination.x > 900 && plane.destination.y > 400)
+        .collect::<Vec<_>>();
+
+    // Fresh libass 3087d2b renders visible ink at 1047,462..1315,486.
+    // Rassa's rasterizer may move antialiased edges by a pixel, but the
+    // projection geometry and camera distance must remain the same.
+    assert_rect_near(
+        visible_bounds(&projected),
+        Rect {
+            x_min: 1047,
+            y_min: 462,
+            x_max: 1315,
+            y_max: 486,
+        },
+        2,
+        "storage resolution, not PlayRes scaling, sets libass's projection camera distance",
+    );
+}
+
+#[test]
+fn anisotropic_shear_fixture_tracks_libass_geometry() {
+    let track = parse_script_text(include_str!(
+        "../../rassa-test/fixtures/libass/compare/edge/anisotropic_shear.ass"
+    ))
+    .expect("anisotropic shear fixture should parse");
+    let engine = RenderEngine::new();
+    let expected = [
+        (
+            500,
+            Rect {
+                x_min: 80,
+                y_min: 79,
+                x_max: 312,
+                y_max: 101,
+            },
+        ),
+        (
+            1500,
+            Rect {
+                x_min: 80,
+                y_min: 79,
+                x_max: 280,
+                y_max: 121,
+            },
+        ),
+        (
+            2500,
+            Rect {
+                x_min: 81,
+                y_min: 63,
+                x_max: 256,
+                y_max: 124,
+            },
+        ),
+    ];
+
+    for (now_ms, libass_bounds) in expected {
+        let planes = engine.render_frame_with_provider(&track, &NullFontProvider, now_ms);
+        assert_rect_near(
+            visible_bounds(&planes),
+            libass_bounds,
+            2,
+            "anisotropic fax/fay plus combined 3D transform should follow libass geometry",
+        );
+    }
+}
+
+#[test]
 fn projective_transform_uses_deep_org_as_perspective_lever_arm() {
     let transform = EventTransform {
         rotation_x: 55.0,
@@ -4958,6 +5115,25 @@ fn bundled_vertical_karaoke_runs_share_one_event_rotation_pivot() {
     let track = parse_script_text("[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 320\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Vertical,@BundledAileron,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,270,1,1,0,7,100,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Vertical,,0,0,0,,{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱")
         .expect("vertical karaoke fixture parses");
     let engine = RenderEngine::new();
+    let sweep_planes =
+        engine.render_frame_with_provider(&track, &BundledFontProvider::aileron_regular(), 510);
+    let primary = sweep_planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0xFFFF_FF00);
+    let secondary = sweep_planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0xFF00_0000);
+    assert!(
+        primary.clone().any(|left| {
+            secondary.clone().any(|right| {
+                left.destination.y == right.destination.y
+                    && left.size.height == right.size.height
+                    && left.destination.x + left.size.width == right.destination.x
+            })
+        }),
+        "an in-progress quarter-turned syllable must retain libass's screen-horizontal primary/secondary split"
+    );
+
     let planes =
         engine.render_frame_with_provider(&track, &BundledFontProvider::aileron_regular(), 700);
 
@@ -4988,6 +5164,91 @@ fn bundled_vertical_karaoke_runs_share_one_event_rotation_pivot() {
             x_max: 77,
             y_max: 202,
         })
+    );
+}
+
+#[test]
+fn quarter_turn_karaoke_sweep_stays_horizontal_and_tracks_progress() {
+    let plane = ImagePlane {
+        size: Size {
+            width: 48,
+            height: 64,
+        },
+        stride: 48,
+        color: RgbaColor(0),
+        destination: Point { x: 20, y: 80 },
+        kind: ass::ImageType::Character,
+        bitmap: vec![255; 48 * 64],
+    };
+    let run = LayoutGlyphRun {
+        karaoke: Some(ParsedKaraokeSpan {
+            start_ms: 0,
+            duration_ms: 400,
+            mode: ParsedKaraokeMode::Sweep,
+        }),
+        ..LayoutGlyphRun::default()
+    };
+    let style = ParsedSpanStyle {
+        primary_colour: 0x0000_00FF,
+        secondary_colour: 0x00FF_FFFF,
+        rotation_z: 270.0,
+        ..ParsedSpanStyle::default()
+    };
+    let event = ParsedEvent {
+        start: 30,
+        duration: 2_000,
+        ..ParsedEvent::default()
+    };
+
+    let at_start = apply_quarter_turn_karaoke_sweep_after_transform(
+        vec![plane.clone()],
+        &run,
+        &style,
+        Some(&event),
+        30,
+        62,
+    );
+    assert_eq!(at_start[0].destination, Point { x: 20, y: 80 });
+    assert_eq!(
+        at_start[0].size,
+        Size {
+            width: 1,
+            height: 64
+        }
+    );
+    assert_eq!(at_start[0].color, RgbaColor(0xFF00_0000));
+    assert_eq!(at_start[1].destination, Point { x: 21, y: 80 });
+    assert_eq!(
+        at_start[1].size,
+        Size {
+            width: 47,
+            height: 64
+        }
+    );
+    assert_eq!(at_start[1].color, RgbaColor(0xFFFF_FF00));
+
+    let mid_sweep = apply_quarter_turn_karaoke_sweep_after_transform(
+        vec![plane],
+        &run,
+        &style,
+        Some(&event),
+        130,
+        62,
+    );
+    assert_eq!(
+        mid_sweep[0].size,
+        Size {
+            width: 17,
+            height: 64
+        }
+    );
+    assert_eq!(mid_sweep[1].destination, Point { x: 37, y: 80 });
+    assert_eq!(
+        mid_sweep[1].size,
+        Size {
+            width: 31,
+            height: 64
+        }
     );
 }
 
@@ -5213,6 +5474,152 @@ fn render_frame_applies_timed_transform_style() {
         .0;
     assert_ne!(start_fill, end_fill);
     assert!(total_plane_area(&end_planes) > total_plane_area(&start_planes));
+}
+
+#[test]
+fn decimal_thin_ring_keeps_latest_libass_geometry_and_continuity() {
+    let track = parse_script_text(include_str!(
+        "../../rassa-test/fixtures/libass/compare/edge/decimal_thin_ring.ass"
+    ))
+    .expect("decimal thin-ring fixture parses");
+    let planes = RenderEngine::new().render_frame_with_provider(&track, &NullFontProvider, 500);
+    let character = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Character)
+        .expect("the sub-pixel ring must retain visible fill coverage");
+
+    assert_eq!(
+        visible_bounds(std::slice::from_ref(character)),
+        Some(Rect {
+            x_min: 947,
+            y_min: 527,
+            x_max: 973,
+            y_max: 553,
+        }),
+        "latest libass 3087d2b has the same 26x26 visible character geometry"
+    );
+    let lit_pixels = character.bitmap.iter().filter(|alpha| **alpha > 0).count();
+    let alpha_mass: u64 = character.bitmap.iter().map(|alpha| u64::from(*alpha)).sum();
+    assert!(
+        (100..=130).contains(&lit_pixels),
+        "latest libass has 103 lit character pixels; got {lit_pixels}"
+    );
+    assert!(
+        (4_800..=5_800).contains(&alpha_mass),
+        "latest libass character alpha mass is 5341; got {alpha_mass}"
+    );
+
+    let width = usize::try_from(character.size.width).expect("positive width");
+    let height = usize::try_from(character.size.height).expect("positive height");
+    let stride = usize::try_from(character.stride).expect("positive stride");
+    let mut visited = vec![false; stride * height];
+    let mut components = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * stride + x;
+            if character.bitmap[index] == 0 || visited[index] {
+                continue;
+            }
+            components += 1;
+            let mut pending = vec![(x, y)];
+            visited[index] = true;
+            while let Some((current_x, current_y)) = pending.pop() {
+                for delta_y in -1_isize..=1 {
+                    for delta_x in -1_isize..=1 {
+                        if delta_x == 0 && delta_y == 0 {
+                            continue;
+                        }
+                        let Some(next_x) = current_x.checked_add_signed(delta_x) else {
+                            continue;
+                        };
+                        let Some(next_y) = current_y.checked_add_signed(delta_y) else {
+                            continue;
+                        };
+                        if next_x >= width || next_y >= height {
+                            continue;
+                        }
+                        let next = next_y * stride + next_x;
+                        if character.bitmap[next] > 0 && !visited[next] {
+                            visited[next] = true;
+                            pending.push((next_x, next_y));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(components, 1, "the bubble ring must not break into dots");
+}
+
+#[test]
+fn fixed_point_vector_clip_preserves_fractional_mask_and_inverse_complement() {
+    // These two 26.6 contours are only 20/64 px apart. Rounding each source
+    // coordinate to an integer makes them identical and erases the ring.
+    let exact_clip = ParsedVectorClip {
+        scale: 1,
+        polygons: vec![
+            vec![
+                Point { x: 6, y: 6 },
+                Point { x: 506, y: 6 },
+                Point { x: 506, y: 506 },
+                Point { x: 6, y: 506 },
+            ],
+            vec![
+                Point { x: 26, y: 26 },
+                Point { x: 26, y: 486 },
+                Point { x: 486, y: 486 },
+                Point { x: 486, y: 26 },
+            ],
+        ],
+    };
+    let source = solid_test_plane(8, 8, Point { x: 0, y: 0 });
+    let regular = apply_vector_clip_d6(vec![source.clone()], &exact_clip, false)
+        .into_iter()
+        .next()
+        .expect("regular exact clip");
+    let inverse = apply_vector_clip_d6(vec![source], &exact_clip, true)
+        .into_iter()
+        .next()
+        .expect("inverse exact clip");
+
+    assert_eq!(
+        regular.size,
+        Size {
+            width: 8,
+            height: 8
+        }
+    );
+    assert_eq!(inverse.size, regular.size);
+    assert!(regular.bitmap[4] > 0 && regular.bitmap[4] < 255);
+    assert_eq!(regular.bitmap[4 * 8 + 4], 0);
+    for (regular_alpha, inverse_alpha) in regular.bitmap.iter().zip(&inverse.bitmap) {
+        assert_eq!(u16::from(*regular_alpha) + u16::from(*inverse_alpha), 255);
+    }
+
+    let rounded_away = ParsedVectorClip {
+        scale: 1,
+        polygons: vec![
+            vec![
+                Point { x: 0, y: 0 },
+                Point { x: 8, y: 0 },
+                Point { x: 8, y: 8 },
+                Point { x: 0, y: 8 },
+            ],
+            vec![
+                Point { x: 0, y: 0 },
+                Point { x: 0, y: 8 },
+                Point { x: 8, y: 8 },
+                Point { x: 8, y: 0 },
+            ],
+        ],
+    };
+    let collapsed = mask_plane_with_vector_clip(
+        solid_test_plane(8, 8, Point { x: 0, y: 0 }),
+        &rounded_away,
+        false,
+    )
+    .expect("a valid but empty rounded clip retains an empty image node");
+    assert_eq!(collapsed.size, Size::default());
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]

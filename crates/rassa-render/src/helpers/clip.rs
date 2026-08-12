@@ -51,6 +51,43 @@ pub(crate) fn scale_vector_clip(
     })
 }
 
+/// Map a vector clip represented in libass's 26.6 source coordinate space to
+/// 26.6 render coordinates, preserving fractional edges through masking.
+pub(crate) fn scale_vector_clip_d6(
+    clip: &ParsedVectorClip,
+    mapping: &EventMapping,
+) -> Option<ParsedVectorClip> {
+    let scale_base = libass_drawing_scale_base(clip.scale);
+    if scale_base <= 0 {
+        return Some(ParsedVectorClip {
+            scale: clip.scale,
+            polygons: Vec::new(),
+        });
+    }
+    let source_scale = 64.0 * f64::from(scale_base);
+    let mut polygons = Vec::new();
+    polygons.try_reserve_exact(clip.polygons.len()).ok()?;
+    for polygon in &clip.polygons {
+        let mut scaled = Vec::new();
+        scaled.try_reserve_exact(polygon.len()).ok()?;
+        for point in polygon {
+            let mapped = Point {
+                x: clip_d6_coordinate(mapping.map_x_pos(f64::from(point.x) / source_scale))?,
+                y: clip_d6_coordinate(mapping.map_y_pos(f64::from(point.y) / source_scale))?,
+            };
+            if !clip_d6_point_is_valid(mapped) {
+                return None;
+            }
+            scaled.push(mapped);
+        }
+        polygons.push(scaled);
+    }
+    Some(ParsedVectorClip {
+        scale: clip.scale,
+        polygons,
+    })
+}
+
 pub(crate) fn apply_vector_clip(
     planes: Vec<ImagePlane>,
     clip: &ParsedVectorClip,
@@ -60,6 +97,160 @@ pub(crate) fn apply_vector_clip(
         .into_iter()
         .filter_map(|plane| mask_plane_with_vector_clip(plane, clip, inverse))
         .collect()
+}
+
+pub(crate) fn apply_vector_clip_d6(
+    planes: Vec<ImagePlane>,
+    clip: &ParsedVectorClip,
+    inverse: bool,
+) -> Vec<ImagePlane> {
+    planes
+        .into_iter()
+        .filter_map(|plane| mask_plane_with_vector_clip_d6(plane, clip, inverse))
+        .collect()
+}
+
+fn mask_plane_with_vector_clip_d6(
+    plane: ImagePlane,
+    clip: &ParsedVectorClip,
+    inverse: bool,
+) -> Option<ImagePlane> {
+    if clip
+        .polygons
+        .iter()
+        .flatten()
+        .copied()
+        .any(|point| !clip_d6_point_is_valid(point))
+    {
+        return Some(plane);
+    }
+    if clip.polygons.is_empty() {
+        return inverse.then_some(plane);
+    }
+
+    let stride = usize::try_from(plane.stride).ok()?;
+    let width = usize::try_from(plane.size.width).ok()?;
+    let height = usize::try_from(plane.size.height).ok()?;
+    let required_len = stride.checked_mul(height)?;
+    if stride < width || required_len > plane.bitmap.len() {
+        return None;
+    }
+
+    let sample_grid = clip_sample_grid_d6(&clip.polygons);
+    let mut bitmap = plane.bitmap.clone();
+    let mut clip_min_x = width;
+    let mut clip_min_y = height;
+    let mut clip_max_x = 0_usize;
+    let mut clip_max_y = 0_usize;
+    for row in 0..height {
+        for column in 0..width {
+            let global_x = i64::from(plane.destination.x) + i64::try_from(column).ok()?;
+            let global_y = i64::from(plane.destination.y) + i64::try_from(row).ok()?;
+            let coverage =
+                vector_clip_pixel_coverage_d6(global_x, global_y, &clip.polygons, sample_grid);
+            if coverage > 0 {
+                clip_min_x = clip_min_x.min(column);
+                clip_min_y = clip_min_y.min(row);
+                clip_max_x = clip_max_x.max(column + 1);
+                clip_max_y = clip_max_y.max(row + 1);
+            }
+            let mask = if inverse { 255 - coverage } else { coverage };
+            let index = row.checked_mul(stride)?.checked_add(column)?;
+            let source = u16::from(*bitmap.get(index)?);
+            *bitmap.get_mut(index)? = ((source * u16::from(mask) + 127) / 255) as u8;
+        }
+    }
+
+    let masked = ImagePlane { bitmap, ..plane };
+    if inverse {
+        return Some(masked);
+    }
+    if clip_min_x >= clip_max_x || clip_min_y >= clip_max_y {
+        return Some(zero_size_plane(masked));
+    }
+    crop_plane_to_bitmap_bounds(
+        masked, clip_min_x, clip_min_y, clip_max_x, clip_max_y, 0, 0, 0, 0,
+    )
+}
+
+fn clip_d6_coordinate(value: f64) -> Option<i32> {
+    let scaled = value * 64.0;
+    if !scaled.is_finite() {
+        return None;
+    }
+    let rounded = scaled.round();
+    if rounded < -f64::from(LIBASS_OUTLINE_MAX_D6) || rounded > f64::from(LIBASS_OUTLINE_MAX_D6) {
+        return None;
+    }
+    Some(rounded as i32)
+}
+
+fn clip_d6_point_is_valid(point: Point) -> bool {
+    (-LIBASS_OUTLINE_MAX_D6..=LIBASS_OUTLINE_MAX_D6).contains(&point.x)
+        && (-LIBASS_OUTLINE_MAX_D6..=LIBASS_OUTLINE_MAX_D6).contains(&point.y)
+}
+
+fn clip_sample_grid_d6(polygons: &[Vec<Point>]) -> u32 {
+    let mut points = polygons.iter().flatten().copied();
+    let Some(first) = points.next() else {
+        return 4;
+    };
+    let mut bounds = Rect {
+        x_min: first.x,
+        y_min: first.y,
+        x_max: first.x,
+        y_max: first.y,
+    };
+    for point in points {
+        bounds.x_min = bounds.x_min.min(point.x);
+        bounds.y_min = bounds.y_min.min(point.y);
+        bounds.x_max = bounds.x_max.max(point.x);
+        bounds.y_max = bounds.y_max.max(point.y);
+    }
+    let bounds_area =
+        i128::from(bounds.x_max - bounds.x_min) * i128::from(bounds.y_max - bounds.y_min);
+    if bounds_area <= 0 {
+        return 4;
+    }
+    let signed_double_area = polygons.iter().fold(0_i128, |total, polygon| {
+        if polygon.len() < 3 {
+            return total;
+        }
+        let contour = polygon
+            .iter()
+            .copied()
+            .zip(polygon.iter().copied().cycle().skip(1))
+            .take(polygon.len())
+            .fold(0_i128, |area, (left, right)| {
+                area + i128::from(left.x) * i128::from(right.y)
+                    - i128::from(right.x) * i128::from(left.y)
+            });
+        total.saturating_add(contour)
+    });
+    let thin_area_ceiling = ((bounds_area as u128) * 2 - 1) / 5;
+    if signed_double_area.unsigned_abs() <= thin_area_ceiling {
+        16
+    } else {
+        4
+    }
+}
+
+fn vector_clip_pixel_coverage_d6(x: i64, y: i64, polygons: &[Vec<Point>], sample_grid: u32) -> u8 {
+    let mut inside = 0_u32;
+    for row in 0..sample_grid {
+        let sample_y = (y as f64 + (f64::from(row) + 0.5) / f64::from(sample_grid)) * 64.0;
+        for column in 0..sample_grid {
+            let sample_x = (x as f64 + (f64::from(column) + 0.5) / f64::from(sample_grid)) * 64.0;
+            if point_in_drawing_polygons_at(sample_x, sample_y, polygons) {
+                inside += 1;
+            }
+        }
+    }
+    if inside == 0 {
+        0
+    } else {
+        ((inside * 255 + sample_grid * sample_grid / 2) / (sample_grid * sample_grid)) as u8
+    }
 }
 
 pub(crate) fn mask_plane_with_vector_clip(
@@ -142,23 +333,6 @@ fn zero_size_plane(plane: ImagePlane) -> ImagePlane {
         stride: 0,
         bitmap: Vec::new(),
         ..plane
-    }
-}
-
-pub(crate) fn drawing_pixel_coverage(x: i32, y: i32, polygons: &[Vec<Point>]) -> u8 {
-    const SAMPLES: [f64; 4] = [0.125, 0.375, 0.625, 0.875];
-    let mut inside = 0_u32;
-    for sample_y in SAMPLES {
-        for sample_x in SAMPLES {
-            if point_in_drawing_polygons_at(x as f64 + sample_x, y as f64 + sample_y, polygons) {
-                inside += 1;
-            }
-        }
-    }
-    if inside == 0 {
-        0
-    } else {
-        ((inside * 255 + 8) / 16) as u8
     }
 }
 

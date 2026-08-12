@@ -4049,6 +4049,79 @@ fn parse_vector_clip(value: &str) -> Option<ParsedVectorClip> {
     Some(ParsedVectorClip { scale, polygons })
 }
 
+/// Recover the first claimed vector clip in dialogue text without discarding
+/// libass's 26.6 outline precision.  The regular dialogue parser keeps its
+/// long-standing integer `ParsedVectorClip` representation for API
+/// compatibility; renderers can use this companion when the original event
+/// text is available.
+pub fn parse_dialogue_vector_clip_d6(text: &str) -> Option<ParsedVectorClip> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    while let Some(open_offset) = bytes[cursor..].iter().position(|byte| *byte == b'{') {
+        let block_start = cursor.checked_add(open_offset)?.checked_add(1)?;
+        let Some(close_offset) = bytes[block_start..].iter().position(|byte| *byte == b'}') else {
+            break;
+        };
+        let block_end = block_start.checked_add(close_offset)?;
+        if let Some(claim) =
+            vector_clip_d6_claim_in_override_block(&text[block_start..block_end], false)
+        {
+            return claim;
+        }
+        cursor = block_end.checked_add(1)?;
+    }
+    None
+}
+
+fn vector_clip_d6_claim_in_override_block(
+    block: &str,
+    inside_transform: bool,
+) -> Option<Option<ParsedVectorClip>> {
+    for raw_tag in split_override_tags(block) {
+        let tag = trim_ass_tag(raw_tag);
+        let clip_rest = tag
+            .strip_prefix("iclip")
+            .or_else(|| tag.strip_prefix("clip"));
+        if let Some(rest) = clip_rest {
+            if vector_clip_args(rest).is_some() {
+                return Some(parse_vector_clip_d6(rest));
+            }
+            continue;
+        }
+        // `apply_transform_immediate_tags` scans one transform layer only.
+        // Do the same here: recursively accepting nested `\t(\t(\clip))`
+        // would select a clip the regular dialogue parser ignores, and an
+        // attacker-controlled nesting chain could otherwise exhaust the
+        // stack while reparsing an event for fixed-point rendering.
+        if !inside_transform {
+            let Some(rest) = tag.strip_prefix('t') else {
+                continue;
+            };
+            let Some(inside) = parenthesized_args(rest) else {
+                continue;
+            };
+            let Some(tag_start) = inside.find('\\') else {
+                continue;
+            };
+            if let Some(claim) = vector_clip_d6_claim_in_override_block(&inside[tag_start..], true)
+            {
+                return Some(claim);
+            }
+        }
+    }
+    None
+}
+
+fn parse_vector_clip_d6(value: &str) -> Option<ParsedVectorClip> {
+    let (scale, drawing) = vector_clip_args(value)?;
+    let polygons =
+        match parse_drawing_polygons_checked_with_mode(drawing, DrawingCoordinateMode::FixedD6) {
+            DrawingParseOutcome::Parsed(polygons) => polygons.unwrap_or_default(),
+            DrawingParseOutcome::InvalidOutline => return None,
+        };
+    Some(ParsedVectorClip { scale, polygons })
+}
+
 fn vector_clip_args(value: &str) -> Option<(i32, &str)> {
     let inside = trim_ass_tag(parenthesized_args(value)?);
     if inside.is_empty() {
@@ -4082,6 +4155,25 @@ fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> 
     }
 }
 
+/// Parse an ASS drawing into libass's signed 26.6 outline coordinate space.
+///
+/// [`ParsedDrawing::polygons`] intentionally remains integer-valued for API
+/// compatibility.  Renderers which still have the original drawing text can
+/// use this representation to avoid collapsing fractional geometry (for
+/// example, a sub-pixel-thick ring later reduced with `\fscx`/`\fscy`).
+pub fn parse_drawing_polygons_d6(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> {
+    if drawing.is_empty() {
+        return None;
+    }
+    if libass_drawing_scale_base(scale) <= 0 {
+        return Some(Vec::new());
+    }
+    match parse_drawing_polygons_checked_with_mode(drawing, DrawingCoordinateMode::FixedD6) {
+        DrawingParseOutcome::Parsed(polygons) => polygons,
+        DrawingParseOutcome::InvalidOutline => Some(Vec::new()),
+    }
+}
+
 fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutcome {
     if drawing.is_empty() {
         return DrawingParseOutcome::Parsed(None);
@@ -4090,6 +4182,65 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
         return DrawingParseOutcome::Parsed(Some(Vec::new()));
     }
 
+    parse_drawing_polygons_checked_with_mode(drawing, DrawingCoordinateMode::ScaledInteger(scale))
+}
+
+#[derive(Clone, Copy)]
+enum DrawingCoordinateMode {
+    ScaledInteger(i32),
+    FixedD6,
+}
+
+impl DrawingCoordinateMode {
+    fn point(self, x: f64, y: f64) -> Point {
+        match self {
+            Self::ScaledInteger(scale) => scale_drawing_point(x, y, scale),
+            Self::FixedD6 => match (
+                libass_drawing_coordinate_to_d6(x),
+                libass_drawing_coordinate_to_d6(y),
+            ) {
+                (Some(x), Some(y)) => Point { x, y },
+                _ => Point {
+                    x: i32::MIN,
+                    y: i32::MIN,
+                },
+            },
+        }
+    }
+
+    fn point_is_valid(self, point: Point) -> bool {
+        match self {
+            Self::ScaledInteger(_) => libass_outline_point_is_valid(point),
+            Self::FixedD6 => {
+                (-LIBASS_OUTLINE_MAX_D6..=LIBASS_OUTLINE_MAX_D6).contains(&point.x)
+                    && (-LIBASS_OUTLINE_MAX_D6..=LIBASS_OUTLINE_MAX_D6).contains(&point.y)
+            }
+        }
+    }
+
+    fn coordinate_from_f64(self, value: f64) -> Option<i32> {
+        match self {
+            Self::ScaledInteger(_) => libass_outline_coordinate_from_f64(value),
+            Self::FixedD6 => {
+                if !value.is_finite() {
+                    return None;
+                }
+                let rounded = value.round();
+                if rounded < -f64::from(LIBASS_OUTLINE_MAX_D6)
+                    || rounded > f64::from(LIBASS_OUTLINE_MAX_D6)
+                {
+                    return None;
+                }
+                Some(rounded as i32)
+            }
+        }
+    }
+}
+
+fn parse_drawing_polygons_checked_with_mode(
+    drawing: &str,
+    mode: DrawingCoordinateMode,
+) -> DrawingParseOutcome {
     let mut cursor = DrawingCursor::new(drawing);
     let mut polygons = Vec::new();
     let mut current = Vec::new();
@@ -4107,7 +4258,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
             'm' => {
                 move_seen = true;
                 if !root_seen {
-                    let Some(point) = cursor.parse_point(scale) else {
+                    let Some(point) = cursor.parse_point(mode) else {
                         continue;
                     };
                     root_seen = true;
@@ -4115,7 +4266,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                     pen = point;
                     history.push(point);
                 }
-                cursor.parse_many_points(scale, 1, |batch| {
+                cursor.parse_many_points(mode, 1, |batch| {
                     let point = batch[0];
                     close_current_contour(&mut polygons, &mut current, &mut started);
                     pen = point;
@@ -4125,7 +4276,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
             }
             'n' => {
                 if !root_seen {
-                    let Some(point) = cursor.parse_point(scale) else {
+                    let Some(point) = cursor.parse_point(mode) else {
                         continue;
                     };
                     if !move_seen {
@@ -4136,7 +4287,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                     pen = point;
                     history.push(point);
                 }
-                cursor.parse_many_points(scale, 1, |batch| {
+                cursor.parse_many_points(mode, 1, |batch| {
                     pen = batch[0];
                     history.push(pen);
                     points += 1;
@@ -4146,9 +4297,9 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                 if !root_seen {
                     continue;
                 }
-                cursor.parse_many_points(scale, 1, |batch| {
+                cursor.parse_many_points(mode, 1, |batch| {
                     let point = batch[0];
-                    valid_outline &= add_line_segment(&mut current, &mut started, pen, point);
+                    valid_outline &= add_line_segment(&mut current, &mut started, pen, point, mode);
                     pen = point;
                     history.push(point);
                     points += 1;
@@ -4158,7 +4309,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                 if !root_seen {
                     continue;
                 }
-                cursor.parse_many_points(scale, 3, |batch| {
+                cursor.parse_many_points(mode, 3, |batch| {
                     let start = *history.last().expect("drawing root exists before bezier");
                     valid_outline &= add_cubic_segment(
                         &mut current,
@@ -4167,6 +4318,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                         batch[0],
                         batch[1],
                         batch[2],
+                        mode,
                     );
                     pen = batch[2];
                     history.extend_from_slice(batch);
@@ -4178,7 +4330,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                     continue;
                 }
                 let spline_start = *history.last().expect("drawing root exists before spline");
-                let Some(batch) = cursor.parse_exact_points::<3>(scale) else {
+                let Some(batch) = cursor.parse_exact_points::<3>(mode) else {
                     spline_close_points = None;
                     continue;
                 };
@@ -4189,14 +4341,15 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                     batch[0],
                     batch[1],
                     batch[2],
+                    mode,
                 );
                 spline_close_points = Some([spline_start, batch[0], batch[1]]);
                 pen = batch[2];
                 history.extend_from_slice(&batch);
                 points += 3;
-                cursor.parse_many_points(scale, 1, |batch| {
+                cursor.parse_many_points(mode, 1, |batch| {
                     valid_outline &=
-                        add_extend_spline(&mut current, &mut started, &history, batch[0]);
+                        add_extend_spline(&mut current, &mut started, &history, batch[0], mode);
                     pen = batch[0];
                     history.push(batch[0]);
                     points += 1;
@@ -4206,9 +4359,9 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                 if points < 3 {
                     continue;
                 }
-                cursor.parse_many_points(scale, 1, |batch| {
+                cursor.parse_many_points(mode, 1, |batch| {
                     valid_outline &=
-                        add_extend_spline(&mut current, &mut started, &history, batch[0]);
+                        add_extend_spline(&mut current, &mut started, &history, batch[0], mode);
                     pen = batch[0];
                     history.push(batch[0]);
                     points += 1;
@@ -4218,7 +4371,7 @@ fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutc
                 if let Some(close_points) = spline_close_points.take() {
                     for point in close_points {
                         valid_outline &=
-                            add_extend_spline(&mut current, &mut started, &history, point);
+                            add_extend_spline(&mut current, &mut started, &history, point, mode);
                         pen = point;
                         history.push(point);
                     }
@@ -4253,16 +4406,19 @@ impl<'a> DrawingCursor<'a> {
         Some(character)
     }
 
-    fn parse_point(&mut self, scale: i32) -> Option<Point> {
+    fn parse_point(&mut self, mode: DrawingCoordinateMode) -> Option<Point> {
         let x = self.parse_number()?;
         let y = self.parse_number()?;
-        Some(scale_drawing_point(x, y, scale))
+        Some(mode.point(x, y))
     }
 
-    fn parse_exact_points<const N: usize>(&mut self, scale: i32) -> Option<[Point; N]> {
+    fn parse_exact_points<const N: usize>(
+        &mut self,
+        mode: DrawingCoordinateMode,
+    ) -> Option<[Point; N]> {
         let mut points = Vec::with_capacity(N);
         for _ in 0..N {
-            let point = self.parse_point(scale)?;
+            let point = self.parse_point(mode)?;
             points.push(point);
         }
         points.try_into().ok()
@@ -4270,13 +4426,13 @@ impl<'a> DrawingCursor<'a> {
 
     fn parse_many_points(
         &mut self,
-        scale: i32,
+        mode: DrawingCoordinateMode,
         batch_size: usize,
         mut append_batch: impl FnMut(&[Point]),
     ) {
         debug_assert!(batch_size > 0);
         let mut batch = Vec::with_capacity(batch_size);
-        while let Some(point) = self.parse_point(scale) {
+        while let Some(point) = self.parse_point(mode) {
             batch.push(point);
             if batch.len() == batch_size {
                 append_batch(&batch);
@@ -4390,8 +4546,14 @@ fn is_ass_c_space(character: char) -> bool {
     )
 }
 
-fn add_line_segment(current: &mut Vec<Point>, started: &mut bool, from: Point, to: Point) -> bool {
-    if !libass_outline_point_is_valid(from) || !libass_outline_point_is_valid(to) {
+fn add_line_segment(
+    current: &mut Vec<Point>,
+    started: &mut bool,
+    from: Point,
+    to: Point,
+    mode: DrawingCoordinateMode,
+) -> bool {
+    if !mode.point_is_valid(from) || !mode.point_is_valid(to) {
         return false;
     }
     if !*started {
@@ -4409,17 +4571,18 @@ fn add_cubic_segment(
     control1: Point,
     control2: Point,
     end: Point,
+    mode: DrawingCoordinateMode,
 ) -> bool {
     if [start, control1, control2, end]
         .into_iter()
-        .any(|point| !libass_outline_point_is_valid(point))
+        .any(|point| !mode.point_is_valid(point))
     {
         return false;
     }
     if !*started {
         current.push(start);
     }
-    let Some(points) = approximate_cubic_bezier(start, control1, control2, end, 16) else {
+    let Some(points) = approximate_cubic_bezier(start, control1, control2, end, 16, mode) else {
         return false;
     };
     current.extend(points);
@@ -4434,17 +4597,19 @@ fn add_spline_segment(
     point1: Point,
     point2: Point,
     point3: Point,
+    mode: DrawingCoordinateMode,
 ) -> bool {
     if [previous, point1, point2, point3]
         .into_iter()
-        .any(|point| !libass_outline_point_is_valid(point))
+        .any(|point| !mode.point_is_valid(point))
     {
         return false;
     }
     if !*started {
         current.push(previous);
     }
-    let Some(points) = approximate_spline_segment(previous, point1, point2, point3, 16) else {
+    let Some(points) = approximate_spline_segment(previous, point1, point2, point3, 16, mode)
+    else {
         return false;
     };
     current.extend(points);
@@ -4457,6 +4622,7 @@ fn add_extend_spline(
     started: &mut bool,
     history: &[Point],
     point: Point,
+    mode: DrawingCoordinateMode,
 ) -> bool {
     let len = history.len();
     if len < 3 {
@@ -4469,6 +4635,7 @@ fn add_extend_spline(
         history[len - 2],
         history[len - 1],
         point,
+        mode,
     )
 }
 
@@ -4478,6 +4645,7 @@ fn approximate_cubic_bezier(
     control2: Point,
     end: Point,
     segments: usize,
+    mode: DrawingCoordinateMode,
 ) -> Option<Vec<Point>> {
     let segments = segments.max(1);
     let mut points = Vec::with_capacity(segments);
@@ -4493,8 +4661,8 @@ fn approximate_cubic_bezier(
             + 3.0 * one_minus_t * t.powi(2) * f64::from(control2.y)
             + t.powi(3) * f64::from(end.y);
         let point = Point {
-            x: libass_outline_coordinate_from_f64(x)?,
-            y: libass_outline_coordinate_from_f64(y)?,
+            x: mode.coordinate_from_f64(x)?,
+            y: mode.coordinate_from_f64(y)?,
         };
         if points.last().copied() != Some(point) {
             points.push(point);
@@ -4509,6 +4677,7 @@ fn approximate_spline_segment(
     point2: Point,
     point3: Point,
     segments: usize,
+    mode: DrawingCoordinateMode,
 ) -> Option<Vec<Point>> {
     let x01 = (i64::from(point1.x) - i64::from(previous.x)) / 3;
     let y01 = (i64::from(point1.y) - i64::from(previous.y)) / 3;
@@ -4522,7 +4691,7 @@ fn approximate_spline_segment(
             x: i32::try_from(x).ok()?,
             y: i32::try_from(y).ok()?,
         };
-        libass_outline_point_is_valid(point).then_some(point)
+        mode.point_is_valid(point).then_some(point)
     };
     let start = point_from_i64(
         i64::from(point1.x) + ((x12 - x01) >> 1),
@@ -4535,7 +4704,7 @@ fn approximate_spline_segment(
         i64::from(point2.y) + ((y23 - y12) >> 1),
     )?;
 
-    approximate_cubic_bezier(start, control1, control2, end, segments)
+    approximate_cubic_bezier(start, control1, control2, end, segments, mode)
 }
 
 fn scale_drawing_point(x: f64, y: f64, scale: i32) -> Point {
@@ -6802,6 +6971,41 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
                 ]],
             })
         );
+    }
+
+    #[test]
+    fn retains_decimal_vector_clip_points_in_d6_for_rendering() {
+        let clip = parse_dialogue_vector_clip_d6(
+            "{\\clip(m 0.838 1.25 l 10.5 1.25 10.5 9.75 0.838 9.75)}Clip",
+        )
+        .expect("vector clip");
+
+        assert_eq!(clip.scale, 1);
+        assert_eq!(
+            clip.polygons,
+            vec![vec![
+                Point { x: 54, y: 80 },
+                Point { x: 672, y: 80 },
+                Point { x: 672, y: 624 },
+                Point { x: 54, y: 624 },
+            ]]
+        );
+    }
+
+    #[test]
+    fn exact_vector_clip_scan_obeys_transform_and_first_claim_semantics() {
+        let clip = parse_dialogue_vector_clip_d6(
+            "{\\t(0,1000,\\iclip(m 0.5 0 l 10.5 0 10.5 10 0.5 10))\\clip(m 20 20 l 30 20 30 30 20 30)}Clip",
+        )
+        .expect("transform-side-effect vector clip");
+        assert_eq!(clip.polygons[0][0], Point { x: 32, y: 0 });
+        assert_eq!(clip.polygons[0][1], Point { x: 672, y: 0 });
+
+        let nested = parse_dialogue_vector_clip_d6(
+            "{\\t(0,1000,\\t(0,500,\\clip(m 0.5 0 l 10.5 0 10.5 10 0.5 10)))\\clip(m 20.5 20 l 30.5 20 30.5 30 20.5 30)}Clip",
+        )
+        .expect("the first clip understood by the normal parser");
+        assert_eq!(nested.polygons[0][0], Point { x: 1312, y: 1280 });
     }
 
     #[test]
