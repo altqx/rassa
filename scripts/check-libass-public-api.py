@@ -108,7 +108,11 @@ def canonical_type(type_name: str) -> str:
     canonical = " ".join(type_name.split())
     # Clang describes anonymous enums using their source location. Preserve
     # anonymous-enum identity without making checkout paths part of the ABI.
-    return re.sub(r"enum \(unnamed at .*?:\d+:\d+\)", "enum (anonymous)", canonical)
+    return re.sub(
+        r"enum \(unnamed(?: enum)? at .*?:\d+:\d+\)",
+        "enum (anonymous)",
+        canonical,
+    )
 
 
 def integer_value(node: dict[str, Any]) -> str | None:
