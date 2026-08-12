@@ -974,12 +974,15 @@ mod tests {
     #[test]
     fn complex_shaping_honors_track_kerning_and_ass_spacing_ligature_policy() {
         let engine = ShapeEngine::new();
-        let provider = FontconfigProvider::new();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test/font2.otf");
+        let provider =
+            DefaultFontFileProvider::new(NullFontProvider, path).with_family("BundledAileron");
         let shape = |text: &str, kerning: bool, horizontal_spacing: bool| {
             engine
                 .shape_text(
                     &provider,
-                    &ShapeRequest::new(text, "Noto Serif")
+                    &ShapeRequest::new(text, "BundledAileron")
                         .with_font_size(64.0)
                         .with_kerning(kerning)
                         .with_horizontal_spacing(horizontal_spacing)
@@ -990,10 +993,6 @@ mod tests {
 
         let kerned = shape("AVAV", true, false);
         let unkerned = shape("AVAV", false, false);
-        if kerned.font.path.is_none() || unkerned.font.path.is_none() {
-            eprintln!("skipping: Noto Serif is unavailable");
-            return;
-        }
         let width = |shaped: &ShapedText| {
             shaped
                 .runs
