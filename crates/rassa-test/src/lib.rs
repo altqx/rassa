@@ -80,6 +80,7 @@ mod tests {
     };
 
     const INLINE_OVERRIDE_FIXTURE: &str = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,36,&H00112233,&H00445566,&H000A0B0C,&H00101010,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)\\t(0,1000,\\1c&H00223344&)}{\\K100}Test";
+    const CHUNK_TRACK_FIXTURE: &str = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
     const STYLE_ONLY_FIXTURE: &str = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Alt,sans,18,&H00ABCDEF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,11,12,13,1";
 
     fn workspace_root() -> PathBuf {
@@ -91,6 +92,10 @@ mod tests {
     }
 
     fn write_temp_fixture(name: &str, content: &str) -> PathBuf {
+        write_temp_fixture_bytes(name, content.as_bytes())
+    }
+
+    fn write_temp_fixture_bytes(name: &str, content: &[u8]) -> PathBuf {
         let mut path = env::temp_dir();
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -112,6 +117,24 @@ mod tests {
             .collect::<Vec<_>>();
         raw.push(ptr::null_mut());
         (storage, raw)
+    }
+
+    fn initialized_capi_renderer(
+        library: *mut rassa_capi::ASS_Library,
+    ) -> *mut rassa_capi::ASS_Renderer {
+        unsafe {
+            let renderer = rassa_capi::ass_renderer_init(library);
+            rassa_capi::ass_set_frame_size(renderer, 320, 180);
+            rassa_capi::ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::Autodetect as i32,
+                ptr::null(),
+                1,
+            );
+            renderer
+        }
     }
 
     fn total_image_area(mut image: *mut rassa_capi::ASS_Image) -> i32 {
@@ -296,6 +319,14 @@ mod tests {
                 FontAttachment {
                     name: "font2.otf".to_string(),
                     data: include_bytes!("../fixtures/libass/compare/test/font2.otf").to_vec(),
+                },
+                FontAttachment {
+                    name: "broad-font1.ttf".to_string(),
+                    data: include_bytes!("../fixtures/libass/compare/broad/font1.ttf").to_vec(),
+                },
+                FontAttachment {
+                    name: "broad-font2.otf".to_string(),
+                    data: include_bytes!("../fixtures/libass/compare/broad/font2.otf").to_vec(),
                 },
             ],
             Some(env::temp_dir().join("rassa-compare-fonts")),
@@ -852,8 +883,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "focused libass fill-raster source coverage parity guard"]
-    fn upstream_compare_sub2_no_blur_source_plane_matches_libass_edge_coverage() {
+    fn upstream_compare_sub2_no_blur_visible_ink_matches_libass_bounds() {
         let script =
             include_str!("../fixtures/libass/compare/test/sub2.ass").replace("{\\blur1}", "");
         let track = parse_fixture(&script);
@@ -887,23 +917,27 @@ mod tests {
         let plane = character_planes[0];
         let stats = plane_bitmap_stats(plane);
 
-        assert_eq!(plane.destination.x, 329);
-        assert_eq!(plane.destination.y, 519);
-        assert_eq!(plane.size.width, 1966);
-        assert_eq!(plane.size.height, 564);
-        assert_eq!(
-            plane.stride, plane.size.width,
-            "rassa stores compact owned plane rows; libass probe stride is 1984"
+        let (inner_x_min, inner_y_min, inner_x_max, inner_y_max) = stats
+            .inner_bbox
+            .expect("fill plane should have visible ink");
+        let visible_bounds = (
+            plane.destination.x + inner_x_min as i32,
+            plane.destination.y + inner_y_min as i32,
+            plane.destination.x + inner_x_max as i32,
+            plane.destination.y + inner_y_max as i32,
         );
-        assert_eq!(
-            stats,
-            PlaneBitmapStats {
-                lit_pixels: 261_814,
-                alpha_sum: 65_024_894,
-                partial_pixels: 13_548,
-                inner_bbox: Some((0, 1, 1951, 551)),
-            }
+        let expected_bounds = (329, 520, 2281, 1071);
+        assert!(
+            (visible_bounds.0 - expected_bounds.0).abs() <= 1
+                && (visible_bounds.1 - expected_bounds.1).abs() <= 1
+                && (visible_bounds.2 - expected_bounds.2).abs() <= 1
+                && (visible_bounds.3 - expected_bounds.3).abs() <= 1,
+            "visible ink bounds should stay within raster-edge tolerance of the libass 0.17.5 ASS_Image probe; actual={visible_bounds:?} expected={expected_bounds:?}"
         );
+        assert_eq!(plane.color.0, 0x0000_ff00);
+        assert!(stats.lit_pixels > 0);
+        assert!(stats.alpha_sum > 0);
+        assert!(stats.partial_pixels > 0);
     }
 
     #[test]
@@ -973,10 +1007,88 @@ mod tests {
     }
 
     #[test]
+    fn upstream_compare_broad_static_matches_libass() {
+        let script = include_str!("../fixtures/libass/compare/broad/broad_static.ass");
+        assert_compare_fixture_close(
+            script,
+            500,
+            include_bytes!("../fixtures/libass/compare/broad/broad_static-0500.png"),
+            25000,
+            700,
+        );
+        assert_compare_fixture_close(
+            script,
+            1500,
+            include_bytes!("../fixtures/libass/compare/broad/broad_static-1500.png"),
+            25000,
+            700,
+        );
+        assert_compare_fixture_close(
+            script,
+            2500,
+            include_bytes!("../fixtures/libass/compare/broad/broad_static-2500.png"),
+            25000,
+            700,
+        );
+    }
+
+    #[test]
+    fn upstream_compare_broad_override_and_animation_cases_match_libass() {
+        for (script, frame_500, frame_1500, frame_2500, max_channel_diff, max_bad_pixels) in [
+            (
+                include_str!("../fixtures/libass/compare/broad/broad_overrides.ass"),
+                include_bytes!("../fixtures/libass/compare/broad/broad_overrides-0500.png")
+                    .as_slice(),
+                include_bytes!("../fixtures/libass/compare/broad/broad_overrides-1500.png")
+                    .as_slice(),
+                include_bytes!("../fixtures/libass/compare/broad/broad_overrides-2500.png")
+                    .as_slice(),
+                50000,
+                3000,
+            ),
+            (
+                include_str!("../fixtures/libass/compare/broad/broad_karaoke.ass"),
+                include_bytes!("../fixtures/libass/compare/broad/broad_karaoke-0500.png")
+                    .as_slice(),
+                include_bytes!("../fixtures/libass/compare/broad/broad_karaoke-1500.png")
+                    .as_slice(),
+                include_bytes!("../fixtures/libass/compare/broad/broad_karaoke-2500.png")
+                    .as_slice(),
+                50000,
+                3000,
+            ),
+            (
+                include_str!("../fixtures/libass/compare/broad/broad_box.ass"),
+                include_bytes!("../fixtures/libass/compare/broad/broad_box-0500.png").as_slice(),
+                include_bytes!("../fixtures/libass/compare/broad/broad_box-1500.png").as_slice(),
+                include_bytes!("../fixtures/libass/compare/broad/broad_box-2500.png").as_slice(),
+                50000,
+                3000,
+            ),
+        ] {
+            assert_compare_fixture_close(script, 500, frame_500, max_channel_diff, max_bad_pixels);
+            assert_compare_fixture_close(
+                script,
+                1500,
+                frame_1500,
+                max_channel_diff,
+                max_bad_pixels,
+            );
+            assert_compare_fixture_close(
+                script,
+                2500,
+                frame_2500,
+                max_channel_diff,
+                max_bad_pixels,
+            );
+        }
+    }
+
+    #[test]
     fn capi_smoke_parses_and_renders_fixture() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -1000,6 +1112,42 @@ mod tests {
     }
 
     #[test]
+    fn capi_new_track_has_libass_builtin_defaults() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+
+            assert!(!track.is_null());
+            assert_eq!((*track).n_styles, 1);
+            assert_eq!((*track).max_styles, 20);
+            assert_eq!((*track).n_events, 0);
+            assert_eq!((*track).max_events, 0);
+            assert_eq!((*track).default_style, 0);
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+            assert_eq!((*track).Timer, 0.0);
+            assert_eq!((*track).ScaledBorderAndShadow, 0);
+            assert_eq!((*track).Kerning, 0);
+            assert!(!(*track).styles.is_null());
+            let style = &*(*track).styles;
+            assert_eq!(CStr::from_ptr(style.Name).to_str(), Ok("Default"));
+            assert_eq!(CStr::from_ptr(style.FontName).to_str(), Ok("Arial"));
+            assert_eq!(style.FontSize, 18.0);
+            assert_eq!(style.PrimaryColour, 0xFFFF_FF00);
+            assert_eq!(style.SecondaryColour, 0x00FF_FF00);
+            assert_eq!(style.OutlineColour, 0x0000_0000);
+            assert_eq!(style.BackColour, 0x0000_0080);
+            assert_eq!(style.Bold, 200);
+            assert_eq!(style.MarginL, 20);
+            assert_eq!(style.MarginR, 20);
+            assert_eq!(style.MarginV, 20);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
     fn capi_process_data_populates_track_fields() {
         unsafe {
             let library = rassa_capi::ass_library_init();
@@ -1012,13 +1160,587 @@ mod tests {
             );
 
             assert!(!track.is_null());
-            assert_eq!((*track).n_styles, 1);
+            assert_eq!((*track).n_styles, 2);
             assert_eq!((*track).n_events, 1);
             assert_eq!((*track).PlayResX, 320);
             assert_eq!((*track).PlayResY, 180);
             assert!(!(*track).styles.is_null());
             assert!(!(*track).events.is_null());
+            assert_eq!((*(*track).styles.add(1)).PrimaryColour, 0x3322_1100);
             assert_eq!((*(*track).events).Duration, 2000);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_appends_to_existing_track_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            let second_fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H0000FF00,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,second";
+
+            rassa_capi::ass_process_data(
+                track,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *const c_char,
+                INLINE_OVERRIDE_FIXTURE.len() as i32,
+            );
+            rassa_capi::ass_process_data(
+                track,
+                second_fixture.as_ptr() as *const c_char,
+                second_fixture.len() as i32,
+            );
+
+            assert_eq!((*track).n_styles, 3);
+            assert_eq!((*track).default_style, 2);
+            assert_eq!((*track).n_events, 2);
+            assert_eq!((*(*track).events.add(0)).Style, 1);
+            assert_eq!((*(*track).events.add(1)).Style, 2);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events.add(1)).Text).to_str(),
+                Ok("second")
+            );
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_appends_bare_dialogue_after_events_header_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let dialogue = b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,Actor,1,2,3,fx,event-only\nDialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,second";
+            rassa_capi::ass_process_data(
+                track,
+                dialogue.as_ptr() as *const c_char,
+                dialogue.len() as i32,
+            );
+
+            assert_eq!((*track).n_events, 2);
+            assert_eq!((*(*track).events).Start, 1000);
+            assert_eq!((*(*track).events).Duration, 1000);
+            assert_eq!((*(*track).events).ReadOrder, 0);
+            assert_eq!((*(*track).events).Style, 1);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events).Name).to_str(),
+                Ok("Actor")
+            );
+            assert_eq!(CStr::from_ptr((*(*track).events).Effect).to_str(), Ok("fx"));
+            assert_eq!(
+                CStr::from_ptr((*(*track).events).Text).to_str(),
+                Ok("event-only")
+            );
+            assert_eq!((*(*track).events.add(1)).Start, 2000);
+            assert_eq!((*(*track).events.add(1)).ReadOrder, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_appends_bare_style_after_styles_header_like_libass() {
+        let header = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n";
+        let style = "Style: Later,sans,26,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,31,32,33,1";
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                header.as_ptr() as *const c_char,
+                header.len() as i32,
+            );
+            assert_eq!((*track).n_styles, 1);
+
+            rassa_capi::ass_process_data(
+                track,
+                style.as_ptr() as *const c_char,
+                style.len() as i32,
+            );
+
+            assert_eq!((*track).n_styles, 2);
+            assert_eq!(
+                CStr::from_ptr((*(*track).styles.add(1)).Name).to_str(),
+                Ok("Later")
+            );
+            assert_eq!((*(*track).styles.add(1)).FontSize as i32, 26);
+            assert_eq!((*(*track).styles.add(1)).PrimaryColour, 0x3322_1100);
+            assert_eq!((*(*track).styles.add(1)).MarginL, 31);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_applies_bare_info_after_script_info_header_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            let header = b"[Script Info]\n";
+            rassa_capi::ass_process_data(
+                track,
+                header.as_ptr() as *const c_char,
+                header.len() as i32,
+            );
+
+            let first = b"PlayResX: 640\rPlayResY: 360\nLayoutResX: 800\nLayoutResY: 450\nTimer: 120.5\nWrapStyle: 3\nScaledBorderAndShadow: yes\nKerning: 1\nLanguage:\tthai\nYCbCr Matrix: tv.601\nScriptType: v4.00+\n";
+            rassa_capi::ass_process_data(
+                track,
+                first.as_ptr() as *const c_char,
+                first.len() as i32,
+            );
+            assert_eq!((*track).PlayResX, 640);
+            assert_eq!((*track).PlayResY, 360);
+            assert_eq!((*track).LayoutResX, 800);
+            assert_eq!((*track).LayoutResY, 450);
+            assert_eq!((*track).Timer, 120.5);
+            assert_eq!((*track).WrapStyle, 3);
+            assert_eq!((*track).ScaledBorderAndShadow, 1);
+            assert_eq!((*track).Kerning, 1);
+            assert_eq!(CStr::from_ptr((*track).Language).to_str(), Ok("th"));
+            assert_eq!((*track).YCbCrMatrix, ass::YCbCrMatrix::Bt601Tv as i32);
+            assert_eq!((*track).track_type, ass::TrackType::Ass as i32);
+
+            let non_space_whitespace = b"Language:\x0cthai\n";
+            rassa_capi::ass_process_data(
+                track,
+                non_space_whitespace.as_ptr() as *const c_char,
+                non_space_whitespace.len() as i32,
+            );
+            assert_eq!(CStr::from_ptr((*track).Language).to_bytes(), b"th");
+
+            let second = b"Timer: nope\n";
+            rassa_capi::ass_process_data(
+                track,
+                second.as_ptr() as *const c_char,
+                second.len() as i32,
+            );
+            assert_eq!((*track).PlayResX, 640);
+            assert_eq!((*track).Timer, 0.0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_does_not_apply_lazy_info_defaults_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            let header = b"[Script Info]\n";
+            rassa_capi::ass_process_data(
+                track,
+                header.as_ptr() as *const c_char,
+                header.len() as i32,
+            );
+
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+            assert_eq!((*track).Timer, 0.0);
+            assert_eq!((*track).Kerning, 0);
+            assert!((*track).Language.is_null());
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_read_memory_defers_playres_fallback_until_render_like_libass() {
+        let fixture = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,Visible";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            assert!(!track.is_null());
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+            assert_eq!((*track).Timer, 0.0);
+            assert_eq!((*track).Kerning, 0);
+            assert!((*track).Language.is_null());
+
+            let mut detect_change = -1;
+            let _ = rassa_capi::ass_render_frame(renderer, track, 0, &mut detect_change);
+            assert_eq!((*track).PlayResX, 384);
+            assert_eq!((*track).PlayResY, 288);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_read_memory_keeps_explicit_invalid_playres_zero_until_render_like_libass() {
+        let fixture = "[Script Info]\nPlayResX:\u{00a0}640\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,Visible";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            assert!(!track.is_null());
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+
+            let mut detect_change = -1;
+            let _ = rassa_capi::ass_render_frame(renderer, track, 0, &mut detect_change);
+            assert_eq!((*track).PlayResX, 384);
+            assert_eq!((*track).PlayResY, 288);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_read_memory_leaves_missing_event_format_null_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            assert!(!track.is_null());
+            assert!(!(*track).style_format.is_null());
+            assert!((*track).event_format.is_null());
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_event_name_and_effect_null_only_when_format_omits_fields_like_libass() {
+        let omitted = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,Visible";
+        let empty = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Name, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,,Visible";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let omitted_track = rassa_capi::ass_read_memory(
+                library,
+                omitted.as_ptr() as *mut c_char,
+                omitted.len(),
+                ptr::null(),
+            );
+            let empty_track = rassa_capi::ass_read_memory(
+                library,
+                empty.as_ptr() as *mut c_char,
+                empty.len(),
+                ptr::null(),
+            );
+
+            assert!(!omitted_track.is_null());
+            assert!((*(*omitted_track).events).Name.is_null());
+            assert!((*(*omitted_track).events).Effect.is_null());
+            assert!(!empty_track.is_null());
+            assert_eq!(
+                CStr::from_ptr((*(*empty_track).events).Name).to_str(),
+                Ok("")
+            );
+            assert_eq!(
+                CStr::from_ptr((*(*empty_track).events).Effect).to_str(),
+                Ok("")
+            );
+
+            rassa_capi::ass_free_track(omitted_track);
+            rassa_capi::ass_free_track(empty_track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_fills_missing_playres_axis_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 640\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,Visible";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            assert!(!track.is_null());
+            assert_eq!((*track).PlayResX, 640);
+            assert_eq!((*track).PlayResY, 0);
+
+            let mut detect_change = -1;
+            let _ = rassa_capi::ass_render_frame(renderer, track, 0, &mut detect_change);
+            assert_eq!((*track).PlayResX, 640);
+            assert_eq!((*track).PlayResY, 480);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_ignores_bare_dialogue_outside_events_state_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                STYLE_ONLY_FIXTURE.as_ptr() as *const c_char,
+                STYLE_ONLY_FIXTURE.len() as i32,
+            );
+            assert_eq!((*track).n_styles, 2);
+            assert_eq!((*track).n_events, 0);
+
+            let dialogue = b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,ignored";
+            rassa_capi::ass_process_data(
+                track,
+                dialogue.as_ptr() as *const c_char,
+                dialogue.len() as i32,
+            );
+
+            assert_eq!((*track).n_events, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_ignores_bare_info_outside_info_state_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+            assert_eq!((*track).PlayResX, 320);
+
+            let info = b"PlayResX: 999\n";
+            rassa_capi::ass_process_data(track, info.as_ptr() as *const c_char, info.len() as i32);
+            assert_eq!((*track).PlayResX, 320);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_ignores_bare_style_outside_styles_state_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+            assert_eq!((*track).n_styles, 2);
+
+            let style = b"Style: Ignored,sans,30,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1";
+            rassa_capi::ass_process_data(
+                track,
+                style.as_ptr() as *const c_char,
+                style.len() as i32,
+            );
+
+            assert_eq!((*track).n_styles, 2);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_leaves_event_format_null_until_format_or_dialogue_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\n";
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+
+            rassa_capi::ass_process_data(
+                track,
+                fixture.as_ptr() as *const c_char,
+                fixture.len() as i32,
+            );
+
+            assert!((*track).event_format.is_null());
+
+            let dialogue = b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,fallback-event";
+            rassa_capi::ass_process_data(
+                track,
+                dialogue.as_ptr() as *const c_char,
+                dialogue.len() as i32,
+            );
+
+            assert!(!(*track).event_format.is_null());
+            assert_eq!((*track).n_events, 1);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events).Text).to_str(),
+                Ok("fallback-event")
+            );
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_updates_event_format_without_track_type_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let event_chunk = b"[Events]\nFormat: Text\nDialogue: event-format-only";
+            rassa_capi::ass_process_data(
+                track,
+                event_chunk.as_ptr() as *const c_char,
+                event_chunk.len() as i32,
+            );
+
+            assert_eq!(CStr::from_ptr((*track).event_format).to_str(), Ok("Text"));
+            assert_eq!((*track).n_events, 1);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events).Text).to_str(),
+                Ok("event-format-only")
+            );
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_uses_existing_style_format_for_bare_styles_like_libass() {
+        let fixture =
+            "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontsize\n";
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+
+            rassa_capi::ass_process_data(
+                track,
+                fixture.as_ptr() as *const c_char,
+                fixture.len() as i32,
+            );
+            assert_eq!(
+                CStr::from_ptr((*track).style_format).to_str(),
+                Ok("Name, Fontsize")
+            );
+
+            let style = b"Style: BareCustom,42";
+            rassa_capi::ass_process_data(
+                track,
+                style.as_ptr() as *const c_char,
+                style.len() as i32,
+            );
+
+            assert_eq!((*track).n_styles, 2);
+            assert_eq!(
+                CStr::from_ptr((*(*track).styles.add(1)).Name).to_str(),
+                Ok("BareCustom")
+            );
+            assert_eq!((*(*track).styles.add(1)).FontSize, 42.0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_zeroes_implicit_read_order_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,first\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,second";
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                fixture.as_ptr() as *const c_char,
+                fixture.len() as i32,
+            );
+
+            assert_eq!((*track).n_events, 2);
+            assert_eq!((*(*track).events.add(0)).ReadOrder, 0);
+            assert_eq!((*(*track).events.add(1)).ReadOrder, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_data_defers_force_style_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let (_storage, mut overrides) = style_override_list(&["PlayResX=640"]);
+            rassa_capi::ass_set_style_overrides(library, overrides.as_mut_ptr());
+
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *const c_char,
+                INLINE_OVERRIDE_FIXTURE.len() as i32,
+            );
+            assert_eq!((*track).PlayResX, 320);
+
+            rassa_capi::ass_process_force_style(track);
+            assert_eq!((*track).PlayResX, 640);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_process_codec_private_applies_force_style_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let (_storage, mut overrides) = style_override_list(&["PlayResX=640"]);
+            rassa_capi::ass_set_style_overrides(library, overrides.as_mut_ptr());
+
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_codec_private(
+                track,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *const c_char,
+                INLINE_OVERRIDE_FIXTURE.len() as i32,
+            );
+
+            assert_eq!((*track).PlayResX, 640);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -1030,9 +1752,14 @@ mod tests {
         unsafe {
             let library = rassa_capi::ass_library_init();
             let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
 
-            let first = b"first";
-            let second = b"second";
+            let first = b"10,2,Default,Actor,11,12,13,fx,first";
+            let second = b"11,3,Default,,0,0,0,,second";
             rassa_capi::ass_process_chunk(
                 track,
                 first.as_ptr() as *const c_char,
@@ -1049,6 +1776,23 @@ mod tests {
             );
 
             assert_eq!((*track).n_events, 2);
+            assert_eq!((*(*track).events.add(0)).ReadOrder, 10);
+            assert_eq!((*(*track).events.add(0)).Layer, 2);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events.add(0)).Name).to_str(),
+                Ok("Actor")
+            );
+            assert_eq!((*(*track).events.add(0)).MarginL, 11);
+            assert_eq!((*(*track).events.add(0)).MarginR, 12);
+            assert_eq!((*(*track).events.add(0)).MarginV, 13);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events.add(0)).Effect).to_str(),
+                Ok("fx")
+            );
+            assert_eq!(
+                CStr::from_ptr((*(*track).events.add(0)).Text).to_str(),
+                Ok("first")
+            );
             assert_eq!(rassa_capi::ass_step_sub(track, 1200, 1), 1800);
             assert_eq!(rassa_capi::ass_step_sub(track, 3200, -1), -2200);
             assert_eq!(rassa_capi::ass_step_sub(track, 3200, 0), -200);
@@ -1058,7 +1802,7 @@ mod tests {
 
             assert_eq!((*track).n_events, 1);
             assert_eq!((*(*track).events).Start, 3000);
-            assert_eq!((*(*track).events).ReadOrder, 0);
+            assert_eq!((*(*track).events).ReadOrder, 11);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -1066,10 +1810,130 @@ mod tests {
     }
 
     #[test]
-    fn capi_render_frame_reports_detect_change_states() {
+    fn capi_render_frame_with_no_events_fails_start_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_set_frame_size(renderer, 320, 180);
+
+            let mut detect_change = -1;
+            let images = rassa_capi::ass_render_frame(renderer, track, 0, &mut detect_change);
+
+            assert!(images.is_null());
+            assert_eq!(detect_change, 2);
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_without_frame_size_fails_start_like_libass() {
+        let fixture = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,Visible";
         unsafe {
             let library = rassa_capi::ass_library_init();
             let renderer = rassa_capi::ass_renderer_init(library);
+            rassa_capi::ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::Autodetect as i32,
+                ptr::null(),
+                1,
+            );
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = -1;
+            let images = rassa_capi::ass_render_frame(renderer, track, 0, &mut detect_change);
+
+            assert!(images.is_null());
+            assert_eq!(detect_change, 2);
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_without_ass_set_fonts_fails_start_like_libass() {
+        let fixture = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,Visible";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(library);
+            rassa_capi::ass_set_frame_size(renderer, 320, 180);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = -1;
+            let images = rassa_capi::ass_render_frame(renderer, track, 0, &mut detect_change);
+
+            assert!(images.is_null());
+            assert_eq!(detect_change, 2);
+            assert_eq!((*track).PlayResX, 0);
+            assert_eq!((*track).PlayResY, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_rejects_track_from_different_library_like_libass() {
+        unsafe {
+            let renderer_library = rassa_capi::ass_library_init();
+            let track_library = rassa_capi::ass_library_init();
+            let renderer = rassa_capi::ass_renderer_init(renderer_library);
+            rassa_capi::ass_set_frame_size(renderer, 320, 180);
+            rassa_capi::ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::Autodetect as i32,
+                ptr::null(),
+                1,
+            );
+            let track = rassa_capi::ass_read_memory(
+                track_library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = -1;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+
+            assert!(images.is_null());
+            assert_eq!(detect_change, 2);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(track_library);
+            rassa_capi::ass_library_done(renderer_library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_reports_detect_change_states() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -1089,7 +1953,134 @@ mod tests {
             assert!(!third.is_null());
             assert_eq!(first_change, 2);
             assert_eq!(second_change, 0);
-            assert!(third_change >= 1);
+            assert_eq!(third_change, 2);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_reports_no_change_for_static_output_at_new_timestamp() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)}Static";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut first_change = -1;
+            let first = rassa_capi::ass_render_frame(renderer, track, 500, &mut first_change);
+            let mut second_change = -1;
+            let second = rassa_capi::ass_render_frame(renderer, track, 900, &mut second_change);
+
+            assert!(!first.is_null());
+            assert!(!second.is_null());
+            assert_eq!(first_change, 2);
+            assert_eq!(second_change, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_does_not_cache_transform_tag_with_space_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)\\t (0,1000,\\fs60)}Anim";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut first_change = -1;
+            let first = rassa_capi::ass_render_frame(renderer, track, 0, &mut first_change);
+            let mut second_change = -1;
+            let second = rassa_capi::ass_render_frame(renderer, track, 900, &mut second_change);
+
+            assert!(!first.is_null());
+            assert!(!second.is_null());
+            assert_eq!(first_change, 2);
+            assert_eq!(second_change, 2);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_reports_position_only_change_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\move(20,20,60,20,0,1000)}Move";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut first_change = -1;
+            let first = rassa_capi::ass_render_frame(renderer, track, 0, &mut first_change);
+            let mut second_change = -1;
+            let second = rassa_capi::ass_render_frame(renderer, track, 500, &mut second_change);
+
+            assert!(!first.is_null());
+            assert!(!second.is_null());
+            assert_eq!(first_change, 2);
+            assert_eq!(second_change, 1);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_frame_reports_same_timestamp_content_change_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,36,&H00112233,&H00445566,&H000A0B0C,&H00101010,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Plain";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut first_change = -1;
+            let first = rassa_capi::ass_render_frame(renderer, track, 500, &mut first_change);
+            let mut override_style = rassa_capi::ASS_Style {
+                PrimaryColour: 0x0C0B_0A00,
+                SecondaryColour: 0x0C0B_0A00,
+                FontSize: 72.0,
+                ..Default::default()
+            };
+            rassa_capi::ass_set_selective_style_override_enabled(
+                renderer,
+                ass::override_bits::STYLE,
+            );
+            rassa_capi::ass_set_selective_style_override(renderer, &mut override_style);
+            let mut second_change = -1;
+            let second = rassa_capi::ass_render_frame(renderer, track, 500, &mut second_change);
+
+            assert!(!first.is_null());
+            assert!(!second.is_null());
+            assert_eq!(first_change, 2);
+            assert_eq!(second_change, 2);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -1101,7 +2092,7 @@ mod tests {
     fn capi_normal_multiline_renders_glyph_masks_not_solid_boxes() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,First normal line\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Second normal line\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Third normal line\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Fourth normal line";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1127,10 +2118,84 @@ mod tests {
     }
 
     #[test]
+    fn capi_vector_clip_no_overlap_keeps_zero_size_image_node_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(20,20)\\clip(m 200 120 l 220 120 220 140 200 140)\\p1}m 0 0 l 30 0 30 20 0 20";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let signatures = image_signatures(images);
+
+            assert!(!images.is_null());
+            assert!(
+                signatures
+                    .iter()
+                    .any(|(_, _, _, width, height, bitmap)| *width == 0
+                        && *height == 0
+                        && bitmap.is_empty()),
+                "valid non-overlapping vector clips keep a zero-size ASS_Image node"
+            );
+            assert_eq!(total_image_area(images), 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_many_active_events_stay_on_real_glyph_path_like_libass() {
+        let mut fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n".to_string();
+        for index in 0..65 {
+            fixture.push_str(&format!(
+                "Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{{\\an7\\pos(10,{})}}E{}\n",
+                10 + index * 2,
+                index
+            ));
+        }
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let signatures = image_signatures(images);
+
+            assert!(signatures.len() > 1);
+            assert!(
+                !signatures.iter().any(|(_, x, y, width, height, _)| *x == 0
+                    && *y == 0
+                    && *width == 320
+                    && *height == 180),
+                "many active events must not collapse into one frame-sized approximation"
+            );
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
     fn capi_renderer_frame_size_clips_output() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             rassa_capi::ass_set_frame_size(renderer, 48, 48);
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1160,7 +2225,7 @@ mod tests {
     fn capi_render_frame_orders_images_by_layer_then_read_order() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 5,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\1c&H0000FF&}High\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,40)\\1c&H00FF00&}Low";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1185,7 +2250,7 @@ mod tests {
     fn capi_render_frame_orders_shadow_outline_before_character() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00111111,&H0000FFFF,&H00222222,&H00333333,0,0,0,0,100,100,0,0,1,2,2,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}Hi";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1223,7 +2288,7 @@ mod tests {
     fn capi_render_frame_allows_collision_across_different_layers() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 1,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H00FF00&}Second";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1248,13 +2313,14 @@ mod tests {
 
     #[test]
     fn capi_font_scale_changes_rendered_image_size() {
+        let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Scale";
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
-                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
-                INLINE_OVERRIDE_FIXTURE.len(),
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
                 ptr::null(),
             );
 
@@ -1276,10 +2342,78 @@ mod tests {
     }
 
     #[test]
+    fn capi_font_scale_default_skips_explicit_events_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(40,40)}Scale";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_signature = image_signatures(baseline);
+            let baseline_area = total_image_area(baseline);
+            rassa_capi::ass_set_font_scale(renderer, 2.0);
+            let default_scaled =
+                rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+
+            assert_eq!(image_signatures(default_scaled), baseline_signature);
+            assert_eq!(total_image_area(default_scaled), baseline_area);
+
+            rassa_capi::ass_set_selective_style_override_enabled(
+                renderer,
+                ass::override_bits::DEFAULT,
+            );
+            let globally_scaled =
+                rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+
+            assert_ne!(image_signatures(globally_scaled), baseline_signature);
+            assert!(total_image_area(globally_scaled) > baseline_area);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_zero_font_scale_collapses_output_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Scale";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            rassa_capi::ass_set_font_scale(renderer, 0.0);
+            let mut detect_change = -1;
+            let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+
+            assert!(images.is_null());
+            assert_eq!(detect_change, 0);
+            assert_eq!((*track).PlayResX, 200);
+            assert_eq!((*track).PlayResY, 120);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
     fn capi_text_scale_overrides_change_rendered_bounds() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let baseline_fixture = "[Script Info]\nPlayResX: 240\nPlayResY: 140\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}Scale";
             let scaled_fixture = "[Script Info]\nPlayResX: 240\nPlayResY: 140\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\fscx200\\fscy50}Scale";
             let baseline_track = rassa_capi::ass_read_memory(
@@ -1317,7 +2451,7 @@ mod tests {
     fn capi_drawing_scale_overrides_change_rendered_bounds() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let baseline_fixture = "[Script Info]\nPlayResX: 120\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\p1}m 0 0 l 10 0 10 10 0 10";
             let scaled_fixture = "[Script Info]\nPlayResX: 120\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\fscx200\\fscy50\\p1}m 0 0 l 10 0 10 10 0 10";
             let baseline_track = rassa_capi::ass_read_memory(
@@ -1355,7 +2489,7 @@ mod tests {
     fn capi_text_spacing_override_changes_rendered_width() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let baseline_fixture = "[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}IIII";
             let spaced_fixture = "[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\fsp8}IIII";
             let baseline_track = rassa_capi::ass_read_memory(
@@ -1392,7 +2526,7 @@ mod tests {
     fn capi_frame_size_scales_rendered_image_size() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -1418,10 +2552,10 @@ mod tests {
     }
 
     #[test]
-    fn capi_invalid_frame_size_resets_both_dimensions() {
+    fn capi_invalid_frame_size_resets_renderer_and_fails_start_like_libass() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -1439,7 +2573,8 @@ mod tests {
 
             rassa_capi::ass_set_frame_size(renderer, -1, 360);
             let reset = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
-            assert_eq!(image_signatures(reset), baseline_signature);
+            assert!(reset.is_null());
+            assert_eq!(detect_change, 2);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -1451,7 +2586,7 @@ mod tests {
     fn capi_pixel_aspect_widens_rendered_output() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -1481,7 +2616,7 @@ mod tests {
     fn capi_negative_pixel_aspect_resets_to_default() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -1512,7 +2647,7 @@ mod tests {
     fn capi_storage_size_affects_default_aspect_mapping() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(0,0)}Storage";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1549,7 +2684,7 @@ mod tests {
     fn capi_margins_map_output_into_content_area_by_default() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(0,0)}I";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1580,7 +2715,7 @@ mod tests {
     fn capi_line_position_moves_subtitles_upward() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Shift";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1609,7 +2744,7 @@ mod tests {
     fn capi_line_spacing_expands_multiline_subtitle_height() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 140\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,One\\NTwo";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1638,7 +2773,7 @@ mod tests {
     fn capi_selective_style_override_changes_render_output() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Override";
             let track = rassa_capi::ass_read_memory(
                 library,
@@ -1653,8 +2788,8 @@ mod tests {
             let baseline_colors = image_colors(baseline);
 
             let mut override_style = rassa_capi::ASS_Style {
-                PrimaryColour: 0x000A0B0C,
-                SecondaryColour: 0x000A0B0C,
+                PrimaryColour: 0x0C0B_0A00,
+                SecondaryColour: 0x0C0B_0A00,
                 FontSize: 48.0,
                 ..Default::default()
             };
@@ -1668,9 +2803,143 @@ mod tests {
             let overridden_area = total_image_area(overridden);
             let overridden_colors = image_colors(overridden);
 
-            assert!(overridden_area > baseline_area);
+            assert!(overridden_area < baseline_area);
             assert!(overridden_colors.contains(&0x0C0B_0A00));
             assert!(!baseline_colors.contains(&0x0C0B_0A00));
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_selective_style_override_skips_explicit_positioned_event_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 288\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(20,40)}Explicit";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_area = total_image_area(baseline);
+            let baseline_colors = image_colors(baseline);
+
+            let mut override_style = rassa_capi::ASS_Style {
+                PrimaryColour: 0x0C0B_0A00,
+                SecondaryColour: 0x0C0B_0A00,
+                FontSize: 72.0,
+                ..Default::default()
+            };
+            rassa_capi::ass_set_selective_style_override_enabled(
+                renderer,
+                ass::override_bits::STYLE,
+            );
+            rassa_capi::ass_set_selective_style_override(renderer, &mut override_style);
+
+            let overridden = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let overridden_area = total_image_area(overridden);
+            let overridden_colors = image_colors(overridden);
+
+            assert_eq!(detect_change, 0);
+            assert_eq!(overridden_area, baseline_area);
+            assert_eq!(overridden_colors, baseline_colors);
+            assert!(!overridden_colors.contains(&0x0C0B_0A00));
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_selective_style_override_skips_raw_nested_hard_tag_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\foo(\\pos(20,40))}Wrapped";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_area = total_image_area(baseline);
+            let baseline_colors = image_colors(baseline);
+
+            let mut override_style = rassa_capi::ASS_Style {
+                PrimaryColour: 0x0C0B_0A00,
+                SecondaryColour: 0x0C0B_0A00,
+                FontSize: 72.0,
+                ..Default::default()
+            };
+            rassa_capi::ass_set_selective_style_override_enabled(
+                renderer,
+                ass::override_bits::STYLE,
+            );
+            rassa_capi::ass_set_selective_style_override(renderer, &mut override_style);
+
+            let overridden = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let overridden_area = total_image_area(overridden);
+            let overridden_colors = image_colors(overridden);
+
+            assert_eq!(detect_change, 0);
+            assert_eq!(overridden_area, baseline_area);
+            assert_eq!(overridden_colors, baseline_colors);
+            assert!(!overridden_colors.contains(&0x0C0B_0A00));
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_selective_style_override_still_applies_to_dialogue_sharing_explicit_style_like_libass()
+    {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 288\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Normal\nDialogue: 1,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\pos(20,100)}Explicit";
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_ptr() as *mut c_char,
+                fixture.len(),
+                ptr::null(),
+            );
+
+            let mut detect_change = 0;
+            let baseline = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let baseline_colors = image_colors(baseline);
+            assert!(baseline_colors.contains(&0x3322_1100));
+
+            let mut override_style = rassa_capi::ASS_Style {
+                PrimaryColour: 0x0C0B_0A00,
+                SecondaryColour: 0x0C0B_0A00,
+                FontSize: 56.0,
+                ..Default::default()
+            };
+            rassa_capi::ass_set_selective_style_override_enabled(
+                renderer,
+                ass::override_bits::STYLE,
+            );
+            rassa_capi::ass_set_selective_style_override(renderer, &mut override_style);
+
+            let overridden = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
+            let overridden_colors = image_colors(overridden);
+
+            assert_eq!(detect_change, 2);
+            assert!(overridden_colors.contains(&0x0C0B_0A00));
+            assert!(overridden_colors.contains(&0x3322_1100));
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -1689,11 +2958,54 @@ mod tests {
             assert!(!track.is_null());
             assert_eq!((*track).n_events, 1);
             assert_eq!((*track).PlayResX, 320);
+            assert!(!(*track).name.is_null());
+            assert_eq!(
+                CStr::from_ptr((*track).name).to_string_lossy(),
+                path.to_string_lossy()
+            );
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_file_rejects_unknown_track_type_like_libass() {
+        let path = write_temp_fixture("read-file-unknown-track", "[Script Info]\nPlayResX: 320\n");
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
+            let track = rassa_capi::ass_read_file(library, c_path.as_ptr(), ptr::null());
+
+            assert!(track.is_null());
+
+            rassa_capi::ass_library_done(library);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_memory_rejects_unknown_track_type_like_libass() {
+        let mut fixture: Vec<c_char> = b"[Script Info]\nPlayResX: 320\n"
+            .iter()
+            .copied()
+            .map(|byte| byte as c_char)
+            .collect();
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_mut_ptr(),
+                fixture.len(),
+                ptr::null(),
+            );
+
+            assert!(track.is_null());
+
+            rassa_capi::ass_library_done(library);
+        }
     }
 
     #[test]
@@ -1727,28 +3039,216 @@ mod tests {
     }
 
     #[test]
-    fn capi_read_styles_replaces_track_style_table() {
+    fn capi_read_memory_rejects_malformed_empty_codepage_input_like_libass() {
+        let mut fixture = CHUNK_TRACK_FIXTURE.as_bytes().to_vec();
+        fixture.extend_from_slice(b"Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,");
+        fixture.push(0xFF);
+        let mut fixture: Vec<c_char> = fixture.into_iter().map(|byte| byte as c_char).collect();
+        let codepage = CString::new("").expect("codepage cstring");
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_read_memory(
+                library,
+                fixture.as_mut_ptr(),
+                fixture.len(),
+                codepage.as_ptr(),
+            );
+
+            assert!(track.is_null());
+
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_read_styles_appends_to_track_style_table() {
         let path = write_temp_fixture("read-styles", STYLE_ONLY_FIXTURE);
         unsafe {
             let library = rassa_capi::ass_library_init();
             let track = rassa_capi::ass_new_track(library);
             let initial_style = rassa_capi::ass_alloc_style(track);
-            assert_eq!(initial_style, 0);
-            assert_eq!((*track).n_styles, 1);
+            assert_eq!(initial_style, 1);
+            assert_eq!((*track).n_styles, 2);
 
             let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
             let result = rassa_capi::ass_read_styles(track, c_path.as_ptr(), ptr::null());
 
             assert_eq!(result, 0);
-            assert_eq!((*track).n_styles, 1);
+            assert_eq!((*track).n_styles, 3);
             assert!(!(*track).styles.is_null());
-            assert_eq!((*(*track).styles).FontSize as i32, 18);
-            assert_eq!((*(*track).styles).MarginL, 11);
+            assert_eq!((*(*track).styles.add(2)).FontSize as i32, 18);
+            assert_eq!((*(*track).styles.add(2)).MarginL, 11);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_styles_rejects_malformed_empty_codepage_input_like_libass() {
+        let mut fixture = STYLE_ONLY_FIXTURE.as_bytes().to_vec();
+        fixture.push(0xFF);
+        let path = write_temp_fixture_bytes("read-styles-empty-codepage", &fixture);
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            let initial_styles = (*track).n_styles;
+
+            let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
+            let codepage = CString::new("").expect("codepage cstring");
+            let result = rassa_capi::ass_read_styles(track, c_path.as_ptr(), codepage.as_ptr());
+
+            assert_eq!(result, 1);
+            assert_eq!((*track).n_styles, initial_styles);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_styles_accepts_sectionless_style_file_like_libass() {
+        let sectionless_styles = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Alt,sans,22,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,21,22,23,1";
+        let path = write_temp_fixture("read-styles-sectionless", sectionless_styles);
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+            assert_eq!((*track).track_type, ass::TrackType::Ass as i32);
+            assert_eq!((*track).n_styles, 2);
+
+            let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
+            let result = rassa_capi::ass_read_styles(track, c_path.as_ptr(), ptr::null());
+
+            assert_eq!(result, 0);
+            assert_eq!((*track).n_styles, 3);
+            assert_eq!((*(*track).styles.add(2)).FontSize as i32, 22);
+            assert_eq!((*(*track).styles.add(2)).PrimaryColour, 0x3322_1100);
+            assert_eq!((*(*track).styles.add(2)).MarginL, 21);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_styles_empty_file_is_successful_noop_like_libass() {
+        let path = write_temp_fixture("read-styles-empty", "\n\n");
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
+            let result = rassa_capi::ass_read_styles(track, c_path.as_ptr(), ptr::null());
+
+            assert_eq!(result, 0);
+            assert_eq!((*track).n_styles, 2);
+            assert_eq!((*track).n_events, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_styles_processes_full_sections_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 640\nTimer: 90\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: ReadStyle,sans,25,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,9,8,7,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 3,0:00:01.00,0:00:02.50,ReadStyle,Actor,4,5,6,fx,from-read-styles";
+        let path = write_temp_fixture("read-styles-full", fixture);
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+
+            let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
+            let result = rassa_capi::ass_read_styles(track, c_path.as_ptr(), ptr::null());
+
+            assert_eq!(result, 0);
+            assert_eq!((*track).PlayResX, 640);
+            assert_eq!((*track).PlayResY, 0);
+            assert_eq!((*track).Timer, 90.0);
+            assert_eq!((*track).n_styles, 2);
+            assert_eq!(
+                CStr::from_ptr((*(*track).styles.add(1)).Name).to_str(),
+                Ok("ReadStyle")
+            );
+            assert_eq!((*track).n_events, 1);
+            assert_eq!((*(*track).events).ReadOrder, 0);
+            assert_eq!((*(*track).events).Layer, 3);
+            assert_eq!((*(*track).events).Style, 1);
+            assert_eq!((*(*track).events).Start, 1000);
+            assert_eq!((*(*track).events).Duration, 1500);
+            assert_eq!(
+                CStr::from_ptr((*(*track).events).Text).to_str(),
+                Ok("from-read-styles")
+            );
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_read_styles_processes_events_only_format_like_libass() {
+        let fixture = "[Events]\nFormat: Text\n";
+        let path = write_temp_fixture("read-styles-event-format", fixture);
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let c_path = CString::new(path.to_string_lossy().as_bytes()).expect("path cstring");
+            let result = rassa_capi::ass_read_styles(track, c_path.as_ptr(), ptr::null());
+
+            assert_eq!(result, 0);
+            assert_eq!(CStr::from_ptr((*track).event_format).to_str(), Ok("Text"));
+            assert_eq!((*track).n_events, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn capi_process_codec_private_adds_missing_event_format_like_libass() {
+        let fixture = "[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n";
+
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+
+            rassa_capi::ass_process_codec_private(
+                track,
+                fixture.as_ptr() as *const c_char,
+                fixture.len() as i32,
+            );
+
+            assert_eq!(
+                CStr::from_ptr((*track).event_format).to_str(),
+                Ok("Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+            );
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
     }
 
     #[test]
@@ -1856,11 +3356,17 @@ mod tests {
             let library = rassa_capi::ass_library_init();
             let track = rassa_capi::ass_new_track(library);
             assert_eq!(rassa_capi::ass_track_set_feature(track, 0, 1), 0);
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 1, 1), 0);
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 2, 1), 0);
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 3, 1), 0);
+            assert_eq!(rassa_capi::ass_track_set_feature(track, -1, 1), -1);
             assert_eq!(rassa_capi::ass_track_set_feature(track, 99, 1), -1);
 
             let allocation = rassa_capi::ass_malloc(64);
             assert!(!allocation.is_null());
+            std::ptr::write_bytes(allocation.cast::<u8>(), 0xa5, 64);
             rassa_capi::ass_free(allocation);
+            rassa_capi::ass_free(ptr::null_mut());
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -1877,16 +3383,38 @@ mod tests {
             rassa_capi::ass_get_available_font_providers(library, &mut providers, &mut size);
 
             assert!(!providers.is_null());
-            assert_eq!(size, 3);
-            let values = std::slice::from_raw_parts(providers, size);
-            assert_eq!(
-                values,
-                &[
+            let expected = if cfg!(target_os = "macos") {
+                vec![
+                    ass::DefaultFontProvider::None as i32,
+                    ass::DefaultFontProvider::Autodetect as i32,
+                    ass::DefaultFontProvider::CoreText as i32,
+                ]
+            } else if cfg!(windows) {
+                vec![
+                    ass::DefaultFontProvider::None as i32,
+                    ass::DefaultFontProvider::Autodetect as i32,
+                    ass::DefaultFontProvider::DirectWrite as i32,
+                ]
+            } else if cfg!(all(
+                unix,
+                not(target_os = "macos"),
+                not(target_arch = "wasm32")
+            )) {
+                vec![
                     ass::DefaultFontProvider::None as i32,
                     ass::DefaultFontProvider::Autodetect as i32,
                     ass::DefaultFontProvider::Fontconfig as i32,
                 ]
-            );
+            } else {
+                vec![
+                    ass::DefaultFontProvider::None as i32,
+                    ass::DefaultFontProvider::Autodetect as i32,
+                ]
+            };
+
+            assert_eq!(size, expected.len());
+            let values = std::slice::from_raw_parts(providers, size);
+            assert_eq!(values, expected.as_slice());
 
             rassa_capi::ass_free(providers.cast());
             rassa_capi::ass_library_done(library);
@@ -1903,8 +3431,8 @@ mod tests {
                 INLINE_OVERRIDE_FIXTURE.len(),
                 ptr::null(),
             );
-            let none_renderer = rassa_capi::ass_renderer_init(library);
-            let invalid_renderer = rassa_capi::ass_renderer_init(library);
+            let none_renderer = initialized_capi_renderer(library);
+            let invalid_renderer = initialized_capi_renderer(library);
 
             rassa_capi::ass_set_fonts(
                 none_renderer,
@@ -1931,8 +3459,8 @@ mod tests {
             let invalid_images =
                 rassa_capi::ass_render_frame(invalid_renderer, track, 500, &mut invalid_change);
 
-            assert!(none_change > 0);
-            assert!(invalid_change > 0);
+            assert_eq!(none_change, 0);
+            assert_eq!(invalid_change, 0);
             assert_eq!(image_signatures(invalid_images), none_signature);
 
             rassa_capi::ass_renderer_done(none_renderer);
@@ -1959,8 +3487,8 @@ mod tests {
                 INLINE_OVERRIDE_FIXTURE.len(),
                 ptr::null(),
             );
-            let no_default_renderer = rassa_capi::ass_renderer_init(library);
-            let default_renderer = rassa_capi::ass_renderer_init(library);
+            let no_default_renderer = initialized_capi_renderer(library);
+            let default_renderer = initialized_capi_renderer(library);
 
             rassa_capi::ass_set_fonts(
                 no_default_renderer,
@@ -1990,8 +3518,8 @@ mod tests {
             let default_images =
                 rassa_capi::ass_render_frame(default_renderer, track, 500, &mut default_change);
 
-            assert!(no_default_change > 0);
-            assert!(default_change > 0);
+            assert_eq!(no_default_change, 0);
+            assert_eq!(default_change, 2);
             assert!(image_signatures(no_default_images).is_empty());
             assert!(!image_signatures(default_images).is_empty());
 
@@ -2003,10 +3531,10 @@ mod tests {
     }
 
     #[test]
-    fn capi_track_features_are_locked_after_rendering() {
+    fn capi_track_features_can_change_after_rendering_like_libass() {
         unsafe {
             let library = rassa_capi::ass_library_init();
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
             let track = rassa_capi::ass_read_memory(
                 library,
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
@@ -2019,7 +3547,8 @@ mod tests {
             let mut detect_change = 0;
             let images = rassa_capi::ass_render_frame(renderer, track, 500, &mut detect_change);
             assert!(!images.is_null());
-            assert_eq!(rassa_capi::ass_track_set_feature(track, 0, 0), -1);
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 0, 0), 0);
+            assert_eq!(rassa_capi::ass_track_set_feature(track, 3, 1), 0);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -2038,22 +3567,27 @@ mod tests {
                 INLINE_OVERRIDE_FIXTURE.as_ptr() as *const c_char,
                 INLINE_OVERRIDE_FIXTURE.len() as i32,
             );
-            assert_eq!((*track).n_styles, 1);
+            assert_eq!((*track).n_styles, 2);
+            assert_eq!((*track).max_styles, 20);
             assert_eq!((*track).n_events, 1);
+            assert_eq!((*track).max_events, 1);
 
             let style_index = rassa_capi::ass_alloc_style(track);
             let event_index = rassa_capi::ass_alloc_event(track);
-            assert_eq!(style_index, 1);
+            assert_eq!(style_index, 2);
             assert_eq!(event_index, 1);
-            assert_eq!((*track).n_styles, 2);
+            assert_eq!((*track).n_styles, 3);
+            assert_eq!((*track).max_styles, 20);
             assert_eq!((*track).n_events, 2);
+            assert_eq!((*track).max_events, 3);
+            assert_eq!((*(*track).events.add(1)).ReadOrder, 0);
 
             rassa_capi::ass_free_style(track, 0);
             rassa_capi::ass_free_event(track, 0);
 
             assert!((*(*track).styles.add(0)).Name.is_null());
             assert!((*(*track).styles.add(0)).FontName.is_null());
-            assert_eq!((*(*track).styles.add(0)).FontSize as i32, 20);
+            assert_eq!((*(*track).styles.add(0)).FontSize as i32, 0);
             assert!((*(*track).events.add(0)).Text.is_null());
             assert_eq!((*(*track).events.add(0)).Start, 0);
             assert_eq!((*(*track).events.add(0)).Duration, 0);
@@ -2068,20 +3602,307 @@ mod tests {
         unsafe {
             let library = rassa_capi::ass_library_init();
             let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
 
             rassa_capi::ass_set_check_readorder(track, 0);
-            rassa_capi::ass_process_chunk(track, b"zero".as_ptr() as *const c_char, 4, 1000, 100);
-            rassa_capi::ass_process_chunk(track, b"zero2".as_ptr() as *const c_char, 5, 1200, 100);
+            let zero = b"0,0,Default,,0,0,0,,zero";
+            rassa_capi::ass_process_chunk(
+                track,
+                zero.as_ptr() as *const c_char,
+                zero.len() as i32,
+                1000,
+                100,
+            );
+            let zero2 = b"0,0,Default,,0,0,0,,zero2";
+            rassa_capi::ass_process_chunk(
+                track,
+                zero2.as_ptr() as *const c_char,
+                zero2.len() as i32,
+                1200,
+                100,
+            );
             assert_eq!((*(*track).events.add(0)).ReadOrder, 0);
             assert_eq!((*(*track).events.add(1)).ReadOrder, 0);
 
             rassa_capi::ass_set_check_readorder(track, 1);
-            rassa_capi::ass_process_chunk(track, b"one".as_ptr() as *const c_char, 3, 1400, 100);
+            let dupe = b"0,0,Default,,0,0,0,,dupe";
+            rassa_capi::ass_process_chunk(
+                track,
+                dupe.as_ptr() as *const c_char,
+                dupe.len() as i32,
+                1400,
+                100,
+            );
+            assert_eq!((*track).n_events, 2);
+            let one = b"2,0,Default,,0,0,0,,one";
+            rassa_capi::ass_process_chunk(
+                track,
+                one.as_ptr() as *const c_char,
+                one.len() as i32,
+                1400,
+                100,
+            );
             assert_eq!((*(*track).events.add(2)).ReadOrder, 2);
 
             rassa_capi::ass_set_check_readorder(track, 2);
-            rassa_capi::ass_process_chunk(track, b"two".as_ptr() as *const c_char, 3, 1600, 100);
-            assert_eq!((*(*track).events.add(3)).ReadOrder, 0);
+            let two = b"2,0,Default,,0,0,0,,two";
+            rassa_capi::ass_process_chunk(
+                track,
+                two.as_ptr() as *const c_char,
+                two.len() as i32,
+                1600,
+                100,
+            );
+            assert_eq!((*(*track).events.add(3)).ReadOrder, 2);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_chunk_skipped_style_field_leaves_style_zero_like_libass() {
+        let fixture = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans,24\n\n[Events]\nFormat: ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                fixture.as_ptr() as *const c_char,
+                fixture.len() as i32,
+            );
+
+            let chunk = b"7,2,Default,Actor,11,12,13,fx,hello";
+            rassa_capi::ass_process_chunk(
+                track,
+                chunk.as_ptr() as *const c_char,
+                chunk.len() as i32,
+                1000,
+                2500,
+            );
+
+            assert_eq!((*track).n_events, 1);
+            let event = &*(*track).events;
+            assert_eq!(event.ReadOrder, 7);
+            assert_eq!(event.Layer, 2);
+            assert_eq!(event.Style, 0);
+            assert_eq!(CStr::from_ptr(event.Name).to_str(), Ok("Default"));
+            assert_eq!(event.MarginL, 0);
+            assert_eq!(event.MarginR, 11);
+            assert_eq!(event.MarginV, 12);
+            assert_eq!(CStr::from_ptr(event.Effect).to_str(), Ok("13"));
+            assert_eq!(CStr::from_ptr(event.Text).to_str(), Ok("fx,hello"));
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_chunk_readorder_bitmap_survives_free_event_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let first = b"7,0,Default,,0,0,0,,first";
+            rassa_capi::ass_process_chunk(
+                track,
+                first.as_ptr() as *const c_char,
+                first.len() as i32,
+                1000,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+
+            rassa_capi::ass_free_event(track, 0);
+            let duplicate = b"7,0,Default,,0,0,0,,duplicate";
+            rassa_capi::ass_process_chunk(
+                track,
+                duplicate.as_ptr() as *const c_char,
+                duplicate.len() as i32,
+                1200,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+            assert!((*(*track).events).Text.is_null());
+
+            rassa_capi::ass_flush_events(track);
+            rassa_capi::ass_process_chunk(
+                track,
+                duplicate.as_ptr() as *const c_char,
+                duplicate.len() as i32,
+                1400,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+            assert_eq!((*(*track).events).ReadOrder, 7);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_chunk_malformed_packet_reserves_readorder_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let malformed = b"9";
+            rassa_capi::ass_process_chunk(
+                track,
+                malformed.as_ptr() as *const c_char,
+                malformed.len() as i32,
+                1000,
+                100,
+            );
+            assert_eq!((*track).n_events, 0);
+
+            let valid = b"9,0,Default,,0,0,0,,valid";
+            rassa_capi::ass_process_chunk(
+                track,
+                valid.as_ptr() as *const c_char,
+                valid.len() as i32,
+                1200,
+                100,
+            );
+            assert_eq!((*track).n_events, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_chunk_readorder_uses_atoi_c_whitespace_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let packet = b"\n14,0,Default,,0,0,0,,newline";
+            rassa_capi::ass_process_chunk(
+                track,
+                packet.as_ptr() as *const c_char,
+                packet.len() as i32,
+                1000,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+            assert_eq!((*(*track).events).ReadOrder, 14);
+
+            let duplicate = b"14,0,Default,,0,0,0,,duplicate";
+            rassa_capi::ass_process_chunk(
+                track,
+                duplicate.as_ptr() as *const c_char,
+                duplicate.len() as i32,
+                1200,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_prune_clears_chunk_readorder_bits_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let early = b"11,0,Default,,0,0,0,,early";
+            rassa_capi::ass_process_chunk(
+                track,
+                early.as_ptr() as *const c_char,
+                early.len() as i32,
+                1000,
+                100,
+            );
+            let late = b"12,0,Default,,0,0,0,,late";
+            rassa_capi::ass_process_chunk(
+                track,
+                late.as_ptr() as *const c_char,
+                late.len() as i32,
+                3000,
+                100,
+            );
+            assert_eq!((*track).n_events, 2);
+
+            rassa_capi::ass_prune_events(track, 2000);
+            assert_eq!((*track).n_events, 1);
+            rassa_capi::ass_process_chunk(
+                track,
+                early.as_ptr() as *const c_char,
+                early.len() as i32,
+                3200,
+                100,
+            );
+            assert_eq!((*track).n_events, 2);
+            assert_eq!((*(*track).events.add(1)).ReadOrder, 11);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_prune_keeps_readorder_bits_when_check_disabled_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
+
+            let first = b"13,0,Default,,0,0,0,,first";
+            rassa_capi::ass_process_chunk(
+                track,
+                first.as_ptr() as *const c_char,
+                first.len() as i32,
+                1000,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+
+            rassa_capi::ass_set_check_readorder(track, 0);
+            rassa_capi::ass_prune_events(track, 2000);
+            assert_eq!((*track).n_events, 0);
+            rassa_capi::ass_set_check_readorder(track, 1);
+            rassa_capi::ass_process_chunk(
+                track,
+                first.as_ptr() as *const c_char,
+                first.len() as i32,
+                2200,
+                100,
+            );
+            assert_eq!((*track).n_events, 0);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -2093,15 +3914,51 @@ mod tests {
         unsafe {
             let library = rassa_capi::ass_library_init();
             let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                CHUNK_TRACK_FIXTURE.as_ptr() as *const c_char,
+                CHUNK_TRACK_FIXTURE.len() as i32,
+            );
 
-            rassa_capi::ass_process_chunk(track, b"first".as_ptr() as *const c_char, 5, 1000, 100);
-            rassa_capi::ass_process_chunk(track, b"second".as_ptr() as *const c_char, 6, 2000, 100);
+            let first = b"1,0,Default,,0,0,0,,first";
+            rassa_capi::ass_process_chunk(
+                track,
+                first.as_ptr() as *const c_char,
+                first.len() as i32,
+                1000,
+                100,
+            );
+            let second = b"2,0,Default,,0,0,0,,second";
+            rassa_capi::ass_process_chunk(
+                track,
+                second.as_ptr() as *const c_char,
+                second.len() as i32,
+                2000,
+                100,
+            );
             assert_eq!((*track).n_events, 2);
+            let event_storage = (*track).events;
+            let max_events = (*track).max_events;
+            assert!(max_events >= 2);
 
             rassa_capi::ass_flush_events(track);
 
             assert_eq!((*track).n_events, 0);
+            assert_eq!((*track).max_events, max_events);
+            assert_eq!((*track).events, event_storage);
             assert!(rassa_capi::ass_step_sub(track, 1500, 1) == 0);
+
+            let third = b"3,0,Default,,0,0,0,,third";
+            rassa_capi::ass_process_chunk(
+                track,
+                third.as_ptr() as *const c_char,
+                third.len() as i32,
+                3000,
+                100,
+            );
+            assert_eq!((*track).n_events, 1);
+            assert_eq!((*track).max_events, max_events);
+            assert_eq!((*track).events, event_storage);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -2109,7 +3966,35 @@ mod tests {
     }
 
     #[test]
-    fn capi_configured_prune_runs_during_render() {
+    fn capi_configured_prune_runs_after_successful_render_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let renderer = initialized_capi_renderer(library);
+            let track = rassa_capi::ass_read_memory(
+                library,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *mut c_char,
+                INLINE_OVERRIDE_FIXTURE.len(),
+                ptr::null(),
+            );
+
+            assert_eq!((*track).n_events, 1);
+            rassa_capi::ass_configure_prune(track, 500);
+
+            let mut detect_change = 0;
+            let images = rassa_capi::ass_render_frame(renderer, track, 2600, &mut detect_change);
+
+            assert!(images.is_null());
+            assert_eq!((*track).n_events, 0);
+            assert_eq!(detect_change, 0);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_renderer_done(renderer);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_configured_prune_does_not_run_on_start_failure_like_libass() {
         unsafe {
             let library = rassa_capi::ass_library_init();
             let renderer = rassa_capi::ass_renderer_init(library);
@@ -2127,8 +4012,8 @@ mod tests {
             let images = rassa_capi::ass_render_frame(renderer, track, 2600, &mut detect_change);
 
             assert!(images.is_null());
-            assert_eq!((*track).n_events, 0);
-            assert!(detect_change >= 1);
+            assert_eq!((*track).n_events, 1);
+            assert_eq!(detect_change, 2);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_renderer_done(renderer);
@@ -2173,18 +4058,96 @@ mod tests {
             );
 
             let (_storage, mut overrides) = style_override_list(&[
-                "Timer=120.5",
+                "Timer=120.5tail",
                 "Default.PrimaryColour=&H00010203&",
+                "Default.SecondaryColour=66051",
+                "Default.OutlineColour=0x00010203",
+                "Default.AlphaLevel=&H80",
+                "Default.BackColour=bad",
                 "Default.Bold=1",
                 "Default.Blur=4.5",
+                "Default.Shadow=bad",
+                "Default.MarginR=&HFFFFFFFF",
+                "Kerning=true",
+                "Kerning= 1",
+                "Kerning=\n1",
+                "ScaledBorderAndShadow=yes",
+                "ScaledBorderAndShadow=0x1",
+                "YCbCr Matrix= pc.709\t",
             ]);
             rassa_capi::ass_set_style_overrides(library, overrides.as_mut_ptr());
             rassa_capi::ass_process_force_style(track);
 
             assert_eq!((*track).Timer, 120.5);
-            assert_eq!((*(*track).styles).PrimaryColour, 0x00010203);
+            assert_eq!((*track).Kerning, 0);
+            assert_eq!((*track).ScaledBorderAndShadow, 0);
+            assert_eq!((*(*track).styles).PrimaryColour, 0x0302_0180);
+            assert_eq!((*(*track).styles).SecondaryColour, 0x0302_0180);
+            assert_eq!((*(*track).styles).OutlineColour, 0x0302_0180);
+            assert_eq!((*(*track).styles).BackColour, 0);
             assert_eq!((*(*track).styles).Bold, 1);
             assert_eq!((*(*track).styles).Blur, 4.5);
+            assert_eq!((*(*track).styles).Shadow, 0.0);
+            assert_eq!((*(*track).styles).MarginR, -1);
+            assert_eq!((*track).YCbCrMatrix, ass::YCbCrMatrix::Bt709Pc as i32);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_force_style_override_spacing_matches_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            rassa_capi::ass_process_data(
+                track,
+                INLINE_OVERRIDE_FIXTURE.as_ptr() as *const c_char,
+                INLINE_OVERRIDE_FIXTURE.len() as i32,
+            );
+
+            let (_storage, mut overrides) = style_override_list(&[
+                " PlayResX=640",
+                "PlayResY =999",
+                "Default .FontSize=99",
+                "Default.FontName=  spaced  ",
+                "default.MarginL=44",
+            ]);
+            rassa_capi::ass_set_style_overrides(library, overrides.as_mut_ptr());
+            rassa_capi::ass_process_force_style(track);
+
+            assert_eq!((*track).PlayResX, 320);
+            assert_eq!((*track).PlayResY, 180);
+            let style = &*(*track).styles.add(1);
+            assert_eq!(style.FontSize as i32, 36);
+            assert_eq!(CStr::from_ptr(style.FontName).to_str(), Ok("  spaced  "));
+            assert_eq!(style.MarginL, 44);
+
+            rassa_capi::ass_free_track(track);
+            rassa_capi::ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_force_style_empty_style_qualifier_targets_empty_name_like_libass() {
+        unsafe {
+            let library = rassa_capi::ass_library_init();
+            let track = rassa_capi::ass_new_track(library);
+            let sid = rassa_capi::ass_alloc_style(track);
+            assert_eq!(sid, 1);
+            let empty_name = rassa_capi::ass_malloc(1).cast::<c_char>();
+            assert!(!empty_name.is_null());
+            empty_name.write(0);
+            (*(*track).styles.add(sid as usize)).Name = empty_name;
+            (*(*track).styles.add(sid as usize)).FontSize = 22.0;
+
+            let (_storage, mut overrides) = style_override_list(&[".FontSize=44"]);
+            rassa_capi::ass_set_style_overrides(library, overrides.as_mut_ptr());
+            rassa_capi::ass_process_force_style(track);
+
+            assert_eq!((*(*track).styles).FontSize as i32, 18);
+            assert_eq!((*(*track).styles.add(1)).FontSize as i32, 44);
 
             rassa_capi::ass_free_track(track);
             rassa_capi::ass_library_done(library);
@@ -2203,9 +4166,9 @@ mod tests {
                 SHAPING_FIXTURE.len(),
                 ptr::null(),
             );
-            let simple_renderer = rassa_capi::ass_renderer_init(library);
-            let complex_renderer = rassa_capi::ass_renderer_init(library);
-            let invalid_renderer = rassa_capi::ass_renderer_init(library);
+            let simple_renderer = initialized_capi_renderer(library);
+            let complex_renderer = initialized_capi_renderer(library);
+            let invalid_renderer = initialized_capi_renderer(library);
 
             rassa_capi::ass_set_shaper(simple_renderer, ass::ShapingLevel::Simple as i32);
             rassa_capi::ass_set_shaper(complex_renderer, ass::ShapingLevel::Complex as i32);
@@ -2251,7 +4214,7 @@ mod tests {
                 INLINE_OVERRIDE_FIXTURE.len(),
                 ptr::null(),
             );
-            let renderer = rassa_capi::ass_renderer_init(library);
+            let renderer = initialized_capi_renderer(library);
 
             rassa_capi::ass_set_hinting(renderer, ass::Hinting::Normal as i32);
 

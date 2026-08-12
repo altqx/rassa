@@ -45,8 +45,20 @@ pub(crate) struct RunTransformContext<'a> {
     pub(crate) transform: EventTransform,
     pub(crate) event: &'a LayoutEvent,
     pub(crate) effective_position: Option<(i32, i32)>,
+    /// Untransformed advance/line-metric bounds for the whole event.
+    ///
+    /// libass calculates the implicit rotation origin once from the event's
+    /// string bbox, before rendering individual style or karaoke runs.  Using
+    /// the recent run's ink bounds here makes every run rotate around a
+    /// different point and leaves a nominally vertical event laid out along
+    /// its original horizontal baseline.
+    pub(crate) event_layout_bounds: Option<Rect>,
     pub(crate) render_scale: RenderScale,
     pub(crate) mapping: &'a EventMapping,
+    /// Screen-space x of the run's baseline start. libass resets cumulative
+    /// `\fay` baseline shear at run boundaries and measures every glyph
+    /// advance and offset from this point, including glyphs within a cluster.
+    pub(crate) shear_pivot_x: Option<f64>,
     /// Screen-space y of the run's ascender line (baseline - ascender).
     /// libass calc_transform_matrix anchors the \fax/\fay shear at the
     /// glyph cell top (outline y = -asc), not the rendered ink bbox top.
@@ -74,6 +86,7 @@ pub(crate) fn apply_run_transform_to_recent_planes(
         context.event,
         &recent_planes,
         context.effective_position,
+        context.event_layout_bounds,
         context.mapping,
     );
     let bounds_base = planes_bounds(&recent_planes)
@@ -83,7 +96,7 @@ pub(crate) fn apply_run_transform_to_recent_planes(
     // i.e. the run's ascender line in screen space; only the ink bbox top is
     // used as a fallback when the ascender line is unavailable.
     let shear_base = (
-        bounds_base.0,
+        context.shear_pivot_x.unwrap_or(bounds_base.0),
         context.shear_pivot_y.unwrap_or(bounds_base.1),
     );
     let transform_slice = |planes: &mut Vec<ImagePlane>, start: usize| {
@@ -102,11 +115,13 @@ pub(crate) fn apply_run_transform_to_recent_planes(
 }
 
 /// Rotation/shear origin per libass calculate_rotation_params: \org if
-/// given, otherwise the event position; with neither, the text bbox center.
+/// given, otherwise the event position; with neither, the alignment base
+/// point of the whole event's untransformed advance bbox.
 pub(crate) fn event_transform_origin(
     event: &LayoutEvent,
     planes: &[ImagePlane],
     effective_position: Option<(i32, i32)>,
+    event_layout_bounds: Option<Rect>,
     mapping: &EventMapping,
 ) -> (f64, f64) {
     if let Some((x, y)) = event.origin_exact {
@@ -121,7 +136,8 @@ pub(crate) fn event_transform_origin(
     if let Some((x, y)) = effective_position {
         return (f64::from(x), f64::from(y));
     }
-    planes_bounds(planes)
+    event_layout_bounds
+        .or_else(|| planes_bounds(planes))
         .map(|bounds| {
             // libass calculate_rotation_params + get_base_point (ass_render.c):
             // with neither \org nor an explicit position, rotation/shear pivots
@@ -313,7 +329,11 @@ impl ProjectiveMatrix {
         let sz = -frz.sin();
         let cz = frz.cos();
         let shear_x = finite_or_zero(transform.shear_x);
-        let shear_y = -finite_or_zero(transform.shear_y);
+        // Screen coordinates grow downwards. This positive sign implements
+        // libass apply_baseline_shear + calc_transform_matrix: positive \fay
+        // lowers each glyph by its cumulative x advance (including every
+        // glyph and offset inside a multi-glyph HarfBuzz cluster).
+        let shear_y = finite_or_zero(transform.shear_y);
         let shear_x_const = shear_x * (origin_y - shear_base_y);
         let shear_y_const = shear_y * (origin_x - shear_base_x);
 

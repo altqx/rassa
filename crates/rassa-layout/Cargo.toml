@@ -17,6 +17,7 @@ rassa-raster = { path = "../rassa-raster", version = "0.6.0" }
 rassa-shape = { path = "../rassa-shape", version = "0.6.0" }
 rassa-unibreak = { path = "../rassa-unibreak", version = "0.6.0" }
 rassa-unicode = { path = "../rassa-unicode", version = "0.6.0" }
+unicode-segmentation = "1.13.2"
 
 [lib]
 path = "src/lib.rs"

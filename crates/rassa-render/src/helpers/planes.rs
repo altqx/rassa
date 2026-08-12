@@ -1,89 +1,5 @@
 use super::*;
 
-pub(crate) fn merge_compatible_event_planes(planes: Vec<ImagePlane>) -> Vec<ImagePlane> {
-    let mut merged: Vec<ImagePlane> = Vec::new();
-    for plane in planes {
-        if let Some(target) = merged
-            .iter_mut()
-            .find(|candidate| compatible_plane_merge(candidate, &plane))
-        {
-            merge_plane_into(target, plane);
-        } else {
-            merged.push(plane);
-        }
-    }
-    merged
-}
-
-/// libass render_and_combine_glyphs combines bitmaps of the same type and
-/// color only when their rectangles intersect; everything else stays a
-/// separate image.
-pub(crate) fn compatible_plane_merge(a: &ImagePlane, b: &ImagePlane) -> bool {
-    if a.kind != b.kind || a.color != b.color || a.stride <= 0 || b.stride <= 0 {
-        return false;
-    }
-    let a_rect = Rect {
-        x_min: a.destination.x,
-        y_min: a.destination.y,
-        x_max: a.destination.x + a.size.width,
-        y_max: a.destination.y + a.size.height,
-    };
-    let b_rect = Rect {
-        x_min: b.destination.x,
-        y_min: b.destination.y,
-        x_max: b.destination.x + b.size.width,
-        y_max: b.destination.y + b.size.height,
-    };
-    a_rect.intersect(b_rect).is_some()
-}
-
-pub(crate) fn merge_plane_into(target: &mut ImagePlane, plane: ImagePlane) {
-    let x_min = target.destination.x.min(plane.destination.x);
-    let y_min = target.destination.y.min(plane.destination.y);
-    let x_max =
-        (target.destination.x + target.size.width).max(plane.destination.x + plane.size.width);
-    let y_max =
-        (target.destination.y + target.size.height).max(plane.destination.y + plane.size.height);
-    let width = (x_max - x_min).max(0);
-    let height = (y_max - y_min).max(0);
-    let stride = width;
-    let mut bitmap = vec![0_u8; (stride * height).max(0) as usize];
-    blit_plane(&mut bitmap, stride, x_min, y_min, target);
-    blit_plane(&mut bitmap, stride, x_min, y_min, &plane);
-    target.destination = Point { x: x_min, y: y_min };
-    target.size = Size { width, height };
-    target.stride = stride;
-    target.bitmap = bitmap;
-}
-
-pub(crate) fn blit_plane(
-    bitmap: &mut [u8],
-    stride: i32,
-    origin_x: i32,
-    origin_y: i32,
-    plane: &ImagePlane,
-) {
-    if stride <= 0 || plane.stride <= 0 || plane.size.width <= 0 || plane.size.height <= 0 {
-        return;
-    }
-    let dst_stride = stride as usize;
-    let src_stride = plane.stride as usize;
-    for y in 0..plane.size.height as usize {
-        for x in 0..plane.size.width as usize {
-            let src = plane.bitmap.get(y * src_stride + x).copied().unwrap_or(0);
-            if src == 0 {
-                continue;
-            }
-            let dst_x = (plane.destination.x - origin_x) as usize + x;
-            let dst_y = (plane.destination.y - origin_y) as usize + y;
-            let dst = dst_y * dst_stride + dst_x;
-            if let Some(value) = bitmap.get_mut(dst) {
-                *value = (*value).max(src);
-            }
-        }
-    }
-}
-
 pub(crate) fn translate_planes(mut planes: Vec<ImagePlane>, offset: Point) -> Vec<ImagePlane> {
     if offset == Point::default() {
         return planes;
@@ -96,13 +12,14 @@ pub(crate) fn translate_planes(mut planes: Vec<ImagePlane>, offset: Point) -> Ve
 }
 
 /// \clip coordinates map like positioned coordinates (libass
-/// x2scr_pos_scaled / y2scr_pos: content scale plus margin offsets).
-pub(crate) fn scale_clip_rect(rect: Rect, mapping: &EventMapping) -> Rect {
+/// x2scr_pos_scaled / y2scr_pos: content scale plus margin offsets). Animated
+/// clips keep fractional script-space edges until this final mapping step.
+pub(crate) fn scale_clip_rect_exact(rect: ParsedRectF64, mapping: &EventMapping) -> Rect {
     Rect {
-        x_min: mapping.map_x_pos(f64::from(rect.x_min)).round() as i32,
-        y_min: mapping.map_y_pos(f64::from(rect.y_min)).round() as i32,
-        x_max: mapping.map_x_pos(f64::from(rect.x_max)).round() as i32,
-        y_max: mapping.map_y_pos(f64::from(rect.y_max)).round() as i32,
+        x_min: mapping.map_x_pos(rect.x_min).round() as i32,
+        y_min: mapping.map_y_pos(rect.y_min).round() as i32,
+        x_max: mapping.map_x_pos(rect.x_max).round() as i32,
+        y_max: mapping.map_y_pos(rect.y_max).round() as i32,
     }
 }
 
@@ -136,25 +53,60 @@ pub(crate) fn compute_horizontal_origin(
     track: &ParsedTrack,
     event: &LayoutEvent,
     line_width: i32,
+    block_width: i32,
+    horizontal_scroll: bool,
     effective_position: Option<(i32, i32)>,
     mapping: &EventMapping,
 ) -> i32 {
+    let block_width = block_width.max(line_width);
+    // libass makes horizontal scrolling use the event's alignment as its
+    // justification, regardless of the style's Justify value.
+    let requested_justify = if horizontal_scroll {
+        match event.alignment & 0x3 {
+            ass::HALIGN_CENTER => ass::ASS_JUSTIFY_CENTER,
+            ass::HALIGN_RIGHT => ass::ASS_JUSTIFY_RIGHT,
+            _ => ass::ASS_JUSTIFY_LEFT,
+        }
+    } else {
+        event.justify
+    };
+    let justify = match requested_justify {
+        ass::ASS_JUSTIFY_LEFT | ass::ASS_JUSTIFY_CENTER | ass::ASS_JUSTIFY_RIGHT => {
+            requested_justify
+        }
+        _ => match event.alignment & 0x3 {
+            ass::HALIGN_LEFT => ass::ASS_JUSTIFY_LEFT,
+            ass::HALIGN_RIGHT => ass::ASS_JUSTIFY_RIGHT,
+            _ => ass::ASS_JUSTIFY_CENTER,
+        },
+    };
+    let line_offset = match justify {
+        ass::ASS_JUSTIFY_LEFT => 0,
+        ass::ASS_JUSTIFY_RIGHT => block_width - line_width,
+        _ => (block_width - line_width) / 2,
+    };
+
     if let Some((x, _)) = effective_position {
-        return match event.alignment & 0x3 {
+        let block_origin = match event.alignment & 0x3 {
             ass::HALIGN_LEFT => x,
-            ass::HALIGN_RIGHT => x - line_width,
-            _ => x - (line_width + 1) / 2,
+            ass::HALIGN_RIGHT => x - block_width,
+            _ => x - (block_width + 1) / 2,
         };
+        return block_origin + line_offset;
     }
     // libass: left edge = x2scr_left(MarginL), right edge =
-    // x2scr_right(PlayResX - MarginR); halign anchors within them.
+    // x2scr_right(PlayResX - MarginR); halign anchors the widest line
+    // within them, then Justify aligns every shorter line inside that block.
+    // This mirrors ass_render.c align_lines(), including selective Justify
+    // overrides supplied through the public API.
     let left_edge = mapping.x_left(f64::from(event.margin_l));
     let right_edge = mapping.x_right(f64::from(track.play_res_x) - f64::from(event.margin_r));
-    match event.alignment & 0x3 {
+    let block_origin = match event.alignment & 0x3 {
         ass::HALIGN_LEFT => left_edge.round() as i32,
-        ass::HALIGN_RIGHT => right_edge.round() as i32 - line_width,
-        _ => ((left_edge + right_edge).round() as i32 - line_width) / 2,
-    }
+        ass::HALIGN_RIGHT => right_edge.round() as i32 - block_width,
+        _ => ((left_edge + right_edge).round() as i32 - block_width) / 2,
+    };
+    block_origin + line_offset
 }
 
 pub(crate) fn scale_position(
@@ -205,20 +157,14 @@ pub(crate) fn interpolate_move(
         .map(|event| (now_ms - event.start).clamp(0, event.duration.max(0)) as i32)
         .unwrap_or_default();
 
-    let (t1_ms, t2_ms) = if movement.t1_ms <= 0 && movement.t2_ms <= 0 {
-        (0, event_duration)
-    } else if movement.t1_ms <= movement.t2_ms {
-        (movement.t1_ms.max(0), movement.t2_ms.max(0))
-    } else {
-        (movement.t2_ms.max(0), movement.t1_ms.max(0))
-    };
+    let (t1_ms, t2_ms) = move_timing_window(movement.t1_ms, movement.t2_ms, event_duration);
     let k = if event_elapsed <= t1_ms {
         0.0
     } else if event_elapsed >= t2_ms {
         1.0
     } else {
-        let delta = (t2_ms - t1_ms).max(1) as f64;
-        f64::from(event_elapsed - t1_ms) / delta
+        let delta = f64::from(move_wrapping_delta(t2_ms, t1_ms));
+        f64::from(move_wrapping_delta(event_elapsed, t1_ms)) / delta
     };
 
     let x = f64::from(movement.end.0 - movement.start.0) * k + f64::from(movement.start.0);
@@ -243,25 +189,33 @@ pub(crate) fn interpolate_move_exact(
         .map(|event| (now_ms - event.start).clamp(0, event.duration.max(0)) as i32)
         .unwrap_or_default();
 
-    let (t1_ms, t2_ms) = if movement.t1_ms <= 0 && movement.t2_ms <= 0 {
-        (0, event_duration)
-    } else if movement.t1_ms <= movement.t2_ms {
-        (movement.t1_ms.max(0), movement.t2_ms.max(0))
-    } else {
-        (movement.t2_ms.max(0), movement.t1_ms.max(0))
-    };
+    let (t1_ms, t2_ms) = move_timing_window(movement.t1_ms, movement.t2_ms, event_duration);
     let k = if event_elapsed <= t1_ms {
         0.0
     } else if event_elapsed >= t2_ms {
         1.0
     } else {
-        let delta = (t2_ms - t1_ms).max(1) as f64;
-        f64::from(event_elapsed - t1_ms) / delta
+        let delta = f64::from(move_wrapping_delta(t2_ms, t1_ms));
+        f64::from(move_wrapping_delta(event_elapsed, t1_ms)) / delta
     };
 
     let x = (movement.end.0 - movement.start.0) * k + movement.start.0;
     let y = (movement.end.1 - movement.start.1) * k + movement.start.1;
     round_exact_point((x, y))
+}
+
+fn move_timing_window(t1_ms: i32, t2_ms: i32, event_duration: i32) -> (i32, i32) {
+    if t1_ms <= 0 && t2_ms <= 0 {
+        (0, event_duration)
+    } else if t1_ms <= t2_ms {
+        (t1_ms, t2_ms)
+    } else {
+        (t2_ms, t1_ms)
+    }
+}
+
+fn move_wrapping_delta(to: i32, from: i32) -> i32 {
+    (to as u32).wrapping_sub(from as u32) as i32
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,6 +388,36 @@ pub(crate) fn fix_collisions(
     }
 }
 
+/// libass sorts events by layer and fixes collisions independently for each
+/// contiguous same-layer group before concatenating the image lists.
+pub(crate) fn fix_collisions_by_layer(
+    cache: &mut std::collections::HashMap<usize, Rect>,
+    records: &mut [RenderedEvent],
+    track: &ParsedTrack,
+) {
+    let mut start = 0;
+    while start < records.len() {
+        let layer = track
+            .events
+            .get(records[start].event_index)
+            .map(|event| event.layer)
+            .unwrap_or(0);
+        let mut end = start + 1;
+        while end < records.len()
+            && track
+                .events
+                .get(records[end].event_index)
+                .map(|event| event.layer)
+                .unwrap_or(0)
+                == layer
+        {
+            end += 1;
+        }
+        fix_collisions(cache, &mut records[start..end]);
+        start = end;
+    }
+}
+
 pub(crate) fn translate_planes_y(planes: &mut [ImagePlane], delta_y: i32) {
     if delta_y == 0 {
         return;
@@ -505,6 +489,7 @@ pub(crate) fn solid_plane_from_rect(rect: Rect, color: u32, kind: ass::ImageType
 /// Composite a run's glyph bitmaps into one plane.  Glyphs sit on the
 /// line baseline: y = ascender - glyph.top, where ascender is the line's
 /// metric ascent (libass: pos.y = baseline; bitmaps offset by glyph top).
+#[cfg(test)]
 pub(crate) fn combined_image_plane_from_glyphs(
     glyphs: &[RasterGlyph],
     origin_x_26_6: i32,
@@ -514,11 +499,36 @@ pub(crate) fn combined_image_plane_from_glyphs(
     kind: ass::ImageType,
     blur_radius: u32,
 ) -> Option<ImagePlane> {
+    combined_image_plane_from_glyphs_xy(
+        glyphs,
+        origin_x_26_6,
+        line_top,
+        ascender,
+        color,
+        kind,
+        BitmapBlur {
+            radius_x: blur_radius,
+            radius_y: blur_radius,
+            be: 0,
+        },
+    )
+}
+
+pub(crate) fn combined_image_plane_from_glyphs_xy(
+    glyphs: &[RasterGlyph],
+    origin_x_26_6: i32,
+    line_top: i32,
+    ascender: Option<i32>,
+    color: u32,
+    kind: ass::ImageType,
+    blur: BitmapBlur,
+) -> Option<ImagePlane> {
     let ascender =
         ascender.unwrap_or_else(|| glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0));
     // libass accumulates the pen in 26.6 units and floors per glyph
     // (render_and_combine_glyphs: x = pos.x >> 6).
     let mut pen_x = origin_x_26_6;
+    let mut pen_y = 0_i32;
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
     let mut max_x = i32::MIN;
@@ -527,15 +537,27 @@ pub(crate) fn combined_image_plane_from_glyphs(
     for glyph in glyphs {
         if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
             pen_x += glyph.advance_x_26_6;
+            pen_y += glyph.advance_y_26_6;
             continue;
         }
-        let x = (pen_x >> 6) + glyph.left + glyph.offset_x;
-        let y = ascender - glyph.top + glyph.offset_y;
+        let offset_x_26_6 = if glyph.offset_x_26_6 == 0 && glyph.offset_x != 0 {
+            glyph.offset_x * 64
+        } else {
+            glyph.offset_x_26_6
+        };
+        let offset_y_26_6 = if glyph.offset_y_26_6 == 0 && glyph.offset_y != 0 {
+            glyph.offset_y * 64
+        } else {
+            glyph.offset_y_26_6
+        };
+        let x = ((pen_x + offset_x_26_6) >> 6) + glyph.left;
+        let y = ascender - glyph.top + ((-pen_y + offset_y_26_6) >> 6);
         min_x = min_x.min(x);
         min_y = min_y.min(y);
         max_x = max_x.max(x + glyph.width);
         max_y = max_y.max(y + glyph.height);
         pen_x += glyph.advance_x_26_6;
+        pen_y += glyph.advance_y_26_6;
     }
 
     if min_x == i32::MAX || min_y == i32::MAX || max_x <= min_x || max_y <= min_y {
@@ -546,13 +568,25 @@ pub(crate) fn combined_image_plane_from_glyphs(
     let height = (max_y - min_y) as usize;
     let mut bitmap = vec![0_u8; width * height];
     pen_x = origin_x_26_6;
+    pen_y = 0;
     for glyph in glyphs {
         if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
             pen_x += glyph.advance_x_26_6;
+            pen_y += glyph.advance_y_26_6;
             continue;
         }
-        let x0 = ((pen_x >> 6) + glyph.left + glyph.offset_x - min_x) as usize;
-        let y0 = (ascender - glyph.top + glyph.offset_y - min_y) as usize;
+        let offset_x_26_6 = if glyph.offset_x_26_6 == 0 && glyph.offset_x != 0 {
+            glyph.offset_x * 64
+        } else {
+            glyph.offset_x_26_6
+        };
+        let offset_y_26_6 = if glyph.offset_y_26_6 == 0 && glyph.offset_y != 0 {
+            glyph.offset_y * 64
+        } else {
+            glyph.offset_y_26_6
+        };
+        let x0 = (((pen_x + offset_x_26_6) >> 6) + glyph.left - min_x) as usize;
+        let y0 = (ascender - glyph.top + ((-pen_y + offset_y_26_6) >> 6) - min_y) as usize;
         let glyph_width = glyph.width as usize;
         let glyph_height = glyph.height as usize;
         let glyph_stride = glyph.stride as usize;
@@ -560,13 +594,16 @@ pub(crate) fn combined_image_plane_from_glyphs(
             for x in 0..glyph_width {
                 let src = glyph.bitmap[y * glyph_stride + x];
                 let dst = &mut bitmap[(y0 + y) * width + x0 + x];
-                *dst = (*dst).max(src);
+                // Glyph outlines within a composite are coverage masks, not
+                // set membership: overlapping coverage adds and clips at 255.
+                *dst = dst.saturating_add(src);
             }
         }
         pen_x += glyph.advance_x_26_6;
+        pen_y += glyph.advance_y_26_6;
     }
 
-    let (bitmap, width, height, pad) = blur_bitmap(bitmap, width, height, blur_radius);
+    let (bitmap, width, height, pad_x, pad_y) = blur_bitmap_xy(bitmap, width, height, blur);
     Some(ImagePlane {
         size: Size {
             width: width as i32,
@@ -575,8 +612,8 @@ pub(crate) fn combined_image_plane_from_glyphs(
         stride: width as i32,
         color: rgba_color_from_ass(color),
         destination: Point {
-            x: min_x - pad as i32,
-            y: line_top + min_y - pad as i32,
+            x: min_x - pad_x as i32,
+            y: line_top + min_y - pad_y as i32,
         },
         kind,
         bitmap,

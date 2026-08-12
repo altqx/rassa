@@ -38,6 +38,7 @@ pub(crate) struct LineMetricsContext<'a> {
     pub(crate) source_event: Option<&'a ParsedEvent>,
     pub(crate) now_ms: i64,
     pub(crate) render_scale: RenderScale,
+    pub(crate) font_scale: f64,
 }
 
 fn run_is_whitespace_text(run: &LayoutGlyphRun) -> bool {
@@ -49,7 +50,8 @@ fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> L
         resolve_run_style(run, context.source_event, context.now_ms),
         context.track,
         context.config,
-        context.render_scale.uniform,
+        context.font_scale,
+        context.render_scale,
     );
     if !(effective_style.font_size.is_finite() && effective_style.font_size > 0.0) {
         return LineMetrics::default();
@@ -72,8 +74,9 @@ fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> L
             size_26_6,
             hinting: context.config.hinting,
         });
-        let glyph_infos =
-            scale_glyph_infos(&run.glyphs, context.render_scale.x, context.render_scale.y);
+        let position_scale =
+            shaped_position_render_scale(run, &effective_style, context.render_scale);
+        let glyph_infos = scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
         if let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) {
             ink_ascender = raster_glyphs
                 .iter()
@@ -104,6 +107,11 @@ fn drawing_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -
     // coordinates at parse time, so only pbo needs the division here).
     let height = f64::from((bounds.height() - 1).max(0)) * scale_y;
     let pbo = drawing_pbo_script_pixels(&effective_style, drawing) * scale_y;
+    if libass_outline_coordinate_from_f64(height).is_none()
+        || libass_outline_coordinate_from_f64(pbo).is_none()
+    {
+        return LineMetrics::default();
+    }
     LineMetrics {
         asc: height - pbo,
         desc: pbo,
@@ -116,10 +124,10 @@ pub(crate) fn drawing_pbo_script_pixels(style: &ParsedSpanStyle, drawing: &Parse
     if !style.pbo.is_finite() {
         return 0.0;
     }
-    let scale_base = 1_i32
-        .checked_shl(drawing.scale.saturating_sub(1).max(0) as u32)
-        .unwrap_or(1)
-        .max(1);
+    let scale_base = rassa_parse::libass_drawing_scale_base(drawing.scale);
+    if scale_base <= 0 {
+        return 0.0;
+    }
     style.pbo / f64::from(scale_base)
 }
 
@@ -193,6 +201,7 @@ pub(crate) fn rendered_text_alignment_width(
     track: &ParsedTrack,
     config: &RendererConfig,
     render_scale: RenderScale,
+    font_scale: f64,
 ) -> i32 {
     let mut width = 0_i32;
     for run in &line.runs {
@@ -207,22 +216,31 @@ pub(crate) fn rendered_text_alignment_width(
             resolve_run_style(run, source_event, now_ms),
             track,
             config,
-            render_scale.uniform,
+            font_scale,
+            render_scale,
         );
         let rasterizer = Rasterizer::with_options(RasterOptions {
             size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
             hinting: config.hinting,
         });
-        let glyph_infos = scale_glyph_infos(&run.glyphs, render_scale.x, render_scale.y);
+        let position_scale = shaped_position_render_scale(run, &effective_style, render_scale);
+        let glyph_infos = scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
         let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
-            width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
+            width += (f64::from(run.width)
+                * style_scale(render_scale.y)
+                * effective_pixel_aspect(track, config))
+            .round() as i32;
             continue;
         };
-        let raster_glyphs =
-            apply_vertical_font_raster_advances(raster_glyphs, &effective_style, &run.font);
+        let raster_glyphs = apply_vertical_font_raster_advances(
+            raster_glyphs,
+            &glyph_infos,
+            &effective_style,
+            &run.font,
+        );
         let raster_glyphs = scale_raster_glyphs(
             raster_glyphs,
-            effective_style.scale_x,
+            effective_style.scale_x * effective_pixel_aspect(track, config),
             effective_style.scale_y,
         );
         let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
@@ -233,7 +251,10 @@ pub(crate) fn rendered_text_alignment_width(
             + 32)
             >> 6;
     }
-    width.max(1)
+    // Keep a true zero advance: libass uses this width for EventImages and
+    // excludes zero-area events from collision placement. A combining-only
+    // event can still produce visible ink while having no horizontal advance.
+    width
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
@@ -259,8 +280,7 @@ pub(crate) fn font_vertical_metrics(
     // FT_FaceRec.underline_position, which FreeType has already recentered by
     // -thickness/2 at face load (sfobjs.c). Using the recentered value here and
     // then applying -size/2 again double-recenters the bar ~thickness/2 lower.
-    let scale_libass =
-        |value: i32| ((i64::from(value) * metrics.y_scale + 0x8000) >> 16) as i32;
+    let scale_libass = |value: i32| ((i64::from(value) * metrics.y_scale + 0x8000) >> 16) as i32;
     let post = unsafe {
         ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_post)
             as *const ffi::TT_Postscript
@@ -406,28 +426,35 @@ pub(crate) fn font_vertical_metrics_from_data(
     })
 }
 
-/// Combined \be/\blur strength in \blur units.  libass applies \be as N
-/// passes of a [1,2,1] box blur (variance N/2) followed by the \blur
-/// gaussian (variance blur^2); sequential blurs add variances.
-pub(crate) fn effective_blur_strength(style: &ParsedSpanStyle) -> f64 {
+pub(crate) fn renderer_blur_radius(blur: f64) -> u32 {
+    if !(blur.is_finite() && blur > 0.0) {
+        return 0;
+    }
+    (blur * 4.0).ceil().max(1.0) as u32
+}
+
+pub(crate) fn effective_bitmap_blur(
+    style: &ParsedSpanStyle,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    font_scale: f64,
+) -> BitmapBlur {
     let blur = if style.blur.is_finite() && style.blur > 0.0 {
         style.blur
     } else {
         0.0
     };
     let be = if style.be.is_finite() && style.be > 0.0 {
-        style.be
+        style.be.trunc().clamp(0.0, 127.0) as u32
     } else {
-        0.0
+        0
     };
-    (be / 2.0 + blur * blur).sqrt()
-}
-
-pub(crate) fn renderer_blur_radius(blur: f64) -> u32 {
-    if !(blur.is_finite() && blur > 0.0) {
-        return 0;
+    let (scale_x, scale_y) = renderer_blur_scales(track, config, font_scale);
+    BitmapBlur {
+        radius_x: renderer_blur_radius(blur * scale_x),
+        radius_y: renderer_blur_radius(blur * scale_y),
+        be,
     }
-    (blur * 4.0).ceil().max(1.0) as u32
 }
 
 pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {
@@ -438,4 +465,3 @@ pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {
         y_max: rect.y_max + amount_y.max(0),
     }
 }
-

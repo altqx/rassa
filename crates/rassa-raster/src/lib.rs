@@ -3,7 +3,11 @@
 mod crossfont;
 
 use std::{
-    collections::HashMap,
+    cell::Cell,
+    collections::{BTreeMap, HashMap},
+    marker::PhantomData,
+    path::PathBuf,
+    rc::Rc,
     sync::{Mutex, OnceLock},
 };
 
@@ -13,12 +17,10 @@ use freetype::{
     face::LoadFlag, ffi,
 };
 
-use crate::crossfont::{
-    BitmapBuffer, FontDesc, GlyphIdKey, Rasterize, RasterizedGlyph, Size, Style,
-};
+use crate::crossfont::{BitmapBuffer, FontDesc, GlyphIdKey, Rasterize, Size, Style};
 use rassa_core::{RassaError, RassaResult, ass};
 use rassa_fonts::{FontMatch, FontProviderKind};
-use rassa_shape::{GlyphInfo, ShapedRun};
+use rassa_shape::{GlyphInfo, GlyphPositioning, ShapedRun, font_bytes_identity};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RasterPixelMode {
@@ -39,12 +41,20 @@ pub struct RasterGlyph {
     pub top: i32,
     pub offset_x: i32,
     pub offset_y: i32,
+    /// Horizontal shaped offset in 26.6 fixed point.
+    pub offset_x_26_6: i32,
+    /// Vertical shaped offset in 26.6 fixed point, in screen coordinates
+    /// (positive values move the glyph down).
+    pub offset_y_26_6: i32,
     pub advance_x: i32,
     pub advance_y: i32,
     /// Horizontal advance in 26.6 fixed point.  libass accumulates the pen in
     /// 26.6 units and floors per glyph; rounding each advance to whole pixels
     /// drifts up to half a pixel per glyph across a run.
     pub advance_x_26_6: i32,
+    /// Vertical advance in 26.6 fixed point, in font coordinates. Renderers
+    /// subtract this from the screen-space pen position.
+    pub advance_y_26_6: i32,
     /// Vertical advance in 26.6 fixed point (FT_Glyph_Metrics.vertAdvance),
     /// used by libass for rotated @font glyphs (DECO_ROTATE).
     pub vert_advance_26_6: i32,
@@ -75,10 +85,74 @@ pub struct Rasterizer {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RasterCacheStats {
     pub glyph_entries: usize,
+    pub bitmap_bytes: usize,
+}
+
+pub const DEFAULT_GLYPH_CACHE_MAX: usize = 10_000;
+pub const DEFAULT_BITMAP_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterCacheLimits {
+    pub glyph_max: usize,
+    pub bitmap_max_bytes: usize,
+}
+
+impl Default for RasterCacheLimits {
+    fn default() -> Self {
+        Self {
+            glyph_max: DEFAULT_GLYPH_CACHE_MAX,
+            bitmap_max_bytes: DEFAULT_BITMAP_CACHE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RasterCacheContext {
+    namespace: u64,
+    limits: RasterCacheLimits,
+}
+
+thread_local! {
+    static RASTER_CACHE_CONTEXT: Cell<RasterCacheContext> =
+        const { Cell::new(RasterCacheContext {
+            namespace: 0,
+            limits: RasterCacheLimits {
+                glyph_max: DEFAULT_GLYPH_CACHE_MAX,
+                bitmap_max_bytes: DEFAULT_BITMAP_CACHE_BYTES,
+            },
+        }) };
+}
+
+/// Temporarily route raster-cache traffic into a renderer-owned namespace.
+/// The guard is deliberately `!Send`; it must be dropped on the thread where
+/// it installed the thread-local context.
+pub struct RasterCacheScope {
+    previous: RasterCacheContext,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl RasterCacheScope {
+    pub fn enter(namespace: u64, limits: RasterCacheLimits) -> Self {
+        Rasterizer::set_cache_limits(namespace, limits);
+        let previous = RASTER_CACHE_CONTEXT
+            .with(|context| context.replace(RasterCacheContext { namespace, limits }));
+        Self {
+            previous,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for RasterCacheScope {
+    fn drop(&mut self) {
+        RASTER_CACHE_CONTEXT.with(|context| context.set(self.previous));
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct GlyphCacheKey {
+    namespace: u64,
+    font: FontCacheIdentity,
     family: String,
     style: Option<String>,
     synthetic_bold: bool,
@@ -89,7 +163,44 @@ struct GlyphCacheKey {
     hinting: ass::Hinting,
 }
 
-static GLYPH_CACHE: OnceLock<Mutex<HashMap<GlyphCacheKey, RasterGlyph>>> = OnceLock::new();
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct FontCacheIdentity {
+    provider: FontProviderKind,
+    path: Option<PathBuf>,
+    bytes: Option<u64>,
+}
+
+impl From<&FontMatch> for FontCacheIdentity {
+    fn from(font: &FontMatch) -> Self {
+        Self {
+            provider: font.provider,
+            path: font.path.clone(),
+            bytes: font.path.as_deref().and_then(font_bytes_identity),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedGlyph {
+    glyph: RasterGlyph,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct NamespaceCache {
+    limits: RasterCacheLimits,
+    stats: RasterCacheStats,
+    lru: BTreeMap<u64, GlyphCacheKey>,
+}
+
+#[derive(Debug, Default)]
+struct GlyphCache {
+    entries: HashMap<GlyphCacheKey, CachedGlyph>,
+    namespaces: HashMap<u64, NamespaceCache>,
+    access_clock: u64,
+}
+
+static GLYPH_CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
 
 impl Rasterizer {
     pub fn new() -> Self {
@@ -108,9 +219,12 @@ impl Rasterizer {
                 cluster: glyph.cluster,
                 offset_x: glyph.x_offset.round() as i32,
                 offset_y: (-glyph.y_offset).round() as i32,
+                offset_x_26_6: to_26_6(glyph.x_offset),
+                offset_y_26_6: -to_26_6(glyph.y_offset),
                 advance_x: glyph.x_advance.round() as i32,
                 advance_y: glyph.y_advance.round() as i32,
-                advance_x_26_6: (glyph.x_advance * 64.0).round() as i32,
+                advance_x_26_6: to_26_6(glyph.x_advance),
+                advance_y_26_6: to_26_6(glyph.y_advance),
                 ..RasterGlyph::default()
             })
             .collect()
@@ -217,23 +331,23 @@ impl Rasterizer {
                         })?;
                 let bitmap = bitmap_glyph.bitmap();
                 let stride = bitmap.pitch().abs();
-                outlined.push(RasterGlyph {
+                let rasterized = RasterGlyph {
                     glyph_id: glyph.glyph_id,
-                    cluster: glyph.cluster,
                     width: bitmap.width(),
                     height: bitmap.rows(),
                     stride,
                     left: bitmap_glyph.left(),
                     top: bitmap_glyph.top(),
-                    offset_x: glyph.x_offset.round() as i32,
-                    offset_y: (-glyph.y_offset).round() as i32,
                     advance_x: (advance.x >> 6) as i32,
                     advance_y: (advance.y >> 6) as i32,
                     advance_x_26_6: advance.x as i32,
+                    advance_y_26_6: advance.y as i32,
                     vert_advance_26_6: slot.metrics().vertAdvance as i32,
                     pixel_mode: classify_pixel_mode(&bitmap),
                     bitmap: copy_bitmap_rows(&bitmap),
-                });
+                    ..RasterGlyph::default()
+                };
+                outlined.push(glyph_from_cache(glyph, rasterized));
             }
             return Ok(outlined);
         }
@@ -250,24 +364,184 @@ impl Rasterizer {
     }
 
     pub fn clear_cache() {
-        glyph_cache()
-            .lock()
-            .expect("glyph cache mutex poisoned")
-            .clear();
+        lock_glyph_cache().clear();
+    }
+
+    pub fn clear_cache_namespace(namespace: u64) {
+        lock_glyph_cache().clear_namespace(namespace);
+    }
+
+    pub fn set_cache_limits(namespace: u64, limits: RasterCacheLimits) {
+        lock_glyph_cache().set_limits(namespace, limits);
     }
 
     pub fn cache_stats() -> RasterCacheStats {
-        RasterCacheStats {
-            glyph_entries: glyph_cache()
-                .lock()
-                .expect("glyph cache mutex poisoned")
-                .len(),
-        }
+        lock_glyph_cache().stats()
+    }
+
+    pub fn cache_stats_for_namespace(namespace: u64) -> RasterCacheStats {
+        lock_glyph_cache().stats_for_namespace(namespace)
     }
 }
 
-fn glyph_cache() -> &'static Mutex<HashMap<GlyphCacheKey, RasterGlyph>> {
-    GLYPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+impl GlyphCache {
+    fn next_access(&mut self) -> u64 {
+        // Avoid duplicate LRU keys after the counter wraps. Reaching this path
+        // requires 2^64 cache operations; clearing is deterministic and keeps
+        // the cache/accounting invariants intact.
+        if self.access_clock == u64::MAX {
+            self.clear();
+        }
+        self.access_clock += 1;
+        self.access_clock
+    }
+
+    fn get(&mut self, key: &GlyphCacheKey) -> Option<RasterGlyph> {
+        let (glyph, previous_access) = self
+            .entries
+            .get(key)
+            .map(|entry| (entry.glyph.clone(), entry.last_used))?;
+        let access = self.next_access();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used = access;
+        }
+        if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
+            namespace.lru.remove(&previous_access);
+            namespace.lru.insert(access, key.clone());
+        }
+        Some(glyph)
+    }
+
+    fn insert(&mut self, key: GlyphCacheKey, glyph: RasterGlyph, limits: RasterCacheLimits) {
+        self.set_limits(key.namespace, limits);
+        let bitmap_bytes = glyph.bitmap.len();
+        if limits.glyph_max == 0 || bitmap_bytes > limits.bitmap_max_bytes {
+            return;
+        }
+
+        self.remove(&key);
+        let access = self.next_access();
+        self.entries.insert(
+            key.clone(),
+            CachedGlyph {
+                glyph,
+                last_used: access,
+            },
+        );
+        let namespace = self.namespaces.entry(key.namespace).or_default();
+        namespace.stats.glyph_entries += 1;
+        namespace.stats.bitmap_bytes = namespace.stats.bitmap_bytes.saturating_add(bitmap_bytes);
+        namespace.lru.insert(access, key.clone());
+        self.enforce_limits(key.namespace);
+    }
+
+    fn remove(&mut self, key: &GlyphCacheKey) -> Option<RasterGlyph> {
+        let entry = self.entries.remove(key)?;
+        if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
+            namespace.lru.remove(&entry.last_used);
+            namespace.stats.glyph_entries = namespace.stats.glyph_entries.saturating_sub(1);
+            namespace.stats.bitmap_bytes = namespace
+                .stats
+                .bitmap_bytes
+                .saturating_sub(entry.glyph.bitmap.len());
+        }
+        Some(entry.glyph)
+    }
+
+    fn set_limits(&mut self, namespace: u64, limits: RasterCacheLimits) {
+        self.namespaces.entry(namespace).or_default().limits = limits;
+        self.enforce_limits(namespace);
+    }
+
+    fn enforce_limits(&mut self, namespace_id: u64) {
+        loop {
+            let eviction = self.namespaces.get(&namespace_id).and_then(|namespace| {
+                (namespace.stats.glyph_entries > namespace.limits.glyph_max
+                    || namespace.stats.bitmap_bytes > namespace.limits.bitmap_max_bytes)
+                    .then(|| namespace.lru.first_key_value().map(|(_, key)| key.clone()))
+                    .flatten()
+            });
+            let Some(key) = eviction else {
+                break;
+            };
+            self.remove(&key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.namespaces.clear();
+        self.access_clock = 0;
+    }
+
+    fn clear_namespace(&mut self, namespace: u64) {
+        let Some(namespace_cache) = self.namespaces.remove(&namespace) else {
+            return;
+        };
+        for key in namespace_cache.lru.into_values() {
+            self.entries.remove(&key);
+        }
+    }
+
+    fn stats(&self) -> RasterCacheStats {
+        self.namespaces
+            .values()
+            .fold(RasterCacheStats::default(), |mut total, namespace| {
+                total.glyph_entries = total
+                    .glyph_entries
+                    .saturating_add(namespace.stats.glyph_entries);
+                total.bitmap_bytes = total
+                    .bitmap_bytes
+                    .saturating_add(namespace.stats.bitmap_bytes);
+                total
+            })
+    }
+
+    fn stats_for_namespace(&self, namespace: u64) -> RasterCacheStats {
+        self.namespaces
+            .get(&namespace)
+            .map(|namespace| namespace.stats.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn current_raster_cache_context() -> RasterCacheContext {
+    RASTER_CACHE_CONTEXT.with(Cell::get)
+}
+
+fn glyph_cache() -> &'static Mutex<GlyphCache> {
+    GLYPH_CACHE.get_or_init(|| Mutex::new(GlyphCache::default()))
+}
+
+fn lock_glyph_cache() -> std::sync::MutexGuard<'static, GlyphCache> {
+    glyph_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn to_26_6(value: f32) -> i32 {
+    (value * 64.0).round() as i32
+}
+
+fn glyph_cache_key(
+    font: &FontMatch,
+    font_identity: &FontCacheIdentity,
+    glyph_id: u32,
+    options: RasterOptions,
+) -> GlyphCacheKey {
+    let context = current_raster_cache_context();
+    GlyphCacheKey {
+        namespace: context.namespace,
+        font: font_identity.clone(),
+        family: font.family.clone(),
+        style: font.style.clone(),
+        synthetic_bold: font.synthetic_bold,
+        synthetic_italic: font.synthetic_italic,
+        face_index: font.face_index,
+        glyph_id,
+        size_26_6: options.size_26_6,
+        hinting: options.hinting,
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
@@ -289,12 +563,17 @@ fn face_is_postscript(face: &freetype::Face) -> bool {
     }
 }
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn apply_synthetic_style_transform(face: &freetype::Face, synthetic_italic: bool) {
     if synthetic_italic {
         // Match libass ass_glyph_italicize (ass_font.c): TrueType faces shear by
         // 0x05700 (~tan 18.77deg), PostScript (CFF/Type1) faces by 0x02d24
         // (~tan 10deg).
-        let xy = if face_is_postscript(face) { 0x02d24 } else { 0x05700 };
+        let xy = if face_is_postscript(face) {
+            0x02d24
+        } else {
+            0x05700
+        };
         let mut matrix = Matrix {
             xx: 0x10000,
             xy,
@@ -321,9 +600,10 @@ fn maybe_embolden_slot(slot: &GlyphSlot, synthetic_bold: bool) {
             return;
         }
         let face = (*raw).face;
-        let strength =
-            ffi::FT_MulFix(ffi::FT_Long::from((*face).units_per_EM), (*(*face).size).metrics.y_scale)
-                / 64;
+        let strength = ffi::FT_MulFix(
+            ffi::FT_Long::from((*face).units_per_EM),
+            (*(*face).size).metrics.y_scale,
+        ) / 64;
         ffi::FT_Outline_Embolden(&mut (*raw).outline, strength);
     }
 }
@@ -334,24 +614,16 @@ fn rasterize_freetype_glyphs(
     glyphs: &[GlyphInfo],
     options: RasterOptions,
 ) -> RassaResult<Vec<RasterGlyph>> {
+    let font_identity = FontCacheIdentity::from(font);
     let cache_keys = glyphs
         .iter()
-        .map(|glyph| GlyphCacheKey {
-            family: font.family.clone(),
-            style: font.style.clone(),
-            synthetic_bold: font.synthetic_bold,
-            synthetic_italic: font.synthetic_italic,
-            face_index: font.face_index,
-            glyph_id: glyph.glyph_id,
-            size_26_6: options.size_26_6,
-            hinting: options.hinting,
-        })
+        .map(|glyph| glyph_cache_key(font, &font_identity, glyph.glyph_id, options))
         .collect::<Vec<_>>();
     let mut cached_glyphs = {
-        let cache = glyph_cache().lock().expect("glyph cache mutex poisoned");
+        let mut cache = lock_glyph_cache();
         cache_keys
             .iter()
-            .map(|key| cache.get(key).cloned())
+            .map(|key| cache.get(key))
             .collect::<Vec<_>>()
     };
     if cached_glyphs.iter().all(Option::is_some) {
@@ -401,47 +673,60 @@ fn rasterize_freetype_glyphs(
         let advance = slot.advance();
         let vert_advance = slot.metrics().vertAdvance as i32;
         let rendered = render_slot_to_gray_bitmap(slot, glyph.glyph_id)?;
-        let rendered = RasterGlyph {
+        let cache_entry = RasterGlyph {
             glyph_id: glyph.glyph_id,
-            cluster: glyph.cluster,
             width: rendered.width,
             height: rendered.height,
             stride: rendered.stride,
             left: rendered.left,
             top: rendered.top,
-            offset_x: glyph.x_offset.round() as i32,
-            offset_y: (-glyph.y_offset).round() as i32 + rendered.offset_y,
+            offset_y: rendered.offset_y,
+            offset_y_26_6: rendered.offset_y * 64,
             advance_x: (advance.x >> 6) as i32,
             advance_y: (advance.y >> 6) as i32,
             advance_x_26_6: advance.x as i32,
+            advance_y_26_6: advance.y as i32,
             vert_advance_26_6: vert_advance,
             pixel_mode: RasterPixelMode::Gray,
             bitmap: rendered.bitmap,
+            ..RasterGlyph::default()
         };
-        let cache_entry = RasterGlyph {
-            cluster: 0,
-            offset_x: 0,
-            offset_y: rendered.offset_y - (-glyph.y_offset).round() as i32,
-            ..rendered.clone()
-        };
-        glyph_cache()
-            .lock()
-            .expect("glyph cache mutex poisoned")
-            .insert(cache_key, cache_entry);
-        rasterized.push(rendered);
+        let context = current_raster_cache_context();
+        lock_glyph_cache().insert(cache_key, cache_entry.clone(), context.limits);
+        rasterized.push(glyph_from_cache(glyph, cache_entry));
     }
 
     Ok(rasterized)
 }
 
 fn glyph_from_cache(glyph: &GlyphInfo, cached: RasterGlyph) -> RasterGlyph {
+    let shaped_positioning = glyph.positioning == GlyphPositioning::Shaped;
     RasterGlyph {
         cluster: glyph.cluster,
         offset_x: glyph.x_offset.round() as i32,
         offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
-        advance_x: cached.advance_x,
-        advance_y: cached.advance_y,
-        advance_x_26_6: cached.advance_x_26_6,
+        offset_x_26_6: to_26_6(glyph.x_offset),
+        offset_y_26_6: -to_26_6(glyph.y_offset) + cached.offset_y_26_6,
+        advance_x: if shaped_positioning {
+            glyph.x_advance.round() as i32
+        } else {
+            cached.advance_x
+        },
+        advance_y: if shaped_positioning {
+            glyph.y_advance.round() as i32
+        } else {
+            cached.advance_y
+        },
+        advance_x_26_6: if shaped_positioning {
+            to_26_6(glyph.x_advance)
+        } else {
+            cached.advance_x_26_6
+        },
+        advance_y_26_6: if shaped_positioning {
+            to_26_6(glyph.y_advance)
+        } else {
+            cached.advance_y_26_6
+        },
         vert_advance_26_6: cached.vert_advance_26_6,
         ..cached
     }
@@ -492,34 +777,12 @@ fn rasterize_system_glyphs(
         ))
     })?;
 
+    let font_identity = FontCacheIdentity::from(font);
     let mut rasterized = Vec::with_capacity(glyphs.len());
     for glyph in glyphs {
-        let cache_key = GlyphCacheKey {
-            family: font.family.clone(),
-            style: font.style.clone(),
-            synthetic_bold: font.synthetic_bold,
-            synthetic_italic: font.synthetic_italic,
-            face_index: font.face_index,
-            glyph_id: glyph.glyph_id,
-            size_26_6: options.size_26_6,
-            hinting: options.hinting,
-        };
-        if let Some(cached) = glyph_cache()
-            .lock()
-            .expect("glyph cache mutex poisoned")
-            .get(&cache_key)
-            .cloned()
-        {
-            rasterized.push(RasterGlyph {
-                cluster: glyph.cluster,
-                offset_x: glyph.x_offset.round() as i32,
-                offset_y: (-glyph.y_offset).round() as i32 + cached.offset_y,
-                advance_x: cached.advance_x,
-                advance_y: cached.advance_y,
-                advance_x_26_6: cached.advance_x_26_6,
-                vert_advance_26_6: cached.vert_advance_26_6,
-                ..cached
-            });
+        let cache_key = glyph_cache_key(font, &font_identity, glyph.glyph_id, options);
+        if let Some(cached) = lock_glyph_cache().get(&cache_key) {
+            rasterized.push(glyph_from_cache(glyph, cached));
             continue;
         }
 
@@ -536,53 +799,41 @@ fn rasterize_system_glyphs(
         })?;
         let (bitmap, stride, pixel_mode) =
             crossfont_bitmap_to_gray(rendered.width.max(0) as usize, &rendered.buffer);
-        let rendered = RasterGlyph {
+        // Preserve the pre-existing simple-shaper fallback on backends that
+        // report a zero nominal advance. Complex positioning is reapplied by
+        // `glyph_from_cache` below and never depends on these cached values.
+        let nominal_advance_x = if rendered.advance.0 != 0 {
+            rendered.advance.0
+        } else {
+            glyph.x_advance.round() as i32
+        };
+        let nominal_advance_y = if rendered.advance.1 != 0 {
+            rendered.advance.1
+        } else {
+            glyph.y_advance.round() as i32
+        };
+        let cache_entry = RasterGlyph {
             glyph_id: glyph.glyph_id,
-            cluster: glyph.cluster,
             width: rendered.width,
             height: rendered.height,
             stride,
             left: rendered.left,
             top: rendered.top,
-            offset_x: glyph.x_offset.round() as i32,
-            offset_y: (-glyph.y_offset).round() as i32,
-            advance_x: rendered_advance_x(&rendered, glyph),
-            advance_x_26_6: rendered_advance_x(&rendered, glyph) * 64,
+            advance_x: nominal_advance_x,
+            advance_x_26_6: nominal_advance_x * 64,
+            advance_y: nominal_advance_y,
+            advance_y_26_6: nominal_advance_y * 64,
             vert_advance_26_6: 0,
-            advance_y: rendered_advance_y(&rendered, glyph),
             pixel_mode,
             bitmap,
+            ..RasterGlyph::default()
         };
-        let cache_entry = RasterGlyph {
-            cluster: 0,
-            offset_x: 0,
-            offset_y: 0,
-            ..rendered.clone()
-        };
-        glyph_cache()
-            .lock()
-            .expect("glyph cache mutex poisoned")
-            .insert(cache_key, cache_entry);
-        rasterized.push(rendered);
+        let context = current_raster_cache_context();
+        lock_glyph_cache().insert(cache_key, cache_entry.clone(), context.limits);
+        rasterized.push(glyph_from_cache(glyph, cache_entry));
     }
 
     Ok(rasterized)
-}
-
-fn rendered_advance_x(rendered: &RasterizedGlyph, shaped: &GlyphInfo) -> i32 {
-    if rendered.advance.0 != 0 {
-        rendered.advance.0
-    } else {
-        shaped.x_advance.round() as i32
-    }
-}
-
-fn rendered_advance_y(rendered: &RasterizedGlyph, shaped: &GlyphInfo) -> i32 {
-    if rendered.advance.1 != 0 {
-        rendered.advance.1
-    } else {
-        shaped.y_advance.round() as i32
-    }
 }
 
 fn crossfont_bitmap_to_gray(
@@ -1243,6 +1494,52 @@ fn apply_rectilinear_boundary_antialias(
     }
 }
 
+// Keep eager bitmap operations within the same default budget libass assigns
+// its bitmap cache.  In particular, do not let drawing borders or blur turn a
+// valid (but large) vector fill into an unchecked multi-gigabyte allocation.
+const MAX_EAGER_BITMAP_BYTES: usize = 128 * 1024 * 1024;
+
+fn empty_bitmap_glyph(glyph: &RasterGlyph) -> RasterGlyph {
+    RasterGlyph {
+        width: 0,
+        height: 0,
+        stride: 0,
+        bitmap: Vec::new(),
+        ..glyph.clone()
+    }
+}
+
+fn checked_padded_bitmap_dimensions(
+    glyph: &RasterGlyph,
+    pad_x: usize,
+    pad_y: usize,
+) -> Option<(usize, usize, usize, usize, usize)> {
+    let width = usize::try_from(glyph.width).ok()?;
+    let height = usize::try_from(glyph.height).ok()?;
+    let stride = usize::try_from(glyph.stride).ok()?;
+    let source_len = stride.checked_mul(height)?;
+    if width == 0 || height == 0 || stride < width || source_len > glyph.bitmap.len() {
+        return None;
+    }
+
+    let new_width = width.checked_add(pad_x.checked_mul(2)?)?;
+    let new_height = height.checked_add(pad_y.checked_mul(2)?)?;
+    i32::try_from(new_width).ok()?;
+    i32::try_from(new_height).ok()?;
+    let bitmap_len = new_width.checked_mul(new_height)?;
+    if bitmap_len > MAX_EAGER_BITMAP_BYTES {
+        return None;
+    }
+    Some((width, height, stride, new_width, new_height))
+}
+
+fn zeroed_bitmap(len: usize) -> Option<Vec<u8>> {
+    let mut bitmap = Vec::new();
+    bitmap.try_reserve_exact(len).ok()?;
+    bitmap.resize(len, 0_u8);
+    Some(bitmap)
+}
+
 fn expand_outline_xy(glyph: &RasterGlyph, radius_x: i32, radius_y: i32) -> RasterGlyph {
     let radius_x = radius_x.max(0);
     let radius_y = radius_y.max(0);
@@ -1254,16 +1551,18 @@ fn expand_outline_xy(glyph: &RasterGlyph, radius_x: i32, radius_y: i32) -> Raste
         return glyph.clone();
     }
 
-    let radius_x = radius_x as usize;
-    let radius_y = radius_y as usize;
-    let width = glyph.width as usize;
-    let height = glyph.height as usize;
-    let stride = glyph.stride as usize;
-    let new_width = width + radius_x * 2;
-    let new_height = height + radius_y * 2;
-    let mut bitmap = vec![0_u8; new_width * new_height];
-    let rx2 = (radius_x * radius_x).max(1) as f64;
-    let ry2 = (radius_y * radius_y).max(1) as f64;
+    let radius_x = usize::try_from(radius_x).expect("nonnegative outline radius");
+    let radius_y = usize::try_from(radius_y).expect("nonnegative outline radius");
+    let Some((width, height, stride, new_width, new_height)) =
+        checked_padded_bitmap_dimensions(glyph, radius_x, radius_y)
+    else {
+        return empty_bitmap_glyph(glyph);
+    };
+    let Some(mut bitmap) = new_width.checked_mul(new_height).and_then(zeroed_bitmap) else {
+        return empty_bitmap_glyph(glyph);
+    };
+    let rx2 = (radius_x as f64 * radius_x as f64).max(1.0);
+    let ry2 = (radius_y as f64 * radius_y as f64).max(1.0);
     for y in 0..height {
         for x in 0..width {
             let value = glyph.bitmap[y * stride + x];
@@ -1298,11 +1597,15 @@ fn expand_outline_xy(glyph: &RasterGlyph, radius_x: i32, radius_y: i32) -> Raste
     }
 
     RasterGlyph {
-        width: new_width as i32,
-        height: new_height as i32,
-        stride: new_width as i32,
-        left: glyph.left - radius_x as i32,
-        top: glyph.top + radius_y as i32,
+        width: i32::try_from(new_width).expect("checked outline width"),
+        height: i32::try_from(new_height).expect("checked outline height"),
+        stride: i32::try_from(new_width).expect("checked outline stride"),
+        left: glyph
+            .left
+            .saturating_sub(i32::try_from(radius_x).expect("checked outline radius")),
+        top: glyph
+            .top
+            .saturating_add(i32::try_from(radius_y).expect("checked outline radius")),
         bitmap,
         ..glyph.clone()
     }
@@ -1313,13 +1616,15 @@ fn blur_glyph(glyph: &RasterGlyph, radius: u32) -> RasterGlyph {
         return glyph.clone();
     }
 
-    let radius = radius as usize;
-    let width = glyph.width as usize;
-    let height = glyph.height as usize;
-    let stride = glyph.stride as usize;
-    let new_width = width + radius * 2;
-    let new_height = height + radius * 2;
-    let mut expanded = vec![0_u8; new_width * new_height];
+    let radius = usize::try_from(radius).unwrap_or(usize::MAX);
+    let Some((width, height, stride, new_width, new_height)) =
+        checked_padded_bitmap_dimensions(glyph, radius, radius)
+    else {
+        return empty_bitmap_glyph(glyph);
+    };
+    let Some(mut expanded) = new_width.checked_mul(new_height).and_then(zeroed_bitmap) else {
+        return empty_bitmap_glyph(glyph);
+    };
 
     for y in 0..height {
         for x in 0..width {
@@ -1327,18 +1632,20 @@ fn blur_glyph(glyph: &RasterGlyph, radius: u32) -> RasterGlyph {
         }
     }
 
-    let mut bitmap = vec![0_u8; expanded.len()];
+    let Some(mut bitmap) = zeroed_bitmap(expanded.len()) else {
+        return empty_bitmap_glyph(glyph);
+    };
     for y in 0..new_height {
         let min_y = y.saturating_sub(radius);
         let max_y = (y + radius).min(new_height - 1);
         for x in 0..new_width {
             let min_x = x.saturating_sub(radius);
             let max_x = (x + radius).min(new_width - 1);
-            let mut sum = 0_u32;
-            let mut count = 0_u32;
+            let mut sum = 0_u64;
+            let mut count = 0_u64;
             for sample_y in min_y..=max_y {
                 for sample_x in min_x..=max_x {
-                    sum += u32::from(expanded[sample_y * new_width + sample_x]);
+                    sum += u64::from(expanded[sample_y * new_width + sample_x]);
                     count += 1;
                 }
             }
@@ -1347,11 +1654,15 @@ fn blur_glyph(glyph: &RasterGlyph, radius: u32) -> RasterGlyph {
     }
 
     RasterGlyph {
-        width: new_width as i32,
-        height: new_height as i32,
-        stride: new_width as i32,
-        left: glyph.left - radius as i32,
-        top: glyph.top + radius as i32,
+        width: i32::try_from(new_width).expect("checked blur width"),
+        height: i32::try_from(new_height).expect("checked blur height"),
+        stride: i32::try_from(new_width).expect("checked blur stride"),
+        left: glyph
+            .left
+            .saturating_sub(i32::try_from(radius).expect("checked blur radius")),
+        top: glyph
+            .top
+            .saturating_add(i32::try_from(radius).expect("checked blur radius")),
         bitmap,
         ..glyph.clone()
     }
@@ -1361,11 +1672,24 @@ fn blur_glyph(glyph: &RasterGlyph, radius: u32) -> RasterGlyph {
 mod tests {
     use super::*;
     use rassa_fonts::FontconfigProvider;
+    #[cfg(not(target_arch = "wasm32"))]
+    use rassa_fonts::{FontProvider, FontQuery};
     use rassa_shape::{ShapeEngine, ShapeRequest, ShapingMode};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn isolated_cache_scope() -> (u64, RasterCacheScope) {
+        static NEXT_TEST_NAMESPACE: AtomicU64 = AtomicU64::new(1 << 63);
+        let namespace = NEXT_TEST_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+        Rasterizer::clear_cache_namespace(namespace);
+        (
+            namespace,
+            RasterCacheScope::enter(namespace, RasterCacheLimits::default()),
+        )
+    }
 
     #[test]
     fn rasterize_run_renders_system_font_bitmaps() {
-        Rasterizer::clear_cache();
+        let (_namespace, _cache_scope) = isolated_cache_scope();
         let provider = FontconfigProvider::new();
         let shaper = ShapeEngine::new();
         let shaped = shaper
@@ -1404,46 +1728,198 @@ mod tests {
     }
 
     #[test]
-    fn rendered_advance_falls_back_to_shaped_positions_when_backend_reports_zero() {
-        let rendered = RasterizedGlyph {
-            advance: (0, 0),
-            ..RasterizedGlyph::default()
-        };
+    fn shaped_positioning_overrides_backend_metrics() {
         let shaped = GlyphInfo {
             glyph_id: 1,
             cluster: 0,
+            vertical_rotation_eligible: false,
             x_advance: 17.4,
             y_advance: -2.6,
-            x_offset: 0.0,
-            y_offset: 0.0,
+            x_offset: 1.25,
+            y_offset: -0.75,
+            positioning: GlyphPositioning::Shaped,
         };
+        let rasterized = glyph_from_cache(
+            &shaped,
+            RasterGlyph {
+                advance_x: 23,
+                advance_y: 5,
+                advance_x_26_6: 23 * 64,
+                advance_y_26_6: 5 * 64,
+                ..RasterGlyph::default()
+            },
+        );
 
-        assert_eq!(rendered_advance_x(&rendered, &shaped), 17);
-        assert_eq!(rendered_advance_y(&rendered, &shaped), -3);
+        assert_eq!(rasterized.advance_x, 17);
+        assert_eq!(rasterized.advance_y, -3);
+        assert_eq!(rasterized.advance_x_26_6, to_26_6(17.4));
+        assert_eq!(rasterized.advance_y_26_6, to_26_6(-2.6));
+        assert_eq!(rasterized.offset_x_26_6, 80);
+        assert_eq!(rasterized.offset_y_26_6, 48);
     }
 
     #[test]
-    fn rendered_advance_keeps_backend_metrics_when_present() {
-        let rendered = RasterizedGlyph {
-            advance: (23, 5),
-            ..RasterizedGlyph::default()
-        };
-        let shaped = GlyphInfo {
+    fn nominal_positioning_keeps_backend_metrics() {
+        let nominal = GlyphInfo {
             glyph_id: 1,
             cluster: 0,
+            vertical_rotation_eligible: false,
             x_advance: 17.4,
             y_advance: -2.6,
             x_offset: 0.0,
             y_offset: 0.0,
+            positioning: GlyphPositioning::Nominal,
+        };
+        let rasterized = glyph_from_cache(
+            &nominal,
+            RasterGlyph {
+                advance_x: 23,
+                advance_y: 5,
+                advance_x_26_6: 23 * 64 + 11,
+                advance_y_26_6: 5 * 64 + 7,
+                ..RasterGlyph::default()
+            },
+        );
+
+        assert_eq!(rasterized.advance_x, 23);
+        assert_eq!(rasterized.advance_y, 5);
+        assert_eq!(rasterized.advance_x_26_6, 23 * 64 + 11);
+        assert_eq!(rasterized.advance_y_26_6, 5 * 64 + 7);
+    }
+
+    fn cache_test_key(namespace: u64, glyph_id: u32) -> GlyphCacheKey {
+        GlyphCacheKey {
+            namespace,
+            font: FontCacheIdentity {
+                provider: FontProviderKind::Null,
+                path: None,
+                bytes: None,
+            },
+            family: "cache-test".to_owned(),
+            style: None,
+            synthetic_bold: false,
+            synthetic_italic: false,
+            face_index: None,
+            glyph_id,
+            size_26_6: 16 * 64,
+            hinting: ass::Hinting::None,
+        }
+    }
+
+    fn cache_test_glyph(glyph_id: u32, bitmap_bytes: usize) -> RasterGlyph {
+        RasterGlyph {
+            glyph_id,
+            width: i32::try_from(bitmap_bytes).unwrap_or(i32::MAX),
+            height: 1,
+            stride: i32::try_from(bitmap_bytes).unwrap_or(i32::MAX),
+            bitmap: vec![glyph_id as u8; bitmap_bytes],
+            ..RasterGlyph::default()
+        }
+    }
+
+    #[test]
+    fn glyph_cache_evicts_least_recently_used_entry_at_glyph_limit() {
+        let namespace = 11;
+        let limits = RasterCacheLimits {
+            glyph_max: 2,
+            bitmap_max_bytes: 100,
+        };
+        let first = cache_test_key(namespace, 1);
+        let second = cache_test_key(namespace, 2);
+        let third = cache_test_key(namespace, 3);
+        let mut cache = GlyphCache::default();
+
+        cache.insert(first.clone(), cache_test_glyph(1, 3), limits);
+        cache.insert(second.clone(), cache_test_glyph(2, 4), limits);
+        assert_eq!(cache.get(&first).expect("first glyph cached").glyph_id, 1);
+        cache.insert(third.clone(), cache_test_glyph(3, 5), limits);
+
+        assert!(cache.entries.contains_key(&first));
+        assert!(!cache.entries.contains_key(&second));
+        assert!(cache.entries.contains_key(&third));
+        assert_eq!(
+            cache.stats_for_namespace(namespace),
+            RasterCacheStats {
+                glyph_entries: 2,
+                bitmap_bytes: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn glyph_cache_accounts_bitmap_bytes_and_rejects_oversized_entries() {
+        let namespace = 12;
+        let limits = RasterCacheLimits {
+            glyph_max: 10,
+            bitmap_max_bytes: 5,
+        };
+        let first = cache_test_key(namespace, 1);
+        let second = cache_test_key(namespace, 2);
+        let oversized = cache_test_key(namespace, 3);
+        let mut cache = GlyphCache::default();
+
+        cache.insert(first.clone(), cache_test_glyph(1, 3), limits);
+        cache.insert(second.clone(), cache_test_glyph(2, 4), limits);
+        cache.insert(oversized.clone(), cache_test_glyph(3, 6), limits);
+
+        assert!(!cache.entries.contains_key(&first));
+        assert!(cache.entries.contains_key(&second));
+        assert!(!cache.entries.contains_key(&oversized));
+        assert_eq!(
+            cache.stats_for_namespace(namespace),
+            RasterCacheStats {
+                glyph_entries: 1,
+                bitmap_bytes: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn glyph_cache_limits_are_isolated_by_renderer_namespace() {
+        let first_namespace = 13;
+        let second_namespace = 14;
+        let mut cache = GlyphCache::default();
+        let one_entry = RasterCacheLimits {
+            glyph_max: 1,
+            bitmap_max_bytes: 100,
+        };
+        let two_entries = RasterCacheLimits {
+            glyph_max: 2,
+            bitmap_max_bytes: 100,
         };
 
-        assert_eq!(rendered_advance_x(&rendered, &shaped), 23);
-        assert_eq!(rendered_advance_y(&rendered, &shaped), 5);
+        for glyph_id in 1..=2 {
+            cache.insert(
+                cache_test_key(first_namespace, glyph_id),
+                cache_test_glyph(glyph_id, 2),
+                one_entry,
+            );
+            cache.insert(
+                cache_test_key(second_namespace, glyph_id),
+                cache_test_glyph(glyph_id, 3),
+                two_entries,
+            );
+        }
+
+        assert_eq!(cache.stats_for_namespace(first_namespace).glyph_entries, 1);
+        assert_eq!(cache.stats_for_namespace(second_namespace).glyph_entries, 2);
+        cache.set_limits(
+            first_namespace,
+            RasterCacheLimits {
+                glyph_max: 0,
+                bitmap_max_bytes: 0,
+            },
+        );
+        assert_eq!(
+            cache.stats_for_namespace(first_namespace),
+            RasterCacheStats::default()
+        );
+        assert_eq!(cache.stats_for_namespace(second_namespace).glyph_entries, 2);
     }
 
     #[test]
     fn rasterize_run_reuses_global_glyph_cache() {
-        Rasterizer::clear_cache();
+        let (namespace, _cache_scope) = isolated_cache_scope();
         let provider = FontconfigProvider::new();
         let shaper = ShapeEngine::new();
         let shaped = shaper
@@ -1457,7 +1933,8 @@ mod tests {
         let first = rasterizer
             .rasterize_run(&shaped.runs[0])
             .expect("rasterization should succeed");
-        let entries_after_first = glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options);
+        let entries_after_first =
+            glyph_cache_entries_for_run(namespace, &shaped.runs[0], rasterizer.options);
         let second = rasterizer
             .rasterize_run(&shaped.runs[0])
             .expect("rasterization should succeed");
@@ -1465,9 +1942,212 @@ mod tests {
         assert_eq!(first, second);
         assert!(entries_after_first > 0);
         assert_eq!(
-            glyph_cache_entries_for_run(&shaped.runs[0], rasterizer.options),
+            glyph_cache_entries_for_run(namespace, &shaped.runs[0], rasterizer.options),
             entries_after_first
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn glyph_cache_separates_distinct_font_sources_with_identical_metadata() {
+        let (namespace, _cache_scope) = isolated_cache_scope();
+        let fixture = |name: &str| FontMatch {
+            family: "cache-identity-collision".to_owned(),
+            path: Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare/test")
+                    .join(name),
+            ),
+            face_index: Some(0),
+            style: Some("Regular".to_owned()),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        };
+        let first_font = fixture("font1.ttf");
+        let second_font = fixture("font2.otf");
+        let glyph = GlyphInfo {
+            glyph_id: 1,
+            positioning: GlyphPositioning::Nominal,
+            ..GlyphInfo::default()
+        };
+        let options = RasterOptions {
+            size_26_6: 91 * 64,
+            hinting: ass::Hinting::None,
+        };
+        let rasterizer = Rasterizer::with_options(options);
+
+        rasterizer
+            .rasterize_glyphs(&first_font, std::slice::from_ref(&glyph))
+            .expect("first attached font should rasterize");
+        rasterizer
+            .rasterize_glyphs(&second_font, std::slice::from_ref(&glyph))
+            .expect("second attached font should rasterize");
+
+        let cache = lock_glyph_cache();
+        let matching = cache
+            .entries
+            .keys()
+            .filter(|key| {
+                key.namespace == namespace
+                    && key.family == "cache-identity-collision"
+                    && key.glyph_id == glyph.glyph_id
+                    && key.size_26_6 == options.size_26_6
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 2);
+        assert_ne!(matching[0].font.path, matching[1].font.path);
+        assert_ne!(matching[0].font.bytes, matching[1].font.bytes);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cached_bitmap_reapplies_contextual_shaped_positions() {
+        let (namespace, _cache_scope) = isolated_cache_scope();
+        let font = FontMatch {
+            family: "contextual-positioning-cache".to_owned(),
+            path: Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+            ),
+            face_index: Some(0),
+            style: Some("Regular".to_owned()),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        };
+        let first_context = GlyphInfo {
+            glyph_id: 1,
+            cluster: 0,
+            vertical_rotation_eligible: false,
+            x_advance: 13.25,
+            y_advance: 0.5,
+            x_offset: 0.25,
+            y_offset: -0.75,
+            positioning: GlyphPositioning::Shaped,
+        };
+        let second_context = GlyphInfo {
+            glyph_id: 1,
+            cluster: 7,
+            vertical_rotation_eligible: false,
+            x_advance: 9.5,
+            y_advance: -0.25,
+            x_offset: -1.75,
+            y_offset: 1.5,
+            positioning: GlyphPositioning::Shaped,
+        };
+        let options = RasterOptions {
+            size_26_6: 93 * 64,
+            hinting: ass::Hinting::None,
+        };
+        let rasterizer = Rasterizer::with_options(options);
+
+        let first = rasterizer
+            .rasterize_glyphs(&font, std::slice::from_ref(&first_context))
+            .expect("first shaped context should rasterize")
+            .remove(0);
+        let second = rasterizer
+            .rasterize_glyphs(&font, std::slice::from_ref(&second_context))
+            .expect("cached shaped context should rasterize")
+            .remove(0);
+
+        assert_eq!(
+            first.bitmap, second.bitmap,
+            "only positioning should differ"
+        );
+        assert_eq!(first.advance_x_26_6, to_26_6(first_context.x_advance));
+        assert_eq!(first.advance_y_26_6, to_26_6(first_context.y_advance));
+        assert_eq!(first.offset_x_26_6, to_26_6(first_context.x_offset));
+        assert_eq!(first.offset_y_26_6, -to_26_6(first_context.y_offset));
+        assert_eq!(second.cluster, second_context.cluster);
+        assert_eq!(second.advance_x_26_6, to_26_6(second_context.x_advance));
+        assert_eq!(second.advance_y_26_6, to_26_6(second_context.y_advance));
+        assert_eq!(second.offset_x_26_6, to_26_6(second_context.x_offset));
+        assert_eq!(second.offset_y_26_6, -to_26_6(second_context.y_offset));
+        assert_ne!(first.advance_x_26_6, second.advance_x_26_6);
+
+        let cache_entries = lock_glyph_cache()
+            .entries
+            .keys()
+            .filter(|key| {
+                key.namespace == namespace
+                    && key.family == font.family
+                    && key.glyph_id == first_context.glyph_id
+                    && key.size_26_6 == options.size_26_6
+            })
+            .count();
+        assert_eq!(
+            cache_entries, 1,
+            "both contexts must share one bitmap entry"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn harfrust_context_dependent_advance_survives_raster_cache() {
+        #[derive(Clone)]
+        struct FixedFontProvider(FontMatch);
+
+        impl FontProvider for FixedFontProvider {
+            fn resolve(&self, _query: &FontQuery) -> FontMatch {
+                self.0.clone()
+            }
+        }
+
+        let (_namespace, _cache_scope) = isolated_cache_scope();
+        let font = FontMatch {
+            family: "Aileron".to_owned(),
+            path: Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+            ),
+            face_index: Some(0),
+            style: Some("Regular".to_owned()),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        };
+        let provider = FixedFontProvider(font.clone());
+        let shaper = ShapeEngine::new();
+        let shape = |text: &str| {
+            shaper
+                .shape_text(
+                    &provider,
+                    &ShapeRequest::new(text, "Aileron")
+                        .with_font_size(93.0)
+                        .with_mode(ShapingMode::Complex),
+                )
+                .expect("fixture font should shape")
+        };
+        let av = shape("AV");
+        let aa = shape("AA");
+        let av_a = &av.runs[0].glyphs[0];
+        let aa_a = &aa.runs[0].glyphs[0];
+        assert_eq!(av_a.glyph_id, aa_a.glyph_id);
+        assert_eq!(av_a.positioning, GlyphPositioning::Shaped);
+        assert_ne!(
+            to_26_6(av_a.x_advance),
+            to_26_6(aa_a.x_advance),
+            "the fixture must expose A's context-dependent GPOS advance"
+        );
+
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: 93 * 64,
+            hinting: ass::Hinting::None,
+        });
+        let av_raster = rasterizer
+            .rasterize_glyphs(&font, std::slice::from_ref(av_a))
+            .expect("AV glyph should rasterize")
+            .remove(0);
+        let aa_raster = rasterizer
+            .rasterize_glyphs(&font, std::slice::from_ref(aa_a))
+            .expect("AA glyph should reuse the cached bitmap")
+            .remove(0);
+
+        assert_eq!(av_raster.bitmap, aa_raster.bitmap);
+        assert_eq!(av_raster.advance_x_26_6, to_26_6(av_a.x_advance));
+        assert_eq!(aa_raster.advance_x_26_6, to_26_6(aa_a.x_advance));
+        assert_ne!(av_raster.advance_x_26_6, aa_raster.advance_x_26_6);
     }
 
     #[test]
@@ -1515,13 +2195,17 @@ mod tests {
         assert_eq!(bitmap, vec![64, 64, 64, 64]);
     }
 
-    fn glyph_cache_entries_for_run(run: &ShapedRun, options: RasterOptions) -> usize {
-        glyph_cache()
-            .lock()
-            .expect("glyph cache mutex poisoned")
+    fn glyph_cache_entries_for_run(
+        namespace: u64,
+        run: &ShapedRun,
+        options: RasterOptions,
+    ) -> usize {
+        lock_glyph_cache()
+            .entries
             .keys()
             .filter(|key| {
-                key.family == run.font.family
+                key.namespace == namespace
+                    && key.family == run.font.family
                     && key.style == run.font.style
                     && key.size_26_6 == options.size_26_6
                     && key.hinting == options.hinting
@@ -1535,10 +2219,12 @@ mod tests {
         let glyphs = rasterizer.rasterize(&[GlyphInfo {
             glyph_id: 'A' as u32,
             cluster: 0,
+            vertical_rotation_eligible: false,
             x_advance: 1.0,
             y_advance: 0.0,
             x_offset: 0.0,
             y_offset: 0.0,
+            positioning: GlyphPositioning::Nominal,
         }]);
 
         assert_eq!(glyphs.len(), 1);
@@ -1593,6 +2279,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vector_bitmap_expansion_rejects_hostile_dimensions_without_panicking() {
+        let rasterizer = Rasterizer::new();
+        let glyph = RasterGlyph {
+            width: 1,
+            height: 1,
+            stride: 1,
+            left: i32::MIN,
+            top: i32::MAX,
+            bitmap: vec![255],
+            ..RasterGlyph::default()
+        };
+
+        for expanded in [
+            rasterizer.outline_glyphs(std::slice::from_ref(&glyph), i32::MAX),
+            rasterizer.blur_glyphs(std::slice::from_ref(&glyph), u32::MAX),
+        ] {
+            assert_eq!(expanded.len(), 1);
+            assert_eq!(expanded[0].width, 0);
+            assert_eq!(expanded[0].height, 0);
+            assert_eq!(expanded[0].stride, 0);
+            assert!(expanded[0].bitmap.is_empty());
+        }
+
+        let malformed = RasterGlyph {
+            width: 2,
+            height: 2,
+            stride: 1,
+            bitmap: vec![255],
+            ..RasterGlyph::default()
+        };
+        let expanded = rasterizer.outline_glyphs(&[malformed], 1);
+        assert_eq!(expanded[0].width, 0);
+        assert!(expanded[0].bitmap.is_empty());
+    }
+
     #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
     #[test]
     fn hinting_modes_map_to_expected_freetype_flags() {
@@ -1615,7 +2337,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
     #[test]
     fn freetype_italic_rasterization_applies_synthetic_slant() {
-        Rasterizer::clear_cache();
+        let (_namespace, _cache_scope) = isolated_cache_scope();
         let provider = FontconfigProvider::new();
         let shaper = ShapeEngine::new();
         let regular = shaper

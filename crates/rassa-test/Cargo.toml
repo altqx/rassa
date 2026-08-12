@@ -18,3 +18,7 @@ rassa_capi = { package = "rassa-capi", path = "../rassa-capi", version = "0.6.0"
 rassa-fonts = { path = "../rassa-fonts", version = "0.6.0" }
 rassa-parse = { path = "../rassa-parse", version = "0.6.0" }
 rassa-render = { path = "../rassa-render", version = "0.6.0" }
+
+[[bin]]
+name = "rassa-corpus-check"
+path = "src/bin/corpus_check.rs"

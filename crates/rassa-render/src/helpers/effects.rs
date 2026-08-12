@@ -45,7 +45,14 @@ pub(crate) fn carve_fill_out_of_outline(planes: &mut [ImagePlane]) {
     let fills: Vec<(Point, Size, i32, Vec<u8>)> = planes
         .iter()
         .filter(|plane| plane.kind == ass::ImageType::Character)
-        .map(|plane| (plane.destination, plane.size, plane.stride, plane.bitmap.clone()))
+        .map(|plane| {
+            (
+                plane.destination,
+                plane.size,
+                plane.stride,
+                plane.bitmap.clone(),
+            )
+        })
         .collect();
     if fills.is_empty() {
         return;
@@ -178,9 +185,13 @@ pub(crate) fn apply_effect_to_planes(
 
 pub(crate) fn transition_effect_disables_collision(event: &ParsedEvent) -> bool {
     let effect = event.effect.as_str();
-    effect.starts_with("Banner;")
-        || effect.starts_with("Scroll up;")
-        || effect.starts_with("Scroll down;")
+    if effect.starts_with("Banner;") {
+        return !effect_values(effect).is_empty();
+    }
+    if effect.starts_with("Scroll up;") || effect.starts_with("Scroll down;") {
+        return effect_values(effect).len() >= 3;
+    }
+    false
 }
 
 pub(crate) fn effect_values(effect: &str) -> Vec<i32> {
@@ -188,7 +199,7 @@ pub(crate) fn effect_values(effect: &str) -> Vec<i32> {
 }
 
 pub(crate) fn atoi_prefix(value: &str) -> i32 {
-    let trimmed = value.trim_start();
+    let trimmed = value.trim_start_matches([' ', '\t', '\n', '\r', '\u{000b}', '\u{000c}']);
     let mut end = 0;
     for (idx, ch) in trimmed.char_indices() {
         if idx == 0 && (ch == '+' || ch == '-') {
@@ -217,7 +228,7 @@ pub(crate) fn effect_delay_scales(track: &ParsedTrack, config: &RendererConfig) 
     let y = layout
         .map(|size| f64::from(size.height.max(1)) / f64::from(track.play_res_y.max(1)))
         .unwrap_or(1.0);
-    RenderScale { x, y, uniform: 1.0 }
+    RenderScale { x, y }
 }
 
 pub(crate) fn resolve_run_fill_color(
@@ -232,10 +243,10 @@ pub(crate) fn resolve_run_fill_color(
     let Some(event) = source_event else {
         return style.primary_colour;
     };
-    let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
+    let elapsed = karaoke_elapsed_ms(event, now_ms);
     // libass ass_parse.c process_karaoke_effects: for \k and \ko,
     // tm_end = tm_start, so the fill switches to primary at syllable START.
-    if elapsed >= karaoke.start_ms {
+    if elapsed >= i64::from(karaoke.start_ms) {
         style.primary_colour
     } else {
         style.secondary_colour
@@ -256,10 +267,14 @@ pub(crate) fn karaoke_hides_outline(
     let Some(event) = source_event else {
         return false;
     };
-    let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
+    let elapsed = karaoke_elapsed_ms(event, now_ms);
     // libass render_text skips the outline only while effect_timing <= 0,
     // i.e. before the syllable starts (ass_render.c).
-    elapsed < karaoke.start_ms
+    elapsed < i64::from(karaoke.start_ms)
+}
+
+fn karaoke_elapsed_ms(event: &ParsedEvent, now_ms: i64) -> i64 {
+    (now_ms - event.start).clamp(0, event.duration.max(0))
 }
 
 pub(crate) fn apply_karaoke_to_character_planes(
@@ -277,8 +292,8 @@ pub(crate) fn apply_karaoke_to_character_planes(
     let Some(event) = source_event else {
         return planes;
     };
-    let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
-    let relative = elapsed - karaoke.start_ms;
+    let elapsed = karaoke_elapsed_ms(event, now_ms);
+    let relative = elapsed - i64::from(karaoke.start_ms);
     match karaoke.mode {
         // \k and \ko: libass sets tm_end = tm_start, so the whole syllable
         // is primary from its start time onward.
@@ -304,7 +319,7 @@ pub(crate) fn apply_karaoke_to_character_planes(
             } else {
                 (style.primary_colour, style.secondary_colour)
             };
-            if relative <= 0 {
+            if relative < 0 {
                 return planes
                     .into_iter()
                     .map(|mut plane| {
@@ -313,7 +328,7 @@ pub(crate) fn apply_karaoke_to_character_planes(
                     })
                     .collect();
             }
-            if relative >= karaoke.duration_ms {
+            if relative >= i64::from(karaoke.duration_ms) {
                 return planes
                     .into_iter()
                     .map(|mut plane| {
@@ -323,11 +338,25 @@ pub(crate) fn apply_karaoke_to_character_planes(
                     .collect();
             }
 
-            let mut progress = f64::from(relative) / f64::from(karaoke.duration_ms.max(1));
+            let mut progress = (relative as f64) / f64::from(karaoke.duration_ms.max(1));
             if reversed {
                 progress = 1.0 - progress;
             }
-            let split_x = run_origin_x + (f64::from(run_width.max(0)) * progress).round() as i32;
+            // libass anchors the sweep to the run's leftmost transformed
+            // outline, not its logical pen origin.  Its rounded outline edge
+            // includes the first antialiased bitmap column at progress zero;
+            // Rassa's raster bitmaps are already trimmed to nonzero coverage,
+            // so advance one column from the visible left edge to preserve
+            // that primary-colour sliver.
+            let sweep_start_x = planes
+                .iter()
+                .filter_map(plane_ink_bounds)
+                .map(|bounds| bounds.x_min)
+                .min()
+                .map(|x| x.saturating_add(1))
+                .unwrap_or(run_origin_x);
+            let split_x = sweep_start_x
+                .saturating_add((f64::from(run_width.max(0)) * progress).round() as i32);
             let mut result = Vec::new();
             for plane in planes {
                 if let Some(mut left) =
@@ -387,4 +416,92 @@ pub(crate) fn clip_plane_horizontally(
         kind: plane.kind,
         bitmap,
     })
+}
+
+pub(crate) fn clip_plane_vertically(
+    plane: &ImagePlane,
+    clip_top: i32,
+    clip_bottom: i32,
+) -> Option<ImagePlane> {
+    let plane_top = plane.destination.y;
+    let plane_bottom = plane.destination.y + plane.size.height;
+    let top = clip_top.max(plane_top);
+    let bottom = clip_bottom.min(plane_bottom);
+    if bottom <= top || plane.size.width <= 0 || plane.size.height <= 0 {
+        return None;
+    }
+
+    let start_row = (top - plane_top) as usize;
+    let new_height = (bottom - top) as usize;
+    let width = plane.size.width as usize;
+    let stride = plane.stride as usize;
+    let mut bitmap = vec![0_u8; width * new_height];
+    for row in 0..new_height {
+        let source_row = (start_row + row) * stride;
+        bitmap[row * width..(row + 1) * width]
+            .copy_from_slice(&plane.bitmap[source_row..source_row + width]);
+    }
+
+    Some(ImagePlane {
+        size: Size {
+            width: plane.size.width,
+            height: new_height as i32,
+        },
+        stride: plane.size.width,
+        color: plane.color,
+        destination: Point {
+            x: plane.destination.x,
+            y: top,
+        },
+        kind: plane.kind,
+        bitmap,
+    })
+}
+
+pub(crate) fn apply_vertical_karaoke_sweep_after_transform(
+    planes: Vec<ImagePlane>,
+    run: &LayoutGlyphRun,
+    style: &ParsedSpanStyle,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> Vec<ImagePlane> {
+    let Some(karaoke) = run
+        .karaoke
+        .filter(|karaoke| karaoke.mode == ParsedKaraokeMode::Sweep)
+    else {
+        return planes;
+    };
+    let Some(event) = source_event else {
+        return planes;
+    };
+    let relative = karaoke_elapsed_ms(event, now_ms) - i64::from(karaoke.start_ms);
+    if relative <= 0 || relative >= i64::from(karaoke.duration_ms) {
+        return planes;
+    }
+    let frz = style.rotation_z % 360.0;
+    if (frz - 270.0).abs() > f64::EPSILON && (frz + 90.0).abs() > f64::EPSILON {
+        return planes;
+    }
+    let mut result = Vec::new();
+    for plane in planes {
+        let Some(_) = plane_ink_bounds(&plane) else {
+            continue;
+        };
+        let split_y = if frz > 0.0 {
+            plane.destination.y + plane.size.height
+        } else {
+            plane.destination.y
+        };
+        if let Some(mut top) = clip_plane_vertically(&plane, plane.destination.y, split_y) {
+            top.color = rgba_color_from_ass(style.primary_colour);
+            result.push(top);
+        }
+        if let Some(mut bottom) =
+            clip_plane_vertically(&plane, split_y, plane.destination.y + plane.size.height)
+        {
+            bottom.color = rgba_color_from_ass(style.secondary_colour);
+            result.push(bottom);
+        }
+    }
+    result
 }

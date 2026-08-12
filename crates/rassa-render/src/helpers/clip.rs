@@ -24,22 +24,31 @@ pub(crate) fn apply_event_clip(
 /// render space, mirroring how `scale_clip_rect` and position tags are scaled.
 /// libass scales clip drawings by the same frame transform as glyph positions;
 /// without this the polygon stays in the PlayRes corner and clips everything.
-pub(crate) fn scale_vector_clip(clip: &ParsedVectorClip, mapping: &EventMapping) -> ParsedVectorClip {
-    ParsedVectorClip {
-        scale: clip.scale,
-        polygons: clip
-            .polygons
-            .iter()
-            .map(|poly| {
-                poly.iter()
-                    .map(|point| Point {
-                        x: mapping.map_x_pos(f64::from(point.x)).round() as i32,
-                        y: mapping.map_y_pos(f64::from(point.y)).round() as i32,
-                    })
-                    .collect()
-            })
-            .collect(),
+pub(crate) fn scale_vector_clip(
+    clip: &ParsedVectorClip,
+    mapping: &EventMapping,
+) -> Option<ParsedVectorClip> {
+    let mut polygons = Vec::new();
+    polygons.try_reserve_exact(clip.polygons.len()).ok()?;
+    for polygon in &clip.polygons {
+        let mut scaled = Vec::new();
+        scaled.try_reserve_exact(polygon.len()).ok()?;
+        for point in polygon {
+            let point = Point {
+                x: libass_outline_coordinate_from_f64(mapping.map_x_pos(f64::from(point.x)))?,
+                y: libass_outline_coordinate_from_f64(mapping.map_y_pos(f64::from(point.y)))?,
+            };
+            if !libass_outline_point_is_valid(point) {
+                return None;
+            }
+            scaled.push(point);
+        }
+        polygons.push(scaled);
     }
+    Some(ParsedVectorClip {
+        scale: clip.scale,
+        polygons,
+    })
 }
 
 pub(crate) fn apply_vector_clip(
@@ -58,45 +67,82 @@ pub(crate) fn mask_plane_with_vector_clip(
     clip: &ParsedVectorClip,
     inverse: bool,
 ) -> Option<ImagePlane> {
-    let mut bitmap = plane.bitmap.clone();
-    let stride = plane.stride as usize;
-    let width = plane.size.width.max(0) as usize;
-    let height = plane.size.height.max(0) as usize;
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0_usize;
-    let mut max_y = 0_usize;
+    if clip
+        .polygons
+        .iter()
+        .flatten()
+        .copied()
+        .any(|point| !libass_outline_point_is_valid(point))
+    {
+        // Programmatically constructed clips bypass the ASS parser.  Mirror
+        // libass's invalid-outline behavior here too: do not apply either
+        // regular or inverse clipping.
+        return Some(plane);
+    }
+    if clip.polygons.is_empty() {
+        return inverse.then_some(plane);
+    }
+
+    let stride = usize::try_from(plane.stride).ok()?;
+    let width = usize::try_from(plane.size.width).ok()?;
+    let height = usize::try_from(plane.size.height).ok()?;
+    let required_len = stride.checked_mul(height)?;
+    if stride < width || required_len > plane.bitmap.len() {
+        return None;
+    }
+    let mut bitmap = Vec::new();
+    bitmap.try_reserve_exact(plane.bitmap.len()).ok()?;
+    bitmap.extend_from_slice(&plane.bitmap);
+    let mut clip_min_x = width;
+    let mut clip_min_y = height;
+    let mut clip_max_x = 0_usize;
+    let mut clip_max_y = 0_usize;
 
     for row in 0..height {
         for column in 0..width {
-            let global_x = plane.destination.x + column as i32;
-            let global_y = plane.destination.y + row as i32;
+            let global_x = i64::from(plane.destination.x) + i64::try_from(column).ok()?;
+            let global_y = i64::from(plane.destination.y) + i64::try_from(row).ok()?;
             let inside = point_in_drawing_polygons_at(
-                f64::from(global_x) + 0.5,
-                f64::from(global_y) + 0.5,
+                global_x as f64 + 0.5,
+                global_y as f64 + 0.5,
                 &clip.polygons,
             );
+            if inside {
+                clip_min_x = clip_min_x.min(column);
+                clip_min_y = clip_min_y.min(row);
+                clip_max_x = clip_max_x.max(column + 1);
+                clip_max_y = clip_max_y.max(row + 1);
+            }
             let keep = if inverse { !inside } else { inside };
-            let index = row * stride + column;
+            let index = row.checked_mul(stride)?.checked_add(column)?;
             if !keep {
-                bitmap[index] = 0;
-            } else if bitmap[index] > 0 {
-                min_x = min_x.min(column);
-                min_y = min_y.min(row);
-                max_x = max_x.max(column + 1);
-                max_y = max_y.max(row + 1);
+                *bitmap.get_mut(index)? = 0;
             }
         }
     }
 
-    if min_x >= max_x || min_y >= max_y {
-        return None;
-    }
     let masked = ImagePlane { bitmap, ..plane };
     if inverse {
         return Some(masked);
     }
-    crop_plane_to_bitmap_bounds(masked, min_x, min_y, max_x, max_y, 0, 0, 0, 0)
+    if clip_min_x >= clip_max_x || clip_min_y >= clip_max_y {
+        return Some(zero_size_plane(masked));
+    }
+    crop_plane_to_bitmap_bounds(
+        masked, clip_min_x, clip_min_y, clip_max_x, clip_max_y, 0, 0, 0, 0,
+    )
+}
+
+fn zero_size_plane(plane: ImagePlane) -> ImagePlane {
+    ImagePlane {
+        size: Size {
+            width: 0,
+            height: 0,
+        },
+        stride: 0,
+        bitmap: Vec::new(),
+        ..plane
+    }
 }
 
 pub(crate) fn drawing_pixel_coverage(x: i32, y: i32, polygons: &[Vec<Point>]) -> u8 {
@@ -125,19 +171,17 @@ pub(crate) fn point_in_drawing_polygons_at(
     sample_y: f64,
     polygons: &[Vec<Point>],
 ) -> bool {
-    polygons
-        .iter()
-        .map(|polygon| polygon_winding_at(sample_x, sample_y, polygon))
-        .sum::<i32>()
-        != 0
+    polygons.iter().fold(0_i64, |winding, polygon| {
+        winding.saturating_add(polygon_winding_at(sample_x, sample_y, polygon))
+    }) != 0
 }
 
-pub(crate) fn polygon_winding_at(sample_x: f64, sample_y: f64, polygon: &[Point]) -> i32 {
+pub(crate) fn polygon_winding_at(sample_x: f64, sample_y: f64, polygon: &[Point]) -> i64 {
     if polygon.len() < 3 {
         return 0;
     }
 
-    let mut winding = 0;
+    let mut winding = 0_i64;
     let mut previous = polygon[polygon.len() - 1];
 
     for &current in polygon {
@@ -161,6 +205,10 @@ pub(crate) fn polygon_winding_at(sample_x: f64, sample_y: f64, polygon: &[Point]
 }
 
 pub(crate) fn clip_plane(plane: ImagePlane, clip_rect: Rect) -> Option<ImagePlane> {
+    if plane.size.width <= 0 || plane.size.height <= 0 || plane.stride <= 0 {
+        return Some(plane);
+    }
+
     let plane_rect = plane_rect(&plane);
     let intersection = plane_rect.intersect(clip_rect)?;
     if intersection == plane_rect {
@@ -217,8 +265,8 @@ pub(crate) fn plane_rect(plane: &ImagePlane) -> Rect {
     Rect {
         x_min: plane.destination.x,
         y_min: plane.destination.y,
-        x_max: plane.destination.x + plane.size.width,
-        y_max: plane.destination.y + plane.size.height,
+        x_max: plane.destination.x.saturating_add(plane.size.width),
+        y_max: plane.destination.y.saturating_add(plane.size.height),
     }
 }
 
@@ -234,12 +282,24 @@ pub(crate) fn crop_plane_to_bitmap_bounds(
     pad_right: usize,
     pad_bottom: usize,
 ) -> Option<ImagePlane> {
-    let x_min = min_x.saturating_sub(pad_left) as i32 + plane.destination.x;
-    let y_min = min_y.saturating_sub(pad_top) as i32 + plane.destination.y;
-    let x_max =
-        ((max_x + pad_right).min(plane.size.width.max(0) as usize)) as i32 + plane.destination.x;
-    let y_max =
-        ((max_y + pad_bottom).min(plane.size.height.max(0) as usize)) as i32 + plane.destination.y;
+    let plane_width = usize::try_from(plane.size.width).ok()?;
+    let plane_height = usize::try_from(plane.size.height).ok()?;
+    let x_min = plane
+        .destination
+        .x
+        .saturating_add(i32::try_from(min_x.saturating_sub(pad_left).min(plane_width)).ok()?);
+    let y_min = plane
+        .destination
+        .y
+        .saturating_add(i32::try_from(min_y.saturating_sub(pad_top).min(plane_height)).ok()?);
+    let x_max = plane
+        .destination
+        .x
+        .saturating_add(i32::try_from(max_x.saturating_add(pad_right).min(plane_width)).ok()?);
+    let y_max = plane
+        .destination
+        .y
+        .saturating_add(i32::try_from(max_y.saturating_add(pad_bottom).min(plane_height)).ok()?);
     crop_plane_to_rect(
         plane,
         Rect {
@@ -257,16 +317,28 @@ pub(crate) fn crop_plane_to_rect(plane: ImagePlane, rect: Rect) -> Option<ImageP
     if rect == plane_rect {
         return Some(plane);
     }
-    let offset_x = (rect.x_min - plane_rect.x_min) as usize;
-    let offset_y = (rect.y_min - plane_rect.y_min) as usize;
-    let width = rect.width() as usize;
-    let height = rect.height() as usize;
-    let src_stride = plane.stride as usize;
-    let mut bitmap = Vec::with_capacity(width * height);
+    let offset_x = usize::try_from(rect.x_min.checked_sub(plane_rect.x_min)?).ok()?;
+    let offset_y = usize::try_from(rect.y_min.checked_sub(plane_rect.y_min)?).ok()?;
+    let width = usize::try_from(rect.width()).ok()?;
+    let height = usize::try_from(rect.height()).ok()?;
+    let src_stride = usize::try_from(plane.stride).ok()?;
+    let source_height = usize::try_from(plane.size.height).ok()?;
+    let source_width = usize::try_from(plane.size.width).ok()?;
+    let source_len = src_stride.checked_mul(source_height)?;
+    if src_stride < source_width || source_len > plane.bitmap.len() {
+        return None;
+    }
+    let bitmap_len = width.checked_mul(height)?;
+    let mut bitmap = Vec::new();
+    bitmap.try_reserve_exact(bitmap_len).ok()?;
 
     for row in 0..height {
-        let start = (offset_y + row) * src_stride + offset_x;
-        bitmap.extend_from_slice(&plane.bitmap[start..start + width]);
+        let start = offset_y
+            .checked_add(row)?
+            .checked_mul(src_stride)?
+            .checked_add(offset_x)?;
+        let end = start.checked_add(width)?;
+        bitmap.extend_from_slice(plane.bitmap.get(start..end)?);
     }
 
     Some(ImagePlane {

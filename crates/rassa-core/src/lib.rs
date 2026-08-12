@@ -1,5 +1,5 @@
 pub mod ass {
-    pub const LIBASS_VERSION: i32 = 0x0170_4000;
+    pub const LIBASS_VERSION: i32 = 0x0170_5000;
 
     pub const VALIGN_SUB: i32 = 0;
     pub const VALIGN_CENTER: i32 = 8;
@@ -178,7 +178,7 @@ pub struct ImagePlane {
     pub bitmap: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RendererConfig {
     pub frame: Size,
     pub storage: Size,
@@ -186,6 +186,7 @@ pub struct RendererConfig {
     pub use_margins: bool,
     pub pixel_aspect: f64,
     pub font_scale: f64,
+    pub selective_font_scale: bool,
     pub line_spacing: f64,
     pub line_position: f64,
     pub hinting: ass::Hinting,
@@ -194,6 +195,34 @@ pub struct RendererConfig {
     /// defaults to breaking at ASCII spaces only; Unicode breaking is an
     /// opt-in feature.
     pub wrap_unicode: bool,
+    /// Paired-bracket resolution for the Unicode bidi algorithm
+    /// (`ASS_FEATURE_BIDI_BRACKETS`).
+    pub bidi_brackets: bool,
+    /// Resolve and reorder bidi paragraphs across ASS override/font runs
+    /// (`ASS_FEATURE_WHOLE_TEXT_LAYOUT`). `\fe-1` also enables this
+    /// implicitly during layout, matching libass.
+    pub whole_text_layout: bool,
+}
+
+impl Default for RendererConfig {
+    fn default() -> Self {
+        Self {
+            frame: Size::default(),
+            storage: Size::default(),
+            margins: Margins::default(),
+            use_margins: false,
+            pixel_aspect: 0.0,
+            font_scale: 1.0,
+            selective_font_scale: false,
+            line_spacing: 0.0,
+            line_position: 0.0,
+            hinting: ass::Hinting::default(),
+            shaping: ass::ShapingLevel::default(),
+            wrap_unicode: false,
+            bidi_brackets: false,
+            whole_text_layout: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

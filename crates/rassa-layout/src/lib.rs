@@ -3,18 +3,33 @@ use rassa_fonts::{
     FontMatch, FontProvider, FontQuery, font_match_supports_text, resolve_system_font_for_char,
 };
 use rassa_parse::{
-    ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan, ParsedMovement, ParsedMovementExact,
-    ParsedRectF64, ParsedSpanStyle, ParsedSpanTransform, ParsedStyle, ParsedTrack,
-    ParsedVectorClip, parse_dialogue_text_with_wrap_style,
+    LIBASS_OUTLINE_MAX_D6, ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeSpan,
+    ParsedMovement, ParsedMovementExact, ParsedRectF64, ParsedSpanStyle, ParsedSpanTransform,
+    ParsedStyle, ParsedTrack, ParsedVectorClip, libass_drawing_coordinate_to_d6,
+    libass_drawing_scale_base, parse_dialogue_text_with_wrap_style,
 };
-use rassa_shape::{GlyphInfo, ShapeEngine, ShapeRequest, ShapingMode};
+use rassa_raster::{RasterOptions, Rasterizer};
+use rassa_shape::{
+    GlyphInfo, GlyphPositioning, ShapeEngine, ShapeRequest, ShapingMode, reorder_bidi_runs,
+};
 use rassa_unibreak::{LineBreakOpportunity, classify_line_breaks};
-use rassa_unicode::BidiDirection;
+#[cfg(test)]
+use rassa_unicode::analyze_bidi_with_base;
+use rassa_unicode::{BidiDirection, analyze_bidi_with_base_and_brackets};
+use unicode_segmentation::UnicodeSegmentation;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutFeatures {
+    pub wrap_unicode: bool,
+    pub bidi_brackets: bool,
+    pub whole_text_layout: bool,
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LayoutGlyphRun {
     pub text: String,
     pub direction: BidiDirection,
+    pub bidi_level: u8,
     pub font_family: String,
     pub font: FontMatch,
     pub glyphs: Vec<GlyphInfo>,
@@ -41,6 +56,8 @@ pub struct LayoutEvent {
     pub event_index: usize,
     pub style_index: usize,
     pub text: String,
+    pub hard_override: bool,
+    pub transform_disables_collision: bool,
     pub font_family: String,
     pub font: FontMatch,
     pub alignment: i32,
@@ -56,6 +73,7 @@ pub struct LayoutEvent {
     pub clip_rect: Option<Rect>,
     pub vector_clip: Option<ParsedVectorClip>,
     pub inverse_clip: bool,
+    pub vector_clip_inverse: bool,
     pub wrap_style: Option<i32>,
     pub origin: Option<(i32, i32)>,
     pub origin_exact: Option<(f64, f64)>,
@@ -90,6 +108,26 @@ impl LayoutEngine {
         shaping_mode: ShapingMode,
         wrap_unicode: bool,
     ) -> RassaResult<LayoutEvent> {
+        self.layout_track_event_with_features(
+            track,
+            event_index,
+            provider,
+            shaping_mode,
+            LayoutFeatures {
+                wrap_unicode,
+                ..LayoutFeatures::default()
+            },
+        )
+    }
+
+    pub fn layout_track_event_with_features<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        event_index: usize,
+        provider: &P,
+        shaping_mode: ShapingMode,
+        features: LayoutFeatures,
+    ) -> RassaResult<LayoutEvent> {
         let event = track
             .events
             .get(event_index)
@@ -99,11 +137,13 @@ impl LayoutEngine {
             .styles
             .get(style_index)
             .unwrap_or(&track.styles[track.default_style as usize]);
+        let banner_no_wrap = banner_effect_forces_no_wrap(event);
+        let event_wrap_style = if banner_no_wrap { 2 } else { track.wrap_style };
         let parsed_text = parse_dialogue_text_with_wrap_style(
             &event.text,
             style,
             &track.styles,
-            track.wrap_style,
+            event_wrap_style,
         );
         let font = provider.resolve(&FontQuery {
             family: style.font_name.clone(),
@@ -122,18 +162,17 @@ impl LayoutEngine {
                     &self.shaper,
                     &track.language,
                     shaping_mode,
+                    track.kerning,
+                    features.whole_text_layout,
+                    features.bidi_brackets,
                 )
             })
             .collect::<RassaResult<Vec<_>>>()?;
         let parsed_wrap_style = parsed_text
             .wrap_style
-            .unwrap_or(track.wrap_style)
+            .unwrap_or(event_wrap_style)
             .clamp(0, 3);
-        let wrap_style = if banner_effect_forces_no_wrap(event) {
-            2
-        } else {
-            parsed_wrap_style
-        };
+        let wrap_style = parsed_wrap_style;
         let alignment = parsed_text.alignment.unwrap_or(style.alignment);
         let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment);
         // libass wrap_lines_smart wraps the whole event, treating \N as a
@@ -143,8 +182,11 @@ impl LayoutEngine {
             max_width,
             wrap_style,
             &track.language,
-            wrap_unicode,
-        )?;
+            features.wrap_unicode,
+        )?
+        .into_iter()
+        .map(trim_line_edge_whitespace)
+        .collect();
 
         Ok(LayoutEvent {
             event_index,
@@ -155,6 +197,8 @@ impl LayoutEngine {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
+            hard_override: parsed_text.hard_override,
+            transform_disables_collision: parsed_text.transform_disables_collision,
             font_family: font.family.clone(),
             font: font.clone(),
             alignment,
@@ -172,11 +216,8 @@ impl LayoutEngine {
                 .or_else(|| parsed_text.clip_rect_exact.map(rect_from_exact_clip)),
             vector_clip: parsed_text.vector_clip,
             inverse_clip: parsed_text.inverse_clip,
-            wrap_style: if banner_effect_forces_no_wrap(event) {
-                Some(2)
-            } else {
-                parsed_text.wrap_style
-            },
+            vector_clip_inverse: parsed_text.vector_clip_inverse,
+            wrap_style: parsed_text.wrap_style.or(banner_no_wrap.then_some(2)),
             origin: parsed_text.origin,
             origin_exact: parsed_text.origin_exact,
             lines,
@@ -206,6 +247,7 @@ fn banner_effect_forces_no_wrap(event: &ParsedEvent) -> bool {
     event.effect.starts_with("Banner;")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_line_from_text<P: FontProvider>(
     event_index: usize,
     style_index: usize,
@@ -214,23 +256,67 @@ fn layout_line_from_text<P: FontProvider>(
     shaper: &ShapeEngine,
     language: &str,
     shaping_mode: ShapingMode,
+    kerning: bool,
+    explicit_whole_text_layout: bool,
+    bidi_brackets: bool,
 ) -> RassaResult<LayoutLine> {
     let mut runs = Vec::new();
     let mut line_direction = BidiDirection::LeftToRight;
+    // `\fe-1` implicitly enables whole-text layout in libass. An explicit
+    // feature request does the same while preserving the normal forced-LTR
+    // base direction for other encodings.
+    let base_direction = if line
+        .spans
+        .first()
+        .is_some_and(|span| span.style.encoding == -1)
+    {
+        BidiDirection::Neutral
+    } else {
+        BidiDirection::LeftToRight
+    };
+    let whole_text_layout = explicit_whole_text_layout || base_direction == BidiDirection::Neutral;
+    let whole_bidi = whole_text_layout
+        .then(|| analyze_bidi_with_base_and_brackets(&line.text, base_direction, bidi_brackets))
+        .transpose()?;
+    if let Some(analysis) = &whole_bidi {
+        line_direction = analysis.direction;
+    }
+    let mut line_char_cursor = 0;
     for span in &line.spans {
-        if span.text.is_empty() {
-            continue;
-        }
+        let span_char_count = span.text.chars().count();
+        let span_char_start = line_char_cursor;
+        line_char_cursor += span_char_count;
         let font = provider.resolve(&FontQuery {
             family: span.style.font_name.clone(),
             style: font_style_name(&span.style),
             weight: font_query_weight(span.style.font_weight),
         });
+        if span.text.is_empty() {
+            runs.push(LayoutGlyphRun {
+                text: String::new(),
+                direction: line_direction,
+                bidi_level: 0,
+                font_family: font.family.clone(),
+                font,
+                glyphs: Vec::new(),
+                width: 0.0,
+                style: span.style.clone(),
+                transforms: span.transforms.clone(),
+                karaoke: None,
+                drawing: None,
+            });
+            continue;
+        }
         if let Some(drawing) = &span.drawing {
             let width = drawing_layout_width(&span.text, drawing, span.style.scale_x);
             runs.push(LayoutGlyphRun {
                 text: span.text.clone(),
                 direction: line_direction,
+                bidi_level: whole_bidi
+                    .as_ref()
+                    .and_then(|analysis| analysis.embedding_levels.get(span_char_start))
+                    .copied()
+                    .unwrap_or(0),
                 font_family: font.family.clone(),
                 font: font.clone(),
                 glyphs: Vec::new(),
@@ -249,6 +335,7 @@ fn layout_line_from_text<P: FontProvider>(
             font_style_name(&span.style),
             span.style.font_weight,
         );
+        let mut span_chunk_cursor = 0;
         for (chunk_text, chunk_font) in shaped_chunks {
             // libass ass_resolve_base_direction: \fe-1 enables bidi base
             // auto-detection; any other encoding forces an LTR base.
@@ -257,27 +344,43 @@ fn layout_line_from_text<P: FontProvider>(
             } else {
                 BidiDirection::LeftToRight
             };
-            let shaped = shaper.shape_text(
-                provider,
-                &ShapeRequest::new(&chunk_text, &chunk_font.family)
-                    .with_style(
-                        font_style_name(&span.style)
-                            .or_else(|| chunk_font.style.clone())
-                            .unwrap_or_default(),
-                    )
-                    .with_optional_weight(font_query_weight(span.style.font_weight))
-                    .with_language(language)
-                    .with_font_size(span.style.font_size as f32)
-                    .with_base_direction(base_direction)
-                    .with_mode(shaping_mode),
-            )?;
+            let chunk_char_count = chunk_text.chars().count();
+            let chunk_global_start = span_char_start + span_chunk_cursor;
+            span_chunk_cursor += chunk_char_count;
+            let mut request = ShapeRequest::new(&chunk_text, &chunk_font.family)
+                .with_style(
+                    font_style_name(&span.style)
+                        .or_else(|| chunk_font.style.clone())
+                        .unwrap_or_default(),
+                )
+                .with_optional_weight(font_query_weight(span.style.font_weight))
+                .with_language(language)
+                .with_font_size(span.style.font_size as f32)
+                .with_kerning(kerning)
+                .with_vertical(span.style.font_name.starts_with('@'))
+                .with_horizontal_spacing(span.style.spacing.abs() > f64::EPSILON)
+                .with_base_direction(base_direction)
+                .with_bidi_brackets(bidi_brackets)
+                .with_mode(shaping_mode);
+            if let Some(analysis) = &whole_bidi {
+                let end = chunk_global_start + chunk_char_count;
+                if let Some(levels) = analysis.embedding_levels.get(chunk_global_start..end) {
+                    request = request
+                        .with_resolved_bidi_levels(levels.to_vec())
+                        .with_deferred_visual_reorder(true);
+                }
+            }
+            let shaped = shaper.shape_text(provider, &request)?;
             for shaped_run in shaped.runs {
-                line_direction = shaped_run.direction;
+                if whole_bidi.is_none() {
+                    line_direction = shaped_run.direction;
+                }
                 let run_font = shaped_run.font.clone();
                 let glyphs = apply_vertical_font_advances(shaped_run.glyphs, &span.style);
                 runs.push(LayoutGlyphRun {
                     text: shaped_run.text,
                     direction: shaped_run.direction,
+                    bidi_level: shaped_run.bidi_level,
                     font_family: run_font.family.clone(),
                     font: run_font,
                     width: text_run_width(&glyphs, &span.style),
@@ -289,6 +392,18 @@ fn layout_line_from_text<P: FontProvider>(
                 });
             }
         }
+    }
+
+    if whole_bidi.is_some() {
+        let mut tagged = runs
+            .into_iter()
+            .map(|run| {
+                let level = run.bidi_level;
+                (run, level)
+            })
+            .collect::<Vec<_>>();
+        reorder_bidi_runs(&mut tagged);
+        runs = tagged.into_iter().map(|(run, _)| run).collect();
     }
 
     let glyph_count = runs.iter().map(|run| run.glyphs.len()).sum();
@@ -307,21 +422,37 @@ fn layout_line_from_text<P: FontProvider>(
 fn drawing_layout_width(text: &str, drawing: &ParsedDrawing, scale_x: f64) -> f32 {
     let scale_x = scale_x.max(0.0);
     if let Some((x_min_d6, x_max_d6)) = drawing_text_x_bounds_d6(text) {
-        let scale_base = 1_i32
-            .checked_shl(drawing.scale.saturating_sub(1) as u32)
-            .unwrap_or(1)
-            .max(1) as f64;
-        return (((x_max_d6 - x_min_d6).max(0) as f64 / 64.0) / scale_base * scale_x) as f32;
+        let scale_base = libass_drawing_scale_base(drawing.scale);
+        if scale_base <= 0 {
+            return 0.0;
+        }
+        let scale_base = f64::from(scale_base);
+        let width =
+            (f64::from(x_max_d6) - f64::from(x_min_d6)).max(0.0) / 64.0 / scale_base * scale_x;
+        return bounded_drawing_layout_width(width);
     }
 
     drawing
         .bounds()
-        .map(|bounds| (bounds.width() - 1).max(0) as f32 * scale_x as f32)
+        .map(|bounds| {
+            bounded_drawing_layout_width(f64::from((bounds.width() - 1).max(0)) * scale_x)
+        })
         .unwrap_or_default()
 }
 
+fn bounded_drawing_layout_width(width: f64) -> f32 {
+    let max_pixels = f64::from(LIBASS_OUTLINE_MAX_D6) / 64.0;
+    if width.is_finite() && (0.0..=max_pixels).contains(&width) {
+        width as f32
+    } else {
+        // libass rejects transforms which move an outline outside its valid
+        // coordinate domain; an invalid drawing contributes no advance.
+        0.0
+    }
+}
+
 fn drawing_text_x_bounds_d6(text: &str) -> Option<(i32, i32)> {
-    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let tokens = split_ass_drawing_tokens(text);
     let mut index = 0;
     let mut x_min = i32::MAX;
     let mut x_max = i32::MIN;
@@ -390,6 +521,31 @@ fn drawing_text_x_bounds_d6(text: &str) -> Option<(i32, i32)> {
     (x_min <= x_max).then_some((x_min, x_max))
 }
 
+fn split_ass_drawing_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if is_ass_c_space(character) {
+            if let Some(token_start) = start.take() {
+                tokens.push(&text[token_start..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(token_start) = start {
+        tokens.push(&text[token_start..]);
+    }
+    tokens
+}
+
+fn is_ass_c_space(character: char) -> bool {
+    matches!(
+        character,
+        ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}'
+    )
+}
+
 fn parse_drawing_bezier_xs_d6(tokens: &[&str], index: usize) -> Option<([i32; 3], usize)> {
     let (x1, next_index) = parse_drawing_x_coordinate_d6(tokens, index)?;
     let (x2, next_index) = parse_drawing_x_coordinate_d6(tokens, next_index)?;
@@ -399,8 +555,10 @@ fn parse_drawing_bezier_xs_d6(tokens: &[&str], index: usize) -> Option<([i32; 3]
 
 fn parse_drawing_x_coordinate_d6(tokens: &[&str], index: usize) -> Option<(i32, usize)> {
     let x = parse_drawing_number_prefix(tokens.get(index)?)?;
-    parse_drawing_number_prefix(tokens.get(index + 1)?)?;
-    Some(((x * 64.0).round() as i32, index + 2))
+    let y = parse_drawing_number_prefix(tokens.get(index + 1)?)?;
+    let x = libass_drawing_coordinate_to_d6(x)?;
+    libass_drawing_coordinate_to_d6(y)?;
+    Some((x, index + 2))
 }
 
 fn parse_drawing_number_prefix(token: &str) -> Option<f64> {
@@ -482,6 +640,9 @@ struct LayoutPiece {
     text: String,
     run: LayoutGlyphRun,
     width: f32,
+    ink_min: f32,
+    ink_max: f32,
+    has_ink: bool,
     char_index: usize,
 }
 
@@ -492,7 +653,7 @@ fn wrap_layout_line(
     language: &str,
     wrap_unicode: bool,
 ) -> RassaResult<Vec<LayoutLine>> {
-    if line.width < max_width || line.text.chars().count() <= 1 {
+    if line.text.chars().count() <= 1 {
         return Ok(vec![line]);
     }
 
@@ -516,6 +677,12 @@ fn wrap_layout_line(
     if pieces.len() <= 1 {
         return Ok(vec![line]);
     }
+    // libass tests the positioned glyph bounding box, not just the sum of
+    // advances. Italic overhang and negative bearings can therefore overflow
+    // a line whose logical advance still fits the margin.
+    if pieces_max_positioned_width(&pieces) < max_width {
+        return Ok(vec![line]);
+    }
     let piece_breakable = |piece: &LayoutPiece| {
         matches!(
             breaks.get(piece.char_index),
@@ -529,14 +696,12 @@ fn wrap_layout_line(
     // check (they get trimmed).
     let mut wrapped: Vec<Vec<LayoutPiece>> = Vec::new();
     let mut current: Vec<LayoutPiece> = Vec::new();
-    let mut current_width = 0.0_f32;
     let mut last_break_pos: Option<usize> = None;
 
     for piece in pieces.iter().cloned() {
-        let is_whitespace = piece.text.chars().all(char::is_whitespace);
-        current_width += piece.width;
+        let is_whitespace = is_libass_trimmed_whitespace(&piece.text);
         current.push(piece);
-        if current_width >= max_width && !is_whitespace {
+        if pieces_positioned_width(&current) >= max_width && !is_whitespace {
             if let Some(split_at) = last_break_pos.filter(|pos| *pos > 0 && *pos < current.len()) {
                 let mut remainder = current.split_off(split_at);
                 trim_wrapped_line_edges(&mut current, false);
@@ -544,7 +709,6 @@ fn wrap_layout_line(
                     wrapped.push(current);
                 }
                 trim_wrapped_line_edges(&mut remainder, true);
-                current_width = pieces_width(&remainder);
                 current = remainder;
                 last_break_pos = None;
             }
@@ -602,7 +766,7 @@ fn rebalance_pair(
     // Find the start of the last word: rewind over trailing whitespace, then
     // to the piece after the last break opportunity.
     let mut word_start = left.len();
-    while word_start > 0 && left[word_start - 1].text.chars().all(char::is_whitespace) {
+    while word_start > 0 && is_libass_trimmed_whitespace(&left[word_start - 1].text) {
         word_start -= 1;
     }
     let word_end = word_start;
@@ -616,14 +780,14 @@ fn rebalance_pair(
 
     let trimmed_width = |pieces: &[LayoutPiece]| {
         let mut end = pieces.len();
-        while end > 0 && pieces[end - 1].text.chars().all(char::is_whitespace) {
+        while end > 0 && is_libass_trimmed_whitespace(&pieces[end - 1].text) {
             end -= 1;
         }
         let mut start = 0;
-        while start < end && pieces[start].text.chars().all(char::is_whitespace) {
+        while start < end && is_libass_trimmed_whitespace(&pieces[start].text) {
             start += 1;
         }
-        pieces_width(&pieces[start..end])
+        pieces_positioned_width(&pieces[start..end])
     };
 
     let l1 = trimmed_width(left);
@@ -631,13 +795,14 @@ fn rebalance_pair(
     let new_left = &left[..word_start];
     let moved = &left[word_start..];
     let l1_new = trimmed_width(new_left);
-    let l2_new = trimmed_width(moved) + l2;
+    let mut candidate_right = moved.to_vec();
+    candidate_right.extend(right.iter().cloned());
+    let l2_new = trimmed_width(&candidate_right);
 
     if (l1_new - l2_new).abs() < (l1 - l2).abs() {
         let mut new_left = new_left.to_vec();
         trim_wrapped_line_edges(&mut new_left, false);
-        let mut new_right = moved.to_vec();
-        new_right.extend(right.iter().cloned());
+        let mut new_right = candidate_right;
         trim_wrapped_line_edges(&mut new_right, true);
         if new_left.is_empty() || new_right.is_empty() {
             return None;
@@ -652,15 +817,18 @@ fn line_to_pieces(line: &LayoutLine) -> Vec<LayoutPiece> {
     let mut pieces = Vec::new();
     let mut char_index = 0_usize;
     for run in &line.runs {
-        let chars = run.text.chars().collect::<Vec<_>>();
-        if run.drawing.is_some() || chars.is_empty() || chars.len() != run.glyphs.len() {
+        let char_count = run.text.chars().count();
+        if run.drawing.is_some() || char_count == 0 {
             pieces.push(LayoutPiece {
                 text: run.text.clone(),
                 run: run.clone(),
                 width: run.width,
-                char_index: char_index + chars.len().saturating_sub(1),
+                ink_min: 0.0,
+                ink_max: run.width,
+                has_ink: run.width > 0.0,
+                char_index: char_index + char_count.saturating_sub(1),
             });
-            char_index += chars.len();
+            char_index += char_count;
             continue;
         }
 
@@ -670,52 +838,258 @@ fn line_to_pieces(line: &LayoutLine) -> Vec<LayoutPiece> {
         } else {
             0.0
         };
-        let mut offset = 0_usize;
-        while offset < chars.len() {
-            let mut end = offset + 1;
-            while end < chars.len() && is_nonspacing_mark(chars[end]) {
-                end += 1;
-            }
-            let cluster_text = chars[offset..end].iter().collect::<String>();
-            let glyph_start = offset.min(run.glyphs.len());
-            let glyph_end = end.min(run.glyphs.len());
-            let cluster_glyphs = if glyph_start < glyph_end {
-                run.glyphs[glyph_start..glyph_end].to_vec()
-            } else {
-                Vec::new()
-            };
-            let cluster_advance = cluster_glyphs
+        let glyph_clusters = glyph_cluster_ranges(&run.text, &run.glyphs);
+        for (byte_start, byte_end, cluster_start, cluster_end) in
+            atomic_text_cluster_ranges(&run.text, &glyph_clusters)
+        {
+            let cluster_text = run.text[byte_start..byte_end].to_owned();
+            let cluster_glyphs = glyph_clusters
                 .iter()
-                .map(|glyph| glyph.x_advance)
-                .sum::<f32>();
+                .filter(|(start, end, _, _)| *start < cluster_end && *end > cluster_start)
+                .flat_map(|(_, _, glyph_start, glyph_end)| {
+                    run.glyphs[*glyph_start..*glyph_end].iter().cloned()
+                })
+                .collect::<Vec<_>>();
             let mut piece_run = run.clone();
             piece_run.text = cluster_text.clone();
             piece_run.glyphs = cluster_glyphs;
-            piece_run.width = cluster_advance * scale_x + spacing;
+            piece_run.width = text_run_width(&piece_run.glyphs, &piece_run.style);
+            let (ink_min, ink_max, has_ink) = text_piece_ink_bounds(&piece_run, scale_x, spacing);
             pieces.push(LayoutPiece {
                 text: cluster_text,
                 width: piece_run.width,
+                ink_min,
+                ink_max,
+                has_ink,
                 run: piece_run,
-                char_index: char_index + end - 1,
+                char_index: char_index + cluster_end.saturating_sub(1),
             });
-            offset = end;
         }
-        char_index += run.text.chars().count();
+        char_index += char_count;
     }
     pieces
+}
+
+/// Map shaped byte-offset (or simple-shaper character-offset) cluster values
+/// onto character ranges and glyph slices. Glyph storage is reversed for RTL;
+/// grouping by value keeps either representation intact.
+fn glyph_cluster_ranges(text: &str, glyphs: &[GlyphInfo]) -> Vec<(usize, usize, usize, usize)> {
+    if glyphs.is_empty() {
+        return Vec::new();
+    }
+    let text_char_len = text.chars().count();
+    let shaped_clusters = glyphs
+        .iter()
+        .any(|glyph| glyph.positioning == GlyphPositioning::Shaped);
+    let cluster_limit = if shaped_clusters {
+        text.len()
+    } else {
+        text_char_len
+    };
+    let cluster_to_char = |cluster: usize| {
+        if shaped_clusters {
+            text.char_indices()
+                .take_while(|(byte, _)| *byte <= cluster.min(text.len()))
+                .count()
+                .saturating_sub(1)
+                .min(text_char_len)
+        } else {
+            cluster.min(text_char_len)
+        }
+    };
+    let mut groups = Vec::new();
+    let mut glyph_start = 0;
+    while glyph_start < glyphs.len() {
+        let cluster = glyphs[glyph_start].cluster;
+        let mut glyph_end = glyph_start + 1;
+        while glyph_end < glyphs.len() && glyphs[glyph_end].cluster == cluster {
+            glyph_end += 1;
+        }
+        groups.push((cluster, glyph_start, glyph_end));
+        glyph_start = glyph_end;
+    }
+    let mut starts = groups.iter().map(|group| group.0).collect::<Vec<_>>();
+    starts.sort_unstable();
+    starts.dedup();
+    groups
+        .into_iter()
+        .map(|(cluster, glyph_start, glyph_end)| {
+            let cluster_end = starts
+                .iter()
+                .copied()
+                .find(|start| *start > cluster)
+                .unwrap_or(cluster_limit);
+            let char_start = cluster_to_char(cluster);
+            let mut char_end = if cluster_end == cluster_limit {
+                text_char_len
+            } else {
+                cluster_to_char(cluster_end)
+            };
+            if char_end <= char_start {
+                char_end = (char_start + 1).min(text_char_len);
+            }
+            (char_start, char_end, glyph_start, glyph_end)
+        })
+        .collect()
+}
+
+fn trim_line_edge_whitespace(mut line: LayoutLine) -> LayoutLine {
+    // libass wrap_lines_smart calls trim_whitespace after wrapping.  Only
+    // ASCII space and a newline glyph which did not become a line break are
+    // skipped; tabs have already become spaces and \h remains NBSP.  Do this
+    // over the complete line so style/font run boundaries cannot protect
+    // otherwise-trimmable edge whitespace.
+    let mut found_content = false;
+    for run in &mut line.runs {
+        if run.drawing.is_some() {
+            found_content = true;
+            continue;
+        }
+        if found_content {
+            continue;
+        }
+        let char_count = run.text.chars().count();
+        let leading = run
+            .text
+            .chars()
+            .take_while(|character| is_libass_trimmed_character(*character))
+            .count();
+        retain_run_character_range(run, leading, char_count);
+        found_content = leading < char_count;
+    }
+
+    found_content = false;
+    for run in line.runs.iter_mut().rev() {
+        if run.drawing.is_some() {
+            found_content = true;
+            continue;
+        }
+        if found_content {
+            continue;
+        }
+        let char_count = run.text.chars().count();
+        let trailing = run
+            .text
+            .chars()
+            .rev()
+            .take_while(|character| is_libass_trimmed_character(*character))
+            .count();
+        retain_run_character_range(run, 0, char_count.saturating_sub(trailing));
+        found_content = trailing < char_count;
+    }
+
+    line.glyph_count = line.runs.iter().map(|run| run.glyphs.len()).sum();
+    line.width = line.runs.iter().map(|run| run.width).sum();
+    line
+}
+
+fn retain_run_character_range(run: &mut LayoutGlyphRun, start: usize, end: usize) {
+    let char_count = run.text.chars().count();
+    let start = start.min(char_count);
+    let end = end.clamp(start, char_count);
+    if start == 0 && end == char_count {
+        return;
+    }
+    if start == end || run.glyphs.is_empty() {
+        run.glyphs.clear();
+        run.width = 0.0;
+        return;
+    }
+
+    let mut retained = vec![false; run.glyphs.len()];
+    for (cluster_start, cluster_end, glyph_start, glyph_end) in
+        glyph_cluster_ranges(&run.text, &run.glyphs)
+    {
+        if cluster_start < end && cluster_end > start {
+            retained[glyph_start..glyph_end].fill(true);
+        }
+    }
+    let mut index = 0;
+    run.glyphs.retain(|_| {
+        let keep = retained.get(index).copied().unwrap_or(false);
+        index += 1;
+        keep
+    });
+    run.width = text_run_width(&run.glyphs, &run.style);
+}
+
+fn is_libass_trimmed_character(character: char) -> bool {
+    matches!(character, ' ' | '\n')
+}
+
+/// Partition text into extended grapheme clusters, then remove every boundary
+/// that falls inside a HarfBuzz cluster. This keeps `ffi`/Indic ligatures
+/// atomic without making the rest of the shaped run unwrappable.
+fn atomic_text_cluster_ranges(
+    text: &str,
+    glyph_clusters: &[(usize, usize, usize, usize)],
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut boundaries = text
+        .grapheme_indices(true)
+        .skip(1)
+        .map(|(byte, _)| (byte, text[..byte].chars().count()))
+        .collect::<Vec<_>>();
+    boundaries.retain(|(_, char_boundary)| {
+        !glyph_clusters
+            .iter()
+            .any(|(start, end, _, _)| *start < *char_boundary && *char_boundary < *end)
+    });
+    boundaries.push((text.len(), text.chars().count()));
+
+    let mut byte_start = 0;
+    let mut char_start = 0;
+    boundaries
+        .into_iter()
+        .map(|(byte_end, char_end)| {
+            let range = (byte_start, byte_end, char_start, char_end);
+            byte_start = byte_end;
+            char_start = char_end;
+            range
+        })
+        .collect()
+}
+
+fn text_piece_ink_bounds(run: &LayoutGlyphRun, scale_x: f32, spacing: f32) -> (f32, f32, bool) {
+    if run.glyphs.is_empty() {
+        return (0.0, run.width, false);
+    }
+    let rasterizer = Rasterizer::with_options(RasterOptions {
+        size_26_6: (run.style.font_size.max(1.0) * 64.0).round() as i32,
+        hinting: ass::Hinting::None,
+    });
+    let Ok(glyphs) = rasterizer.rasterize_glyphs(&run.font, &run.glyphs) else {
+        return (0.0, run.width, true);
+    };
+    let mut pen = 0.0_f32;
+    let mut ink_min = f32::INFINITY;
+    let mut ink_max = f32::NEG_INFINITY;
+    for glyph in glyphs {
+        if glyph.width > 0 && glyph.height > 0 && !glyph.bitmap.is_empty() {
+            let offset = glyph.offset_x_26_6 as f32 / 64.0;
+            let left = pen + (glyph.left as f32 + offset) * scale_x;
+            ink_min = ink_min.min(left);
+            ink_max = ink_max.max(left + glyph.width as f32 * scale_x);
+        }
+        pen += glyph.advance_x_26_6 as f32 / 64.0 * scale_x + spacing;
+    }
+    if ink_min.is_finite() && ink_max.is_finite() {
+        (ink_min, ink_max, true)
+    } else {
+        (0.0, run.width, false)
+    }
 }
 
 fn trim_wrapped_line_edges(pieces: &mut Vec<LayoutPiece>, trim_leading: bool) {
     while pieces
         .last()
-        .is_some_and(|piece| piece.text.chars().all(char::is_whitespace))
+        .is_some_and(|piece| is_libass_trimmed_whitespace(&piece.text))
     {
         pieces.pop();
     }
     if trim_leading {
         let leading = pieces
             .iter()
-            .take_while(|piece| piece.text.chars().all(char::is_whitespace))
+            .take_while(|piece| is_libass_trimmed_whitespace(&piece.text))
             .count();
         if leading > 0 {
             pieces.drain(0..leading);
@@ -723,8 +1097,39 @@ fn trim_wrapped_line_edges(pieces: &mut Vec<LayoutPiece>, trim_leading: bool) {
     }
 }
 
-fn pieces_width(pieces: &[LayoutPiece]) -> f32 {
-    pieces.iter().map(|piece| piece.width).sum()
+fn is_libass_trimmed_whitespace(text: &str) -> bool {
+    text.chars().all(is_libass_trimmed_character)
+}
+
+fn pieces_positioned_width(pieces: &[LayoutPiece]) -> f32 {
+    let Some(first) = pieces.first() else {
+        return 0.0;
+    };
+    // libass measures a candidate line from the first cluster's left bbox
+    // edge to the current (last) cluster's right bbox edge. It does not use
+    // the sum of advances, nor the union of every intermediate outline.
+    let start = if first.has_ink { first.ink_min } else { 0.0 };
+    let (last, prefix) = pieces.split_last().expect("non-empty pieces");
+    let pen = prefix.iter().map(|piece| piece.width).sum::<f32>();
+    let end = pen + if last.has_ink { last.ink_max } else { 0.0 };
+    (end - start).max(0.0)
+}
+
+fn pieces_max_positioned_width(pieces: &[LayoutPiece]) -> f32 {
+    let Some(first) = pieces.first() else {
+        return 0.0;
+    };
+    let start = if first.has_ink { first.ink_min } else { 0.0 };
+    let mut pen = 0.0_f32;
+    let mut max_width = 0.0_f32;
+    for piece in pieces {
+        if !is_libass_trimmed_whitespace(&piece.text) {
+            let end = pen + if piece.has_ink { piece.ink_max } else { 0.0 };
+            max_width = max_width.max((end - start).max(0.0));
+        }
+        pen += piece.width;
+    }
+    max_width
 }
 
 fn line_from_pieces(source: &LayoutLine, pieces: &[LayoutPiece]) -> LayoutLine {
@@ -761,7 +1166,9 @@ fn apply_vertical_font_advances(
         return glyphs;
     }
     for glyph in &mut glyphs {
-        if glyph.x_advance.abs() > f32::EPSILON || glyph.y_advance.abs() > f32::EPSILON {
+        if glyph.vertical_rotation_eligible
+            && (glyph.x_advance.abs() > f32::EPSILON || glyph.y_advance.abs() > f32::EPSILON)
+        {
             glyph.x_advance = advance;
             glyph.y_advance = 0.0;
         }
@@ -795,70 +1202,129 @@ fn split_text_by_font<P: FontProvider>(
         weight: font_query_weight(weight),
     });
     let mut chunks: Vec<(String, FontMatch)> = Vec::new();
+    let mut leading_ignorables = String::new();
 
-    for character in text.chars() {
-        let font = if is_nonspacing_mark(character) {
-            // libass/Harfbuzz shape combining marks together with their base glyph.
-            // Splitting fallback runs per scalar breaks Thai lower vowels (อุ/อู)
-            // and tone/above marks because the shaper no longer sees the base+mark
-            // cluster. Prefer the previous run's font for marks so the whole
-            // grapheme cluster remains one shaped run.
-            chunks
-                .last()
-                .map(|(_, font)| font.clone())
-                .unwrap_or_else(|| {
-                    resolve_font_for_character(&base_font, family, style.as_deref(), character)
-                })
-        } else {
-            resolve_font_for_character(&base_font, family, style.as_deref(), character)
-        };
+    for grapheme in fallback_text_clusters(text) {
+        if grapheme.chars().all(is_font_selection_ignorable) {
+            if let Some((chunk, _)) = chunks.last_mut() {
+                chunk.push_str(&grapheme);
+            } else {
+                leading_ignorables.push_str(&grapheme);
+            }
+            continue;
+        }
+        let font = resolve_font_for_cluster(&base_font, family, style.as_deref(), &grapheme);
+        let mut cluster = std::mem::take(&mut leading_ignorables);
+        cluster.push_str(&grapheme);
 
         if let Some((chunk, chunk_font)) = chunks.last_mut() {
             if same_font_match(chunk_font, &font) {
-                chunk.push(character);
+                chunk.push_str(&cluster);
                 continue;
             }
         }
-        chunks.push((character.to_string(), font));
+        chunks.push((cluster, font));
+    }
+    if !leading_ignorables.is_empty() {
+        if let Some((chunk, _)) = chunks.last_mut() {
+            chunk.push_str(&leading_ignorables);
+        } else {
+            chunks.push((leading_ignorables, base_font));
+        }
     }
 
     chunks
 }
 
-fn resolve_font_for_character(
+fn fallback_text_clusters(text: &str) -> Vec<String> {
+    let mut clusters: Vec<String> = Vec::new();
+    for grapheme in text.graphemes(true) {
+        let joins_previous = grapheme.chars().next().is_some_and(is_shaping_control);
+        let joins_next = clusters
+            .last()
+            .and_then(|cluster| cluster.chars().next_back())
+            .is_some_and(is_shaping_control);
+        if joins_previous || joins_next {
+            if let Some(cluster) = clusters.last_mut() {
+                cluster.push_str(grapheme);
+            } else {
+                clusters.push(grapheme.to_owned());
+            }
+        } else {
+            clusters.push(grapheme.to_owned());
+        }
+    }
+    clusters
+}
+
+fn is_shaping_control(character: char) -> bool {
+    matches!(character, '\u{200c}' | '\u{200d}')
+}
+
+fn resolve_font_for_cluster(
     base_font: &FontMatch,
     family: &str,
     style: Option<&str>,
-    character: char,
+    cluster: &str,
 ) -> FontMatch {
+    let required = cluster
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !character.is_control()
+                && !is_font_selection_ignorable(*character)
+        })
+        .collect::<String>();
     if base_font.path.is_none()
-        || character.is_whitespace()
-        || character.is_control()
-        || base_font
-            .path
-            .as_ref()
-            .is_some_and(|_| font_match_supports_text(base_font, &character.to_string()))
+        || required.is_empty()
+        || font_match_supports_text(base_font, &required)
     {
-        base_font.clone()
-    } else {
-        resolve_system_font_for_char(family, style, character)
-            .map(|(resolved_family, resolved_path, face_index)| FontMatch {
-                family: resolved_family,
-                path: resolved_path,
-                face_index,
-                style: style.map(str::to_string),
-                synthetic_bold: base_font.synthetic_bold,
-                synthetic_italic: base_font.synthetic_italic,
-                provider: base_font.provider,
-            })
-            .unwrap_or_else(|| base_font.clone())
+        return base_font.clone();
     }
+
+    let mut first_fallback = None;
+    for character in required.chars() {
+        let Some((resolved_family, resolved_path, face_index)) =
+            resolve_system_font_for_char(family, style, character)
+        else {
+            continue;
+        };
+        let candidate = FontMatch {
+            family: resolved_family,
+            path: resolved_path,
+            face_index,
+            style: style.map(str::to_string),
+            synthetic_bold: base_font.synthetic_bold,
+            synthetic_italic: base_font.synthetic_italic,
+            provider: base_font.provider,
+        };
+        if first_fallback.is_none() {
+            first_fallback = Some(candidate.clone());
+        }
+        if font_match_supports_text(&candidate, &required) {
+            return candidate;
+        }
+    }
+    first_fallback.unwrap_or_else(|| base_font.clone())
 }
 
-fn is_nonspacing_mark(character: char) -> bool {
+fn is_font_selection_ignorable(character: char) -> bool {
+    let codepoint = character as u32;
     matches!(
-        character,
-        '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}'
+        codepoint,
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFF0..=0xFFF8
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
     )
 }
 
@@ -923,11 +1389,291 @@ fn normalize_justify(justify: i32, alignment: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rassa_fonts::{FontconfigProvider, NullFontProvider, font_match_supports_text};
+    #[cfg(not(target_arch = "wasm32"))]
+    use rassa_fonts::font_match_supports_text;
+    use rassa_fonts::{FontProviderKind, FontconfigProvider, NullFontProvider};
     use rassa_parse::{ParsedKaraokeMode, ParsedTrack, parse_script_text};
 
     fn parse_track(input: &str) -> ParsedTrack {
         parse_script_text(input).expect("script should parse")
+    }
+
+    #[derive(Clone)]
+    struct FixedFontProvider(FontMatch);
+
+    impl FontProvider for FixedFontProvider {
+        fn resolve(&self, _query: &FontQuery) -> FontMatch {
+            self.0.clone()
+        }
+    }
+
+    fn aileron_fixture_font(synthetic_italic: bool) -> FontMatch {
+        FontMatch {
+            family: "Aileron".to_owned(),
+            path: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+            ),
+            face_index: Some(0),
+            style: Some("Regular".to_owned()),
+            synthetic_bold: false,
+            synthetic_italic,
+            provider: FontProviderKind::Attached,
+        }
+    }
+
+    fn shaped_glyph(cluster: usize, glyph_id: u32, advance: f32) -> GlyphInfo {
+        GlyphInfo {
+            glyph_id,
+            cluster,
+            x_advance: advance,
+            positioning: GlyphPositioning::Shaped,
+            ..GlyphInfo::default()
+        }
+    }
+
+    #[test]
+    fn wrap_keeps_each_ligature_cluster_atomic_without_freezing_the_run() {
+        // Two three-character ligatures separated by a normal break. The old
+        // `chars.len() != glyphs.len()` fallback made this entire run one
+        // unwrappable piece.
+        let run = LayoutGlyphRun {
+            text: "ffi ffi".to_owned(),
+            font: FontMatch::unresolved("Fixture", None, FontProviderKind::Null),
+            glyphs: vec![
+                shaped_glyph(0, 10, 3.0),
+                shaped_glyph(3, 11, 1.0),
+                shaped_glyph(4, 10, 3.0),
+            ],
+            width: 7.0,
+            style: ParsedSpanStyle::default(),
+            ..LayoutGlyphRun::default()
+        };
+        let line = LayoutLine {
+            text: run.text.clone(),
+            glyph_count: run.glyphs.len(),
+            width: run.width,
+            runs: vec![run],
+            ..LayoutLine::default()
+        };
+
+        let pieces = line_to_pieces(&line);
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|piece| piece.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ffi", " ", "ffi"],
+        );
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|piece| piece.run.glyphs.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1],
+        );
+
+        let wrapped = wrap_layout_line(line, 4.0, 1, "en", false)
+            .expect("ligature run should wrap at its intervening space");
+        assert_eq!(
+            wrapped
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ffi", "ffi"],
+        );
+    }
+
+    #[test]
+    fn fallback_partition_never_splits_unicode_text_clusters() {
+        let provider = FixedFontProvider(aileron_fixture_font(false));
+        let clusters = [
+            "e\u{0301}",                        // general combining mark
+            "ש\u{05c1}",                        // Hebrew point
+            "ب\u{0650}",                        // Arabic mark
+            "क्\u{200d}ष",                       // Indic conjunct with ZWJ
+            "क्\u{200c}",                        // ZWNJ/default-ignorable tail
+            "👩\u{200d}👩\u{200d}👧\u{200d}👦", // emoji ZWJ sequence
+            "日\u{fe0f}",                       // variation selector
+        ];
+
+        for cluster in clusters {
+            assert_eq!(
+                cluster.graphemes(true).count(),
+                1,
+                "test input must be one extended grapheme: {cluster:?}"
+            );
+            let chunks = split_text_by_font(cluster, &provider, "Aileron", None, 400);
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                cluster,
+            );
+            assert_eq!(
+                chunks.len(),
+                1,
+                "font fallback split extended cluster {cluster:?}: {chunks:?}"
+            );
+        }
+
+        for text in ["ب\u{200d}ت", "ب\u{200c}ت"] {
+            assert_eq!(
+                fallback_text_clusters(text),
+                vec![text.to_owned()],
+                "ZWJ/ZWNJ must carry shaping context across grapheme boundaries"
+            );
+            let chunks = split_text_by_font(text, &provider, "Aileron", None, 400);
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|(chunk, _)| chunk.as_str())
+                    .collect::<String>(),
+                text,
+            );
+            assert_eq!(
+                chunks.len(),
+                1,
+                "font fallback must not sever ZWJ/ZWNJ context: {text:?}"
+            );
+        }
+
+        for text in ["\u{2060}e", "e\u{2060}", "\u{00ad}日\u{e0100}"] {
+            let chunks = split_text_by_font(text, &provider, "Aileron", None, 400);
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|(chunk, _)| chunk.as_str())
+                    .collect::<String>(),
+                text,
+            );
+            assert_eq!(
+                chunks.len(),
+                1,
+                "leading/trailing default ignorables must follow adjacent text: {text:?}"
+            );
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn positioned_width_accounts_for_italic_overhang_and_negative_bearing() {
+        let provider = FixedFontProvider(aileron_fixture_font(true));
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1000\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,100,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,j j",
+        );
+        let line = LayoutEngine::new()
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Complex)
+            .expect("italic fixture should shape")
+            .lines
+            .into_iter()
+            .next()
+            .expect("one unwrapped line");
+        let pieces = line_to_pieces(&line);
+        let positioned = pieces_positioned_width(&pieces);
+
+        assert!(
+            pieces.iter().any(|piece| piece.ink_min < 0.0),
+            "italic fixture should expose a negative glyph bearing: {pieces:?}"
+        );
+        assert!(
+            positioned > line.width,
+            "positioned ink should exceed logical advance: ink={positioned}, advance={}",
+            line.width,
+        );
+
+        let max_width = (positioned + line.width) * 0.5;
+        let wrapped = wrap_layout_line(line, max_width, 1, "en", false)
+            .expect("positioned ink overflow should wrap");
+        assert_eq!(
+            wrapped
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["j", "j"],
+        );
+    }
+
+    #[test]
+    fn script_info_kerning_controls_complex_layout_advances() {
+        let mut track = parse_track(
+            "[Script Info]\nKerning: yes\nPlayResX: 1000\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Noto Serif,64,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\q2}AVAV",
+        );
+        let engine = LayoutEngine::new();
+        let provider = FontconfigProvider::new();
+        let kerned = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("kerned layout succeeds");
+        if kerned.lines[0].runs[0].font.path.is_none() {
+            eprintln!("skipping: Noto Serif is unavailable");
+            return;
+        }
+
+        track.kerning = false;
+        let unkerned = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("unkerned layout succeeds");
+
+        assert!(
+            kerned.lines[0].width < unkerned.lines[0].width,
+            "Kerning: no must retain unkerned advances: kerned={} unkerned={}",
+            kerned.lines[0].width,
+            unkerned.lines[0].width,
+        );
+    }
+
+    #[test]
+    fn whole_text_layout_reorders_mixed_bidi_across_override_runs() {
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1000\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\q2}abc אב{\\b1}ג 123",
+        );
+        let layout = LayoutEngine::new()
+            .layout_track_event_with_features(
+                &track,
+                0,
+                &NullFontProvider,
+                ShapingMode::Simple,
+                LayoutFeatures {
+                    whole_text_layout: true,
+                    ..LayoutFeatures::default()
+                },
+            )
+            .expect("whole-text layout succeeds");
+        let visual = layout.lines[0]
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .filter_map(|glyph| char::from_u32(glyph.glyph_id))
+            .collect::<String>();
+        let expected = analyze_bidi_with_base("abc אבג 123", BidiDirection::LeftToRight)
+            .expect("bidi analysis succeeds")
+            .visual_text;
+
+        assert_eq!(visual, expected);
+        assert!(layout.lines[0].runs.len() >= 3);
+    }
+
+    #[test]
+    fn encoding_minus_one_implicitly_enables_whole_text_layout() {
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1000\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,-1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\q2}אב{\\i1}ג abc",
+        );
+        let layout = LayoutEngine::new()
+            .layout_track_event_with_mode(&track, 0, &NullFontProvider, ShapingMode::Simple)
+            .expect("implicit whole-text layout succeeds");
+        let visual = layout.lines[0]
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .filter_map(|glyph| char::from_u32(glyph.glyph_id))
+            .collect::<String>();
+        let expected = analyze_bidi_with_base("אבג abc", BidiDirection::Neutral)
+            .expect("bidi analysis succeeds")
+            .visual_text;
+
+        assert_eq!(visual, expected);
+        assert_eq!(layout.lines[0].direction, BidiDirection::RightToLeft);
     }
 
     #[test]
@@ -941,7 +1687,7 @@ mod tests {
             .layout_track_event(&track, 0, &provider)
             .expect("layout should succeed");
 
-        assert_eq!(layout.style_index, 1);
+        assert_eq!(layout.style_index, 2);
         assert_eq!(layout.font_family, "DejaVu Sans");
         assert_eq!(layout.margin_l, 30);
         assert_eq!(layout.margin_r, 22);
@@ -1029,6 +1775,104 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
     }
 
     #[test]
+    fn layout_wrap_trims_only_libass_ascii_spaces() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 8
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha \u{00a0} beta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert!(
+            layout
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with('\u{00a0}')),
+            "libass trims ASCII spaces at wrap edges but preserves NBSP"
+        );
+    }
+
+    #[test]
+    fn layout_trims_line_edge_ascii_whitespace_across_style_runs() {
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1000\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\fs60}  {\\fs20}A B{\\fs80}   {\\fs20}",
+        );
+        let line = &LayoutEngine::new()
+            .layout_track_event_with_mode(&track, 0, &NullFontProvider, ShapingMode::Simple)
+            .expect("edge-whitespace fixture lays out")
+            .lines[0];
+
+        let rendered_text = line
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .filter_map(|glyph| char::from_u32(glyph.glyph_id))
+            .collect::<String>();
+        assert_eq!(rendered_text, "A B");
+        assert_eq!(line.glyph_count, 3);
+        assert_eq!(line.width, 3.0);
+        assert!(
+            line.runs
+                .iter()
+                .filter(|run| run.text.chars().all(is_libass_trimmed_character))
+                .all(|run| run.glyphs.is_empty() && run.width == 0.0),
+            "whitespace-only edge runs must survive for metrics but carry no placement advance: {line:?}"
+        );
+    }
+
+    #[test]
+    fn layout_trims_nonbreaking_newline_spaces_but_preserves_nbsp() {
+        let script = |text: &str| {
+            parse_track(&format!(
+                "[Script Info]\nPlayResX: 1000\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{text}"
+            ))
+        };
+        let layout = |track: &ParsedTrack| {
+            LayoutEngine::new()
+                .layout_track_event_with_mode(track, 0, &NullFontProvider, ShapingMode::Simple)
+                .expect("whitespace fixture lays out")
+        };
+
+        let newline_spaces = layout(&script("\\n A \\n{\\fs20}"));
+        assert_eq!(newline_spaces.lines[0].glyph_count, 1);
+        assert_eq!(newline_spaces.lines[0].width, 1.0);
+
+        let nbsp = layout(&script("\\hA{\\fs20}"));
+        assert_eq!(nbsp.lines[0].glyph_count, 2);
+        assert!(nbsp.lines[0].width > newline_spaces.lines[0].width);
+    }
+
+    #[test]
+    fn all_space_line_keeps_metric_runs_but_has_zero_placement_width() {
+        let track = parse_track(
+            "[Script Info]\nPlayResX: 1000\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,A\\N{\\fs80}   \\N{\\fs20}A",
+        );
+        let layout = LayoutEngine::new()
+            .layout_track_event_with_mode(&track, 0, &NullFontProvider, ShapingMode::Simple)
+            .expect("space-only line lays out");
+        let middle = &layout.lines[1];
+
+        assert_eq!(middle.glyph_count, 0);
+        assert_eq!(middle.width, 0.0);
+        assert!(
+            middle.runs.iter().any(|run| run.style.font_size == 80.0),
+            "trimmed runs remain available to half-height empty-line metric selection"
+        );
+    }
+
+    #[test]
     fn layout_wraps_against_default_script_resolution() {
         let track = parse_track(
             "[V4+ Styles]
@@ -1080,6 +1924,61 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,Banner;25;0;0,alpha be
 
         assert_eq!(layout.wrap_style, Some(2));
         assert_eq!(layout.lines.len(), 1);
+    }
+
+    #[test]
+    fn banner_effect_makes_lowercase_n_break_before_q_override_like_libass() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 400
+PlayResY: 80
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,Banner;25;0;0,alpha\\nbeta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.wrap_style, Some(2));
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].text, "alpha");
+        assert_eq!(layout.lines[1].text, "beta");
+    }
+
+    #[test]
+    fn banner_effect_q_override_controls_lowercase_n_like_libass() {
+        let track = parse_track(
+            "[Script Info]
+PlayResX: 400
+PlayResY: 80
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,8,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,2,2,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,Banner;25;0;0,{\\q0}alpha\\nbeta",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.wrap_style, Some(0));
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].text, "alpha beta");
     }
 
     #[test]
@@ -1377,6 +2276,32 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
         assert!(layout.clip_rect.is_none());
         assert!(layout.vector_clip.is_some());
         assert!(!layout.inverse_clip);
+        assert!(!layout.vector_clip_inverse);
+    }
+
+    #[test]
+    fn layout_carries_combined_rect_and_vector_clip_metadata() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\iclip(m 0 0 l 8 0 8 8 0 8)\\clip(1,2,3,4)}Clip",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert_eq!(
+            layout.clip_rect,
+            Some(Rect {
+                x_min: 1,
+                y_min: 2,
+                x_max: 3,
+                y_max: 4,
+            })
+        );
+        assert!(!layout.inverse_clip);
+        assert!(layout.vector_clip.is_some());
+        assert!(layout.vector_clip_inverse);
     }
 
     #[test]
@@ -1515,6 +2440,53 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
     }
 
     #[test]
+    fn layout_splits_drawing_runs_at_override_blocks_like_libass() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p1}m 0 0 l 8 0 8 8 0 8{\\pos(20,20)}m 20 20 l 28 20 28 28 20 28",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert_eq!(layout.lines[0].runs.len(), 2);
+        assert!(layout.lines[0].runs[0].drawing.is_some());
+        assert!(layout.lines[0].runs[1].drawing.is_some());
+    }
+
+    #[test]
+    fn layout_drawing_width_does_not_split_unicode_whitespace_like_libass() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p1}m\u{00a0}0 0 l 8 0 8 8 0 8",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        assert!(layout.lines[0].runs[0].drawing.is_some());
+        assert_eq!(layout.lines[0].runs[0].width, 0.0);
+    }
+
+    #[test]
+    fn layout_wraps_large_drawing_scale_base_like_libass() {
+        let track = parse_track(
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p34}m 0 0 l 64 0 64 64 0 64",
+        );
+        let engine = LayoutEngine::new();
+        let provider = NullFontProvider;
+        let layout = engine
+            .layout_track_event(&track, 0, &provider)
+            .expect("layout should succeed");
+
+        let run = &layout.lines[0].runs[0];
+        assert!(run.drawing.is_some());
+        assert_eq!(run.width, 32.0);
+    }
+
+    #[test]
     fn layout_uses_decimal_drawing_control_bounds_for_width() {
         let track = parse_track(
             "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\p1}m 0 0 b 41.909 83.818 83.818 65.378 83.818 41.909",
@@ -1585,6 +2557,32 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
 
         assert_eq!(layout.alignment, ass::VALIGN_SUB | ass::HALIGN_LEFT);
         assert_eq!(layout.justify, ass::ASS_JUSTIFY_LEFT);
+    }
+
+    #[test]
+    fn vertical_font_advances_only_override_eligible_source_clusters() {
+        let style = ParsedSpanStyle {
+            font_name: "@Vertical".to_owned(),
+            font_size: 40.0,
+            ..ParsedSpanStyle::default()
+        };
+        let glyphs = vec![
+            GlyphInfo {
+                x_advance: 12.0,
+                vertical_rotation_eligible: false,
+                ..GlyphInfo::default()
+            },
+            GlyphInfo {
+                x_advance: 13.0,
+                vertical_rotation_eligible: true,
+                ..GlyphInfo::default()
+            },
+        ];
+
+        let glyphs = apply_vertical_font_advances(glyphs, &style);
+
+        assert_eq!(glyphs[0].x_advance, 12.0);
+        assert_eq!(glyphs[1].x_advance, 40.0);
     }
 
     #[test]

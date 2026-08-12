@@ -2,7 +2,8 @@ use super::*;
 use rassa_fonts::{
     FontProvider, FontProviderKind, FontQuery, FontconfigProvider, NullFontProvider,
 };
-use rassa_parse::parse_script_text;
+use rassa_layout::LayoutLine;
+use rassa_parse::{ParsedAnimatedStyle, ParsedKaraokeSpan, ParsedSpanTransform, parse_script_text};
 
 fn config(
     frame_width: i32,
@@ -21,11 +22,143 @@ fn config(
     }
 }
 
+struct BundledFontProvider {
+    path: std::path::PathBuf,
+}
+
+impl BundledFontProvider {
+    fn aileron_regular() -> Self {
+        Self {
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+        }
+    }
+}
+
+impl FontProvider for BundledFontProvider {
+    fn resolve(&self, query: &FontQuery) -> FontMatch {
+        FontMatch {
+            family: query.family.clone(),
+            path: Some(self.path.clone()),
+            face_index: Some(0),
+            style: query.style.clone(),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Fontconfig,
+        }
+    }
+}
+
 fn total_plane_area(planes: &[ImagePlane]) -> i32 {
     planes
         .iter()
         .map(|plane| plane.size.width * plane.size.height)
         .sum()
+}
+
+#[test]
+fn glyph_compositing_adds_overlapping_coverage_like_libass() {
+    let glyphs = vec![
+        RasterGlyph {
+            width: 1,
+            height: 1,
+            stride: 1,
+            bitmap: vec![100],
+            ..RasterGlyph::default()
+        },
+        RasterGlyph {
+            width: 1,
+            height: 1,
+            stride: 1,
+            bitmap: vec![180],
+            ..RasterGlyph::default()
+        },
+    ];
+
+    let plane =
+        combined_image_plane_from_glyphs(&glyphs, 0, 0, Some(0), 0, ass::ImageType::Character, 0)
+            .expect("overlapping glyphs create an image");
+
+    assert_eq!(plane.bitmap, vec![255]);
+}
+
+#[test]
+fn glyph_compositing_applies_fixed_point_shaped_positions() {
+    let glyphs = vec![
+        RasterGlyph {
+            width: 1,
+            height: 1,
+            stride: 1,
+            advance_x_26_6: 96,
+            advance_y_26_6: 64,
+            bitmap: vec![255],
+            ..RasterGlyph::default()
+        },
+        RasterGlyph {
+            width: 1,
+            height: 1,
+            stride: 1,
+            offset_x_26_6: 32,
+            bitmap: vec![255],
+            ..RasterGlyph::default()
+        },
+    ];
+
+    let plane =
+        combined_image_plane_from_glyphs(&glyphs, 0, 0, Some(0), 0, ass::ImageType::Character, 0)
+            .expect("positioned glyphs create an image");
+
+    assert_eq!(plane.destination, Point { x: 0, y: -1 });
+    assert_eq!(
+        plane.size,
+        Size {
+            width: 3,
+            height: 2
+        }
+    );
+    assert_eq!(plane.bitmap, vec![0, 0, 255, 255, 0, 0]);
+}
+
+#[test]
+fn be_transform_interpolation_uses_libass_integer_rounding() {
+    assert_eq!(interpolate_be(0.0, 0.49, 1.0), 0.0);
+    assert_eq!(interpolate_be(0.0, 0.5, 1.0), 1.0);
+    assert_eq!(interpolate_be(0.0, 4.6, 0.5), 2.0);
+    assert_eq!(interpolate_be(5.0, 0.0, 0.5), 3.0);
+    assert_eq!(interpolate_be(0.0, 200.0, 1.0), 127.0);
+    assert_eq!(interpolate_be(0.0, -1.0, 1.0), 0.0);
+}
+
+#[test]
+fn blur_transform_interpolation_clamps_after_lerp_like_libass() {
+    assert_eq!(interpolate_blur(0.0, 200.0, 0.25), 50.0);
+    assert_eq!(interpolate_blur(0.0, 200.0, 0.5), 100.0);
+    assert_eq!(interpolate_blur(20.0, -20.0, 0.25), 10.0);
+    assert_eq!(interpolate_blur(20.0, -20.0, 0.75), 0.0);
+}
+
+#[test]
+fn nonnegative_transform_interpolation_clamps_after_lerp_like_libass() {
+    assert_eq!(interpolate_nonnegative(10.0, -30.0, 0.1), 6.0);
+    assert_eq!(interpolate_nonnegative(10.0, -30.0, 0.25), 0.0);
+    assert_eq!(interpolate_nonnegative(2.0, -2.0, 0.25), 1.0);
+    assert_eq!(interpolate_nonnegative(2.0, -2.0, 0.75), 0.0);
+}
+
+#[test]
+fn color_transform_interpolation_truncates_channels_like_libass() {
+    assert_eq!(
+        interpolate_color(0x0000_0000, 0x00FF_FFFF, 0.5),
+        0x007F_7F7F
+    );
+    assert_eq!(
+        interpolate_color(0x0000_0000, 0xFF00_0000, 0.5),
+        0x7F00_0000
+    );
+    assert_eq!(
+        interpolate_color(0x0033_6699, 0x00CC_9966, 0.5),
+        0x007F_7F7F
+    );
 }
 
 #[test]
@@ -100,6 +233,33 @@ fn fade_alpha_combines_with_existing_colour_alpha() {
 }
 
 #[test]
+fn fade_alpha_wraps_over_255_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let fade = ParsedFade::Complex {
+        alpha1: 300,
+        alpha2: 0,
+        alpha3: 0,
+        t1_ms: 0,
+        t2_ms: 100,
+        t3_ms: 100,
+        t4_ms: 200,
+    };
+
+    assert_eq!(compute_fad_alpha(fade, Some(&event), 0), 300);
+    assert_eq!(with_fade_alpha(0xFF00_0000, 300), 0xFF00_002C);
+}
+
+#[test]
+fn fade_alpha_nonpositive_values_do_not_modify_colour_like_libass() {
+    assert_eq!(with_fade_alpha(0xFF00_0080, -20), 0xFF00_0080);
+    assert_eq!(with_fade_alpha(0xFF00_0080, 0), 0xFF00_0080);
+}
+
+#[test]
 fn move_interpolation_swaps_reversed_times_like_libass() {
     let event = ParsedEvent {
         start: 0,
@@ -123,6 +283,78 @@ fn move_interpolation_swaps_reversed_times_like_libass() {
 }
 
 #[test]
+fn move_interpolation_preserves_negative_start_time_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 500,
+        ..ParsedEvent::default()
+    };
+
+    assert_eq!(
+        interpolate_move(
+            ParsedMovement {
+                start: (0, 0),
+                end: (100, 0),
+                t1_ms: -100,
+                t2_ms: 100,
+            },
+            Some(&event),
+            0,
+        ),
+        (50, 0)
+    );
+    assert_eq!(
+        interpolate_move_exact(
+            ParsedMovementExact {
+                start: (0.0, 0.0),
+                end: (100.0, 0.0),
+                t1_ms: -100,
+                t2_ms: 100,
+            },
+            Some(&event),
+            0,
+        ),
+        (50, 0)
+    );
+}
+
+#[test]
+fn move_interpolation_uses_signed_wrapping_delta_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+
+    assert_eq!(
+        interpolate_move(
+            ParsedMovement {
+                start: (0, 0),
+                end: (1, 0),
+                t1_ms: i32::MIN,
+                t2_ms: i32::MAX,
+            },
+            Some(&event),
+            0,
+        ),
+        (i32::MAX, 0)
+    );
+    assert_eq!(
+        interpolate_move_exact(
+            ParsedMovementExact {
+                start: (0.0, 0.0),
+                end: (1.0, 0.0),
+                t1_ms: i32::MIN,
+                t2_ms: i32::MAX,
+            },
+            Some(&event),
+            0,
+        ),
+        (i32::MAX, 0)
+    );
+}
+
+#[test]
 fn scaled_clip_rect_rounds_edges_like_libass() {
     let mapping = EventMapping {
         explicit: true,
@@ -139,12 +371,12 @@ fn scaled_clip_rect_rounds_edges_like_libass() {
         play_res_y: 1080.0,
     };
     assert_eq!(
-        scale_clip_rect(
-            Rect {
-                x_min: 659,
-                y_min: 35,
-                x_max: 1261,
-                y_max: 48,
+        scale_clip_rect_exact(
+            ParsedRectF64 {
+                x_min: 659.0,
+                y_min: 35.0,
+                x_max: 1261.0,
+                y_max: 48.0,
             },
             &mapping,
         ),
@@ -155,6 +387,104 @@ fn scaled_clip_rect_rounds_edges_like_libass() {
             y_max: 72,
         }
     );
+}
+
+#[test]
+fn scaled_exact_clip_rect_rounds_after_mapping_like_libass() {
+    let mapping = EventMapping {
+        explicit: true,
+        use_margins: false,
+        scale_x: 2.0,
+        scale_y: 2.0,
+        margin_left: 0.0,
+        margin_top: 0.0,
+        frame_w: 200.0,
+        frame_h: 200.0,
+        fit_w: 200.0,
+        fit_h: 200.0,
+        play_res_x: 100.0,
+        play_res_y: 100.0,
+    };
+    assert_eq!(
+        scale_clip_rect_exact(
+            ParsedRectF64 {
+                x_min: 0.25,
+                y_min: 0.25,
+                x_max: 10.25,
+                y_max: 20.25,
+            },
+            &mapping,
+        ),
+        Rect {
+            x_min: 1,
+            y_min: 1,
+            x_max: 21,
+            y_max: 41,
+        }
+    );
+}
+
+#[test]
+fn animated_clip_resolution_keeps_fractional_edges_until_mapping() {
+    let event = LayoutEvent {
+        clip_rect: Some(Rect {
+            x_min: 0,
+            y_min: 0,
+            x_max: 100,
+            y_max: 100,
+        }),
+        lines: vec![LayoutLine {
+            runs: vec![LayoutGlyphRun {
+                transforms: vec![ParsedSpanTransform {
+                    start_ms: 0,
+                    end_ms: Some(1000),
+                    accel: 1.0,
+                    style: ParsedAnimatedStyle {
+                        clip_rect: Some(ParsedRectF64 {
+                            x_min: 1.0,
+                            y_min: 1.0,
+                            x_max: 11.0,
+                            y_max: 21.0,
+                        }),
+                        clip_inverse: Some(false),
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let source = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..Default::default()
+    };
+    let track = ParsedTrack {
+        play_res_x: 100,
+        play_res_y: 100,
+        ..Default::default()
+    };
+    let mapping = EventMapping {
+        explicit: true,
+        use_margins: false,
+        scale_x: 2.0,
+        scale_y: 2.0,
+        margin_left: 0.0,
+        margin_top: 0.0,
+        frame_w: 200.0,
+        frame_h: 200.0,
+        fit_w: 200.0,
+        fit_h: 200.0,
+        play_res_x: 100.0,
+        play_res_y: 100.0,
+    };
+
+    let (clip, inverse) =
+        resolve_rect_clip(&event, &track, Some(&source), 500).expect("animated clip");
+    assert!(!inverse);
+    assert_eq!(scale_clip_rect_exact(clip, &mapping).x_min, 1);
 }
 
 #[test]
@@ -182,6 +512,758 @@ fn transform_accel_preserves_libass_power_value() {
     };
 
     assert_eq!(resolve_run_style(&run, Some(&event), 500).font_size, 30.0);
+}
+
+#[test]
+fn transform_zero_end_time_uses_event_duration_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            font_size: 10.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(0),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                font_size: Some(20.0),
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 500).font_size, 15.0);
+}
+
+#[test]
+fn transform_negative_start_time_is_not_clamped_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            font_size: 10.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: -100,
+            end_ms: Some(100),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                font_size: Some(20.0),
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 0).font_size, 15.0);
+}
+
+#[test]
+fn transform_bare_font_size_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            font_size: 40.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                font_size_steps: vec![ParsedFontSizeTransform::Reset { reset: 20.0 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 0).font_size, 20.0);
+}
+
+#[test]
+fn transform_repeated_relative_font_size_compounds_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            font_size: 20.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                font_size_steps: vec![
+                    ParsedFontSizeTransform::Relative {
+                        value: 5.0,
+                        reset: 20.0,
+                    },
+                    ParsedFontSizeTransform::Relative {
+                        value: 5.0,
+                        reset: 20.0,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 500).font_size, 31.25);
+}
+
+#[test]
+fn transform_repeated_absolute_font_size_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            font_size: 20.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                font_size_steps: vec![
+                    ParsedFontSizeTransform::Absolute {
+                        value: 40.0,
+                        reset: 20.0,
+                    },
+                    ParsedFontSizeTransform::Absolute {
+                        value: 50.0,
+                        reset: 20.0,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 500).font_size, 40.0);
+}
+
+#[test]
+fn transform_bare_scale_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            scale_x: 4.0,
+            scale_y: 5.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                scale_x_steps: vec![ParsedScaleTransform::Reset { reset: 1.2 }],
+                scale_y_steps: vec![ParsedScaleTransform::Reset { reset: 0.8 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 0);
+    assert_eq!(resolved.scale_x, 1.2);
+    assert_eq!(resolved.scale_y, 0.8);
+}
+
+#[test]
+fn transform_repeated_scale_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                scale_x_steps: vec![
+                    ParsedScaleTransform::Absolute {
+                        value: 2.0,
+                        reset: 1.0,
+                    },
+                    ParsedScaleTransform::Absolute {
+                        value: 3.0,
+                        reset: 1.0,
+                    },
+                ],
+                scale_y_steps: vec![
+                    ParsedScaleTransform::Absolute {
+                        value: 0.5,
+                        reset: 1.0,
+                    },
+                    ParsedScaleTransform::Absolute {
+                        value: 0.25,
+                        reset: 1.0,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 500);
+    assert_eq!(resolved.scale_x, 2.25);
+    assert_eq!(resolved.scale_y, 0.5);
+}
+
+#[test]
+fn transform_bare_spacing_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            spacing: 20.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                spacing_steps: vec![ParsedLinearTransform::Reset { reset: 4.0 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 0).spacing, 4.0);
+}
+
+#[test]
+fn transform_repeated_spacing_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            spacing: 4.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                spacing_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 8.0,
+                        reset: 4.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 12.0,
+                        reset: 4.0,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(resolve_run_style(&run, Some(&event), 500).spacing, 9.0);
+}
+
+#[test]
+fn transform_bare_rotation_shear_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            rotation_x: 9.0,
+            rotation_y: 8.0,
+            rotation_z: 90.0,
+            shear_x: 0.2,
+            shear_y: 0.3,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                rotation_x_steps: vec![ParsedLinearTransform::Reset { reset: 0.0 }],
+                rotation_y_steps: vec![ParsedLinearTransform::Reset { reset: 0.0 }],
+                rotation_z_steps: vec![ParsedLinearTransform::Reset { reset: 15.0 }],
+                shear_x_steps: vec![ParsedLinearTransform::Reset { reset: 0.0 }],
+                shear_y_steps: vec![ParsedLinearTransform::Reset { reset: 0.0 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 0);
+    assert_eq!(resolved.rotation_x, 0.0);
+    assert_eq!(resolved.rotation_y, 0.0);
+    assert_eq!(resolved.rotation_z, 15.0);
+    assert_eq!(resolved.shear_x, 0.0);
+    assert_eq!(resolved.shear_y, 0.0);
+}
+
+#[test]
+fn transform_repeated_rotation_shear_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            rotation_x: 0.0,
+            rotation_y: 0.0,
+            rotation_z: 15.0,
+            shear_x: 0.1,
+            shear_y: 0.2,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                rotation_x_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 10.0,
+                        reset: 0.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 20.0,
+                        reset: 0.0,
+                    },
+                ],
+                rotation_y_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: -5.0,
+                        reset: 0.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 5.0,
+                        reset: 0.0,
+                    },
+                ],
+                rotation_z_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 30.0,
+                        reset: 15.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 60.0,
+                        reset: 15.0,
+                    },
+                ],
+                shear_x_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 0.2,
+                        reset: 0.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 0.3,
+                        reset: 0.0,
+                    },
+                ],
+                shear_y_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 0.4,
+                        reset: 0.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 0.5,
+                        reset: 0.0,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 500);
+    assert_eq!(resolved.rotation_x, 12.5);
+    assert_eq!(resolved.rotation_y, 1.25);
+    assert_eq!(resolved.rotation_z, 41.25);
+    assert_eq!(resolved.shear_x, 0.225);
+    assert_eq!(resolved.shear_y, 0.4);
+}
+
+#[test]
+fn transform_bare_blur_be_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            blur: 5.0,
+            be: 6.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                blur_steps: vec![ParsedLinearTransform::Reset { reset: 0.0 }],
+                be_steps: vec![ParsedLinearTransform::Reset { reset: 0.0 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 0);
+    assert_eq!(resolved.blur, 0.0);
+    assert_eq!(resolved.be, 0.0);
+}
+
+#[test]
+fn transform_repeated_blur_be_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            blur: 0.0,
+            be: 0.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                blur_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 20.0,
+                        reset: 0.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 40.0,
+                        reset: 0.0,
+                    },
+                ],
+                be_steps: vec![
+                    ParsedLinearTransform::Absolute {
+                        value: 2.0,
+                        reset: 0.0,
+                    },
+                    ParsedLinearTransform::Absolute {
+                        value: 4.0,
+                        reset: 0.0,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 500);
+    assert_eq!(resolved.blur, 25.0);
+    assert_eq!(resolved.be, 3.0);
+}
+
+#[test]
+fn transform_bare_border_shadow_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            border: 9.0,
+            border_x: 10.0,
+            border_y: 11.0,
+            shadow: 12.0,
+            shadow_x: 13.0,
+            shadow_y: 14.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                border_x_steps: vec![ParsedAxisTransform::Reset { reset: 2.0 }],
+                border_y_steps: vec![ParsedAxisTransform::Reset { reset: 2.0 }],
+                shadow_x_steps: vec![ParsedAxisTransform::Reset { reset: 3.0 }],
+                shadow_y_steps: vec![ParsedAxisTransform::Reset { reset: 3.0 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 0);
+    assert_eq!(resolved.border, 2.0);
+    assert_eq!(resolved.border_x, 2.0);
+    assert_eq!(resolved.border_y, 2.0);
+    assert_eq!(resolved.shadow, 3.0);
+    assert_eq!(resolved.shadow_x, 3.0);
+    assert_eq!(resolved.shadow_y, 3.0);
+}
+
+#[test]
+fn transform_repeated_border_shadow_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            border: 2.0,
+            border_x: 2.0,
+            border_y: 2.0,
+            shadow: 3.0,
+            shadow_x: 3.0,
+            shadow_y: 3.0,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                border_x_steps: vec![
+                    ParsedAxisTransform::Absolute {
+                        value: 8.0,
+                        reset: 2.0,
+                        clamp: true,
+                    },
+                    ParsedAxisTransform::Absolute {
+                        value: -20.0,
+                        reset: 2.0,
+                        clamp: true,
+                    },
+                ],
+                border_y_steps: vec![
+                    ParsedAxisTransform::Absolute {
+                        value: 8.0,
+                        reset: 2.0,
+                        clamp: true,
+                    },
+                    ParsedAxisTransform::Absolute {
+                        value: 6.0,
+                        reset: 2.0,
+                        clamp: true,
+                    },
+                ],
+                shadow_x_steps: vec![
+                    ParsedAxisTransform::Absolute {
+                        value: -5.0,
+                        reset: 3.0,
+                        clamp: true,
+                    },
+                    ParsedAxisTransform::Absolute {
+                        value: -2.0,
+                        reset: 3.0,
+                        clamp: false,
+                    },
+                ],
+                shadow_y_steps: vec![
+                    ParsedAxisTransform::Absolute {
+                        value: -5.0,
+                        reset: 3.0,
+                        clamp: true,
+                    },
+                    ParsedAxisTransform::Absolute {
+                        value: 7.0,
+                        reset: 3.0,
+                        clamp: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let resolved = resolve_run_style(&run, Some(&event), 500);
+    assert_eq!(resolved.border_x, 0.0);
+    assert_eq!(resolved.border_y, 5.5);
+    assert_eq!(resolved.border, 5.5);
+    assert_eq!(resolved.shadow_x, -1.0);
+    assert_eq!(resolved.shadow_y, 3.5);
+    assert_eq!(resolved.shadow, 3.5);
+}
+
+#[test]
+fn transform_bare_colour_alpha_reset_ignores_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            primary_colour: 0xFF00_0000,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 100,
+            end_ms: Some(200),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                primary_colour_steps: vec![
+                    ParsedColourTransform::ResetRgb { reset: 0x2010_2030 },
+                    ParsedColourTransform::ResetAlpha { reset: 0x20 },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(
+        resolve_run_style(&run, Some(&event), 0).primary_colour,
+        0x2010_2030
+    );
+}
+
+#[test]
+fn transform_repeated_colour_alpha_uses_ordered_power_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            primary_colour: 0x2010_2030,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                primary_colour_steps: vec![
+                    ParsedColourTransform::Rgb { value: 0x000000 },
+                    ParsedColourTransform::Rgb { value: 0xFFFFFF },
+                    ParsedColourTransform::Alpha { value: 0x80 },
+                    ParsedColourTransform::Alpha { value: 0x40 },
+                    ParsedColourTransform::Alpha { value: 0x20 },
+                ],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    assert_eq!(
+        resolve_run_style(&run, Some(&event), 500).primary_colour,
+        0x3483_878b
+    );
+}
+
+#[test]
+fn transform_alpha_interpolates_raw_int_before_byte_truncation_like_libass() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: 1000,
+        ..ParsedEvent::default()
+    };
+    let run = LayoutGlyphRun {
+        style: ParsedSpanStyle {
+            primary_colour: 0x0010_2030,
+            secondary_colour: 0x0010_2030,
+            ..ParsedSpanStyle::default()
+        },
+        transforms: vec![rassa_parse::ParsedSpanTransform {
+            start_ms: 0,
+            end_ms: Some(1000),
+            accel: 1.0,
+            style: rassa_parse::ParsedAnimatedStyle {
+                primary_colour_steps: vec![ParsedColourTransform::Alpha { value: 0x100 }],
+                secondary_colour_steps: vec![ParsedColourTransform::Alpha { value: -1 }],
+                ..Default::default()
+            },
+        }],
+        ..LayoutGlyphRun::default()
+    };
+
+    let halfway = resolve_run_style(&run, Some(&event), 500);
+    assert_eq!(halfway.primary_colour, 0x8010_2030);
+    assert_eq!(halfway.secondary_colour, 0xFF10_2030);
+
+    let finished = resolve_run_style(&run, Some(&event), 1000);
+    assert_eq!(finished.primary_colour, 0x0010_2030);
+    assert_eq!(finished.secondary_colour, 0x0010_2030);
+}
+
+#[test]
+fn vsfilter_alpha_clipping_wraps_only_after_transform_interpolation() {
+    let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 120\nPlayResY: 120\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,93,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\1a0\\t(\\1a1FF)}A";
+    let track = parse_script_text(script).expect("alpha clipping fixture should parse");
+    let provider = BundledFontProvider::aileron_regular();
+    let renderer = RenderEngine::new();
+
+    for (time_ms, expected_alpha) in [(2040, 0xD0), (2560, 0x05), (4960, 0xFA)] {
+        let planes = renderer.render_frame_with_provider(&track, &provider, time_ms);
+        let character = planes
+            .iter()
+            .find(|plane| plane.kind == ass::ImageType::Character)
+            .expect("alpha clipping fixture should render a character plane");
+        assert_eq!(
+            character.color.0,
+            0xFFFF_FF00 | expected_alpha,
+            "VSFilter truncates the interpolated raw alpha to u8 at {time_ms} ms"
+        );
+    }
 }
 
 fn vertical_span(planes: &[ImagePlane]) -> i32 {
@@ -254,6 +1336,15 @@ fn visible_bounds(planes: &[ImagePlane]) -> Option<Rect> {
         }
     }
     bounds
+}
+
+fn visible_kind_bounds(planes: &[ImagePlane], kind: ass::ImageType) -> Option<Rect> {
+    let matching = planes
+        .iter()
+        .filter(|plane| plane.kind == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    visible_bounds(&matching)
 }
 
 fn drawing_alignment_script(alignment: i32, override_tags: &str, event_margins: &str) -> String {
@@ -792,6 +1883,46 @@ fn borderstyle3_opaque_box_follows_text_transform() {
     assert!(
         box_bounds.height() > 90,
         "opaque box must be transformed with the rotated/sheared text, got bounds {box_bounds:?}"
+    );
+}
+
+#[test]
+fn borderstyle3_uses_inline_box_geometry_colours_and_axis_shadow() {
+    let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 500\nPlayResY: 180\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,DejaVu Sans,30,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,3,2,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Box,,0,0,0,,{\\an5\\pos(250,90)}A{\\xbord6\\ybord1\\3c&H0000FF&\\xshad-4\\yshad5\\4c&H00FF00&}B\n";
+    let track = parse_script_text(script).expect("inline BorderStyle=3 script should parse");
+    let planes =
+        RenderEngine::new().render_frame_with_provider(&track, &FontconfigProvider::new(), 500);
+
+    let overridden_box = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Outline && plane.color.0 == 0xFF00_0000)
+        .expect("inline \\3c must colour its own opaque-box run");
+    let base_box = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Outline && plane.color.0 == 0x0000_0000)
+        .expect("the base-style run must retain its own opaque-box colour");
+    let overridden_shadow = planes
+        .iter()
+        .find(|plane| plane.kind == ass::ImageType::Shadow && plane.color.0 == 0x00FF_0000)
+        .expect("inline \\4c and axis shadow must create a run-specific box shadow");
+
+    assert!(
+        overridden_box.size.width >= base_box.size.width + 4,
+        "the larger inline \\xbord must widen only the overridden box: base={base_box:?} override={overridden_box:?}"
+    );
+    assert_eq!(
+        overridden_box.size.height, 32,
+        "inline \\ybord1 must replace the base two-pixel vertical padding"
+    );
+    assert_eq!(
+        overridden_shadow.destination.x,
+        overridden_box.destination.x - 4,
+        "negative \\xshad must move the run-specific shadow left"
+    );
+    assert_eq!(
+        overridden_shadow.destination.y,
+        overridden_box.destination.y + 5,
+        "positive \\yshad must move the run-specific shadow down"
     );
 }
 
@@ -1521,10 +2652,11 @@ fn render_frame_distinguishes_be_from_blur() {
         engine.render_frame_with_provider(&track, &provider, 500)
     };
     let sharp_ink = visible_bounds(&render(&script(""))).expect("sharp ink");
-    // Sum the alpha in the column band two pixels left of the sharp ink.
+    // Sum the alpha one pixel left of the sharp ink. libass reserves exactly
+    // one pixel for \be1, while the gaussian reaches farther at \blur1.
     let left_bleed = |script_text: &str| {
         let planes = render(script_text);
-        let probe_x = sharp_ink.x_min - 2;
+        let probe_x = sharp_ink.x_min - 1;
         planes
             .iter()
             .filter(|plane| plane.kind == ass::ImageType::Character)
@@ -1828,6 +2960,53 @@ fn render_frame_interpolates_animated_clip_rect() {
 }
 
 #[test]
+fn render_frame_interpolates_animated_inverse_clip_rect() {
+    // libass parses \t(\iclip(...)) through the same animated rectangular
+    // clip path as \clip, but switches clip mode to inverse for the event.
+    let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(20,30)\\t(0,1000,\\iclip(0,0,60,120))}AnimatedInverseClip").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let width_at = |now_ms: i64| {
+        let planes = engine.render_frame_with_provider(&track, &provider, now_ms);
+        visible_bounds(&planes)
+            .map(|rect| rect.width())
+            .unwrap_or(0)
+    };
+
+    let start = width_at(10);
+    let middle = width_at(500);
+    let end = width_at(999);
+    assert!(
+        start < middle && middle <= end,
+        "animated \\t(\\iclip) must reveal the inverse region as the excluded rectangle shrinks: {start} < {middle} <= {end}"
+    );
+}
+
+#[test]
+fn render_frame_applies_transform_vector_clip_like_static_vector_clip() {
+    let script = |tag: &str| {
+        format!(
+            "[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(20,30){tag}}}VectorClipParity"
+        )
+    };
+    let vector = "m 20 0 l 160 0 160 120 20 120";
+    let bounds_for = |script_text: String| {
+        render_text_bounds(&script_text).expect("vector-clipped text should render")
+    };
+
+    assert_eq!(
+        bounds_for(script(format!("\\clip({vector})").as_str())),
+        bounds_for(script(format!("\\t(0,1000,\\clip({vector}))").as_str())),
+        "libass applies vector \\clip inside \\t as a clip side effect"
+    );
+    assert_eq!(
+        bounds_for(script(format!("\\iclip({vector})").as_str())),
+        bounds_for(script(format!("\\t(0,1000,\\iclip({vector}))").as_str())),
+        "libass applies vector \\iclip inside \\t as an inverse clip side effect"
+    );
+}
+
+#[test]
 fn render_frame_applies_inverse_rectangular_clip() {
     let plane = ImagePlane {
         size: Size {
@@ -1857,6 +3036,131 @@ fn render_frame_applies_inverse_rectangular_clip() {
     );
 }
 
+fn solid_test_plane(width: i32, height: i32, destination: Point) -> ImagePlane {
+    ImagePlane {
+        size: Size { width, height },
+        stride: width,
+        color: RgbaColor(0x00FF_FFFF),
+        destination,
+        kind: ass::ImageType::Character,
+        bitmap: vec![255; (width * height) as usize],
+    }
+}
+
+fn assert_valid_frame_planes(planes: &[ImagePlane], frame_width: i32, frame_height: i32) {
+    for plane in planes {
+        assert!(plane.size.width >= 0 && plane.size.height >= 0);
+        assert!(plane.stride >= plane.size.width && plane.stride >= 0);
+        let stride = usize::try_from(plane.stride).expect("nonnegative stride");
+        let height = usize::try_from(plane.size.height).expect("nonnegative height");
+        let required = stride.checked_mul(height).expect("plane size fits usize");
+        assert!(
+            required <= plane.bitmap.len(),
+            "plane bitmap is shorter than stride * height: {plane:?}"
+        );
+        let right = i64::from(plane.destination.x) + i64::from(plane.size.width);
+        let bottom = i64::from(plane.destination.y) + i64::from(plane.size.height);
+        assert!(plane.destination.x >= 0 && plane.destination.y >= 0);
+        assert!(right <= i64::from(frame_width) && bottom <= i64::from(frame_height));
+    }
+}
+
+fn rectangular_vector_clip(x_min: i32, y_min: i32, x_max: i32, y_max: i32) -> ParsedVectorClip {
+    ParsedVectorClip {
+        scale: 1,
+        polygons: vec![vec![
+            Point { x: x_min, y: y_min },
+            Point { x: x_max, y: y_min },
+            Point { x: x_max, y: y_max },
+            Point { x: x_min, y: y_max },
+        ]],
+    }
+}
+
+#[test]
+fn regular_vector_clip_keeps_empty_overlap_plane_like_libass() {
+    let plane = solid_test_plane(6, 4, Point { x: 0, y: 0 });
+    let clipped =
+        mask_plane_with_vector_clip(plane, &rectangular_vector_clip(20, 20, 30, 30), false)
+            .expect("valid vector clip with no overlap keeps an empty ASS_Image node");
+
+    assert_eq!(clipped.size, Size::default());
+    assert_eq!(clipped.stride, 0);
+    assert_eq!(clipped.destination, Point { x: 0, y: 0 });
+    assert!(clipped.bitmap.is_empty());
+}
+
+#[test]
+fn regular_vector_clip_crops_to_mask_overlap_not_visible_pixels() {
+    let mut plane = solid_test_plane(8, 6, Point { x: 0, y: 0 });
+    plane.bitmap.fill(0);
+    plane.bitmap[0] = 255;
+
+    let clipped = mask_plane_with_vector_clip(plane, &rectangular_vector_clip(2, 1, 6, 5), false)
+        .expect("regular vector clip should keep the mask overlap geometry");
+
+    assert_eq!(clipped.destination, Point { x: 2, y: 1 });
+    assert_eq!(
+        clipped.size,
+        Size {
+            width: 4,
+            height: 4,
+        }
+    );
+    assert_eq!(clipped.stride, 4);
+    assert!(clipped.bitmap.iter().all(|value| *value == 0));
+}
+
+#[test]
+fn inverse_vector_clip_keeps_original_plane_when_mask_covers_everything() {
+    let plane = solid_test_plane(6, 4, Point { x: 10, y: 20 });
+    let clipped = mask_plane_with_vector_clip(
+        plane.clone(),
+        &rectangular_vector_clip(10, 20, 16, 24),
+        true,
+    )
+    .expect("inverse vector clip keeps the ASS_Image node even when all alpha is masked");
+
+    assert_eq!(clipped.size, plane.size);
+    assert_eq!(clipped.stride, plane.stride);
+    assert_eq!(clipped.destination, plane.destination);
+    assert!(clipped.bitmap.iter().all(|value| *value == 0));
+}
+
+#[test]
+fn inverse_vector_clip_keeps_original_plane_when_mask_does_not_overlap() {
+    let plane = solid_test_plane(6, 4, Point { x: 10, y: 20 });
+    let clipped = mask_plane_with_vector_clip(
+        plane.clone(),
+        &rectangular_vector_clip(40, 40, 50, 50),
+        true,
+    )
+    .expect("inverse vector clip without overlap leaves the ASS_Image unchanged");
+
+    assert_eq!(clipped, plane);
+}
+
+#[test]
+fn invalid_programmatic_vector_clip_is_unapplied_for_regular_and_inverse_modes() {
+    let plane = solid_test_plane(6, 4, Point { x: 10, y: 20 });
+    let invalid = ParsedVectorClip {
+        scale: 1,
+        polygons: vec![vec![
+            Point { x: i32::MIN, y: 0 },
+            Point { x: 20, y: 0 },
+            Point { x: 20, y: 20 },
+        ]],
+    };
+
+    for inverse in [false, true] {
+        assert_eq!(
+            mask_plane_with_vector_clip(plane.clone(), &invalid, inverse),
+            Some(plane.clone()),
+            "libass skips an invalid vector outline instead of applying {inverse:?} clipping"
+        );
+    }
+}
+
 #[test]
 fn render_frame_applies_vector_clip() {
     let track = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(0,0)\\clip(m 0 0 l 32 0 32 32 0 32)}Hi").expect("script should parse");
@@ -1872,6 +3176,87 @@ fn render_frame_applies_vector_clip() {
     );
     assert!(planes.iter().all(|plane| plane.destination.x >= 0));
     assert!(planes.iter().all(|plane| plane.destination.y >= 0));
+}
+
+#[test]
+fn master_outline_extremes_do_not_clip_regular_or_inverse_text() {
+    let render = |clip_tag: &str| {
+        let script = format!(
+            "[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(20,20){clip_tag}}}OutlineRange"
+        );
+        let track = parse_script_text(&script).expect("adversarial clip script parses");
+        RenderEngine::new().render_frame_with_provider(&track, &FontconfigProvider::new(), 500)
+    };
+
+    let baseline = render("");
+    assert!(!baseline.is_empty());
+    let baseline_bounds = visible_bounds(&baseline);
+    for tag in [
+        "\\clip(m 0 0 l -33554432 0 20 20 0 20)",
+        "\\iclip(m 0 0 l -33554432 0 20 20 0 20)",
+        "\\clip(m 0 0 s -2147483648 0 10 10 20 20 p 30 30 c)",
+        "\\iclip(m 0 0 s -2147483648 0 10 10 20 20 p 30 30 c)",
+    ] {
+        let planes = render(tag);
+        assert_eq!(
+            visible_bounds(&planes),
+            baseline_bounds,
+            "invalid vector outline must be left unapplied for {tag:?}"
+        );
+        assert_valid_frame_planes(&planes, 200, 100);
+    }
+}
+
+#[test]
+fn hostile_vector_drawings_are_rejected_before_bitmap_allocation() {
+    let render = |drawing_tags: &str, drawing: &str| {
+        let script = format!(
+            "[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(10,10)\\p1{drawing_tags}}}{drawing}"
+        );
+        let track = parse_script_text(&script).expect("adversarial drawing script parses");
+        RenderEngine::new().render_frame_with_provider(&track, &FontconfigProvider::new(), 500)
+    };
+
+    let cases = [
+        ("", "m 0 0 l -33554432 0 0 10"),
+        ("", "m 0 0 s -2147483648 0 10 10 20 20 p 30 30 c"),
+        (
+            "\\fscx1000000000000\\fscy1000000000000",
+            "m 0 0 l 10 0 10 10 0 10",
+        ),
+        // Coordinates are individually valid, but the eager 12k-square bitmap
+        // would exceed libass's 128 MiB default bitmap-cache budget.
+        ("", "m 0 0 l 12000 0 12000 12000 0 12000"),
+    ];
+    for (tags, drawing) in cases {
+        let planes = render(tags, drawing);
+        assert!(
+            planes.is_empty(),
+            "hostile drawing must not produce a partial or gigantic plane: tags={tags:?} drawing={drawing:?}"
+        );
+        assert_valid_frame_planes(&planes, 200, 100);
+    }
+}
+
+#[test]
+fn render_frame_applies_vector_clip_scale_clamping_and_empty_masks_like_libass() {
+    fn render_with_tag(tag: &str) -> Vec<ImagePlane> {
+        let script = format!(
+            "[Script Info]\nPlayResX: 200\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\pos(100,50){tag}}}Hi"
+        );
+        let track = parse_script_text(&script).expect("script should parse");
+        let engine = RenderEngine::new();
+        let provider = FontconfigProvider::new();
+        engine.render_frame_with_provider(&track, &provider, 500)
+    }
+
+    assert!(!render_with_tag("").is_empty());
+    assert!(render_with_tag("\\clip(not drawing)").is_empty());
+    assert!(!render_with_tag("\\clip(0,m 0 0 l 200 0 200 100 0 100)").is_empty());
+    assert!(!render_with_tag("\\iclip(not drawing)").is_empty());
+    // A fully masked inverse clip still retains its zero-coverage ASS_Image;
+    // 0.17.5 filters colour-alpha 0xFF nodes, not empty bitmap masks.
+    assert!(!render_with_tag("\\iclip(0,m 0 0 l 200 0 200 100 0 100)").is_empty());
 }
 
 #[test]
@@ -1957,6 +3342,48 @@ fn render_frame_remaps_events_into_full_frame_when_margins_used() {
         positioned_top >= 10,
         "a positioned event maps into the margin-offset content area; got y_min={positioned_top}"
     );
+
+    let bare_drawing_mode_track =
+        parse_script_text(&script("{\\p0}Hi")).expect("script should parse");
+    let bare_drawing_mode = engine.render_frame_with_provider_and_config(
+        &bare_drawing_mode_track,
+        &provider,
+        500,
+        &margin_config,
+    );
+    let bare_drawing_mode_top = visible_bounds(&bare_drawing_mode)
+        .expect("bare \\p0 hard override ink")
+        .y_min;
+    assert!(
+        bare_drawing_mode_top >= 10,
+        "a bare \\p0 tag is a libass hard override and maps into the content area; got y_min={bare_drawing_mode_top}"
+    );
+
+    let hard_clip_track =
+        parse_script_text(&script("{\\clip(0,0,0,0)}Hi")).expect("script should parse");
+    let hard_clip = engine.render_frame_with_provider_and_config(
+        &hard_clip_track,
+        &provider,
+        500,
+        &margin_config,
+    );
+    assert!(
+        visible_bounds(&hard_clip).is_none(),
+        "a normal \\clip tag is a libass hard override and should apply its zero-size clip"
+    );
+
+    let spaced_clip_track =
+        parse_script_text(&script("{\\ clip(0,0,0,0)}Hi")).expect("script should parse");
+    let spaced_clip = engine.render_frame_with_provider_and_config(
+        &spaced_clip_track,
+        &provider,
+        500,
+        &margin_config,
+    );
+    assert!(
+        visible_bounds(&spaced_clip).is_some(),
+        "libass parses spaced \\ clip but its hard scan does not mark the event explicit under use_margins"
+    );
 }
 
 #[test]
@@ -2007,7 +3434,13 @@ fn render_frame_keeps_border_closer_to_device_size_when_scaled_border_is_disable
     let disabled = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\nScaledBorderAndShadow: no\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,18,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,4,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)}I").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
-    let config = config(200, 200, rassa_core::Margins::default(), true);
+    let config = RendererConfig {
+        storage: Size {
+            width: 200,
+            height: 200,
+        },
+        ..config(200, 200, rassa_core::Margins::default(), true)
+    };
     let enabled_planes =
         engine.render_frame_with_provider_and_config(&enabled, &provider, 500, &config);
     let disabled_planes =
@@ -2051,6 +3484,29 @@ fn render_frame_applies_font_scale_to_output() {
     assert!(!baseline.is_empty());
     assert!(!scaled.is_empty());
     assert!(total_plane_area(&scaled) > total_plane_area(&baseline));
+}
+
+#[test]
+fn render_frame_zero_font_scale_collapses_output_like_libass() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 200\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,Scale").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+
+    let zero_scaled = engine.render_frame_with_provider_and_config(
+        &track,
+        &provider,
+        500,
+        &RendererConfig {
+            frame: Size {
+                width: 200,
+                height: 120,
+            },
+            font_scale: 0.0,
+            ..RendererConfig::default()
+        },
+    );
+
+    assert!(zero_scaled.is_empty());
 }
 
 #[test]
@@ -2198,6 +3654,29 @@ fn render_frame_applies_banner_effect_motion() {
         (194..=198).contains(&early.x_min),
         "libass positions a right-to-left banner by PlayResX - elapsed/delay, got {early:?}"
     );
+}
+
+#[test]
+fn effect_values_use_c_atoi_whitespace_like_libass() {
+    assert_eq!(
+        effect_values("Banner; \t\n\r\u{000b}\u{000c}+25;\u{00a0}25; -3;abc;99"),
+        vec![25, 0, -3, 0]
+    );
+}
+
+#[test]
+fn invalid_scroll_effect_does_not_disable_collision_like_libass() {
+    let mut event = ParsedEvent {
+        effect: "Scroll up;20;100".to_string(),
+        ..ParsedEvent::default()
+    };
+    assert!(!transition_effect_disables_collision(&event));
+
+    event.effect = "Scroll up;20;100;25".to_string();
+    assert!(transition_effect_disables_collision(&event));
+
+    event.effect = "Banner;".to_string();
+    assert!(transition_effect_disables_collision(&event));
 }
 
 #[test]
@@ -2415,8 +3894,9 @@ fn render_frame_layout_resolution_takes_precedence_over_storage_and_explicit_asp
     );
 
     assert_eq!(
-        total_plane_area(&overridden_inputs),
-        total_plane_area(&baseline)
+        character_bounds(&overridden_inputs),
+        character_bounds(&baseline),
+        "LayoutRes forces derived pixel aspect and overrides storage and explicit PAR"
     );
 }
 
@@ -2499,6 +3979,63 @@ fn render_frame_avoids_basic_bottom_collision_for_unpositioned_events() {
 }
 
 #[test]
+fn zero_advance_combining_mark_events_do_not_participate_in_collision_layout() {
+    // libass-tests zero-area/zero-area.ass: a standalone combining mark has
+    // visible ink but a zero-width advance bbox. VSFilter's intersection-area
+    // rule cannot collide it, and libass therefore skips it in fix_collisions
+    // regardless of whether it appears before or after a normal event.
+    // Aileron contains U+0326 as a zero-advance combining mark, making this
+    // regression self-contained with the repository's bundled font.
+    let track = parse_script_text("[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,96,&H000000FF,&H80FFFF00,&H00000000,&H0000FF00,0,0,0,0,100,100,0,0,1,0,0,5,0,10,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\1c&H0000FF&}\u{326}\nDialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\1c&H00FF00&}A\nDialogue: 0,0:00:06.00,0:00:10.00,Default,,0,0,0,,{\\1c&H00FF00&}A\nDialogue: 0,0:00:06.00,0:00:10.00,Default,,0,0,0,,{\\1c&H0000FF&}\u{326}")
+        .expect("zero-area collision fixture parses");
+    let provider = BundledFontProvider::aileron_regular();
+    let engine = RenderEngine::new();
+
+    let prepared = engine.prepare_frame(&track, &provider, 2000);
+    let mark = prepared
+        .active_events
+        .iter()
+        .find(|event| event.event_index == 0)
+        .expect("combining-mark event is active");
+    let config = default_renderer_config(&track);
+    assert_eq!(
+        rendered_text_alignment_width(
+            &mark.lines[0],
+            track.events.first(),
+            2000,
+            &track,
+            &config,
+            RenderScale { x: 1.0, y: 1.0 },
+            1.0,
+        ),
+        0,
+        "a visible combining-only line retains its zero advance bbox: {mark:?}"
+    );
+
+    let early = engine.render_frame_with_provider(&track, &provider, 2000);
+    let late = engine.render_frame_with_provider(&track, &provider, 8000);
+    let colour_bounds = |planes: &[ImagePlane], colour| {
+        let matching = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == colour)
+            .cloned()
+            .collect::<Vec<_>>();
+        visible_bounds(&matching).expect("coloured event renders visible ink")
+    };
+
+    assert_eq!(
+        colour_bounds(&early, 0xFF00_0000),
+        colour_bounds(&late, 0xFF00_0000),
+        "the combining mark stays on the same baseline in either read order"
+    );
+    assert_eq!(
+        colour_bounds(&early, 0x00FF_0000),
+        colour_bounds(&late, 0x00FF_0000),
+        "the normal event is not displaced by a preceding zero-area event"
+    );
+}
+
+#[test]
 fn collision_positions_stay_stable_across_frames_like_libass() {
     // libass keeps a per-event render_priv rect: an event placed by
     // fix_collisions keeps its position in later frames while its height is
@@ -2525,10 +4062,103 @@ fn collision_positions_stay_stable_across_frames_like_libass() {
 }
 
 #[test]
-fn render_frame_collides_events_across_layers_like_libass() {
-    // libass fix_collisions (ass_render.c) runs over every event of the
-    // frame with no layer distinction: the layer only controls z-order, so
-    // two unpositioned bottom subtitles on different layers still stack.
+fn collision_cache_invalidates_after_in_place_track_mutation() {
+    let mut track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 150\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,First\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Second").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+
+    let before = engine.render_frame_with_provider(&track, &provider, 500);
+    track.events[0].text = "First\\Nline two\\Nline three".to_string();
+    let after = engine.render_frame_with_provider(&track, &provider, 500);
+
+    let visible_y = |planes: &[ImagePlane]| {
+        planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .map(|plane| plane.destination.y)
+            .min()
+            .expect("visible character plane")
+    };
+    assert_ne!(
+        visible_y(&before),
+        visible_y(&after),
+        "in-place track changes must invalidate cached collision rectangles"
+    );
+}
+
+#[test]
+fn collision_fix_groups_records_by_layer_like_libass() {
+    let record = |event_index| RenderedEvent {
+        event_index,
+        planes: Vec::new(),
+        collision_rect: Some(Rect {
+            x_min: 0,
+            y_min: 0,
+            x_max: 100,
+            y_max: 10,
+        }),
+        detect_collisions: true,
+        shift_direction: 1,
+        frame_clip: Rect {
+            x_min: 0,
+            y_min: 0,
+            x_max: 100,
+            y_max: 100,
+        },
+    };
+    let same_layer = ParsedTrack {
+        events: vec![
+            ParsedEvent {
+                layer: 0,
+                ..Default::default()
+            },
+            ParsedEvent {
+                layer: 0,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut same_layer_records = vec![record(0), record(1)];
+    let mut same_layer_cache = std::collections::HashMap::new();
+    fix_collisions_by_layer(&mut same_layer_cache, &mut same_layer_records, &same_layer);
+    assert_eq!(same_layer_cache.get(&0).map(|rect| rect.y_min), Some(0));
+    assert_eq!(same_layer_cache.get(&1).map(|rect| rect.y_min), Some(10));
+
+    let different_layers = ParsedTrack {
+        events: vec![
+            ParsedEvent {
+                layer: 0,
+                ..Default::default()
+            },
+            ParsedEvent {
+                layer: 1,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut different_layer_records = vec![record(0), record(1)];
+    let mut different_layer_cache = std::collections::HashMap::new();
+    fix_collisions_by_layer(
+        &mut different_layer_cache,
+        &mut different_layer_records,
+        &different_layers,
+    );
+    assert_eq!(
+        different_layer_cache.get(&0).map(|rect| rect.y_min),
+        Some(0)
+    );
+    assert_eq!(
+        different_layer_cache.get(&1).map(|rect| rect.y_min),
+        Some(0)
+    );
+}
+
+#[test]
+fn render_frame_allows_collision_across_layers_like_libass() {
+    // libass ass_render_frame sorts by layer, then calls fix_collisions for
+    // each same-layer group. Different layers only affect z-order.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 1,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H00FF00&}Second").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -2547,9 +4177,9 @@ fn render_frame_collides_events_across_layers_like_libass() {
         .min()
         .expect("layer 1 character plane");
 
-    assert!(
-        (layer0_y - layer1_y).abs() >= 20,
-        "events on different layers still avoid each other in libass: layer0_y={layer0_y} layer1_y={layer1_y}"
+    assert_eq!(
+        layer0_y, layer1_y,
+        "events on different layers should not collision-shift each other: layer0_y={layer0_y} layer1_y={layer1_y}"
     );
 }
 
@@ -2576,6 +4206,56 @@ fn banner_effect_does_not_participate_in_collision_layout_like_libass() {
         .expect("solo banner character plane");
 
     assert_eq!(banner_y, solo_banner_y);
+}
+
+#[test]
+fn transform_tag_does_not_participate_in_collision_layout_like_libass() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\t\\1c&H00FF00&}Second").expect("script should parse");
+    let transform_only = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\t\\1c&H00FF00&}Second").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 100);
+    let solo_planes = engine.render_frame_with_provider(&transform_only, &provider, 100);
+
+    let transform_y = planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
+        .map(|plane| plane.destination.y)
+        .min()
+        .expect("transform-tag character plane");
+    let solo_transform_y = solo_planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
+        .map(|plane| plane.destination.y)
+        .min()
+        .expect("solo transform-tag character plane");
+
+    assert_eq!(transform_y, solo_transform_y);
+}
+
+#[test]
+fn origin_tag_does_not_participate_in_collision_layout_like_libass() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\org(120,0)\\1c&H00FF00&}Second").expect("script should parse");
+    let origin_only = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\org(120,0)\\1c&H00FF00&}Second").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 100);
+    let solo_planes = engine.render_frame_with_provider(&origin_only, &provider, 100);
+
+    let origin_y = planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
+        .map(|plane| plane.destination.y)
+        .min()
+        .expect("origin-tag character plane");
+    let solo_origin_y = solo_planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x00FF_0000)
+        .map(|plane| plane.destination.y)
+        .min()
+        .expect("solo origin-tag character plane");
+
+    assert_eq!(origin_y, solo_origin_y);
 }
 
 #[test]
@@ -2766,11 +4446,9 @@ fn render_frame_applies_fad_alpha() {
     let mid_planes = engine.render_frame_with_provider(&track, &provider, 500);
     let end_planes = engine.render_frame_with_provider(&track, &provider, 999);
 
-    let start_alpha = start_planes
-        .iter()
-        .map(|plane| plane.color.0 & 0xFF)
-        .max()
-        .expect("start alpha");
+    // Since libass 0.17.5, fully transparent images are omitted from the
+    // returned list rather than exposed with an alpha byte of 0xFF.
+    assert!(start_planes.is_empty());
     let mid_alpha = mid_planes
         .iter()
         .map(|plane| plane.color.0 & 0xFF)
@@ -2782,7 +4460,6 @@ fn render_frame_applies_fad_alpha() {
         .max()
         .expect("end alpha");
 
-    assert!(start_alpha > mid_alpha);
     assert!(end_alpha > mid_alpha);
 }
 
@@ -2795,11 +4472,7 @@ fn render_frame_applies_full_fade_alpha() {
     let middle_planes = engine.render_frame_with_provider(&track, &provider, 400);
     let late_planes = engine.render_frame_with_provider(&track, &provider, 850);
 
-    let start_alpha = start_planes
-        .iter()
-        .map(|plane| plane.color.0 & 0xFF)
-        .max()
-        .expect("start alpha");
+    assert!(start_planes.is_empty());
     let middle_alpha = middle_planes
         .iter()
         .map(|plane| plane.color.0 & 0xFF)
@@ -2811,9 +4484,8 @@ fn render_frame_applies_full_fade_alpha() {
         .max()
         .expect("late alpha");
 
-    assert!(start_alpha > middle_alpha);
     assert!(late_alpha > middle_alpha);
-    assert!(late_alpha < start_alpha);
+    assert!(late_alpha < 0xFF);
 }
 
 #[test]
@@ -2864,6 +4536,246 @@ fn render_frame_sweeps_karaoke_fill_during_active_span() {
         mid_planes
             .iter()
             .any(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0x6655_4400)
+    );
+}
+
+#[test]
+fn sweep_emits_both_libass_colours_at_the_exact_start_boundary() {
+    // libass anchors a \kf split at the leftmost transformed outline.  At
+    // exact progress zero the rounded edge still leaves a visible primary
+    // antialias column; the rest of the word remains secondary.  This is the
+    // boundary exercised at 2000/6000/8000/10000 ms by libass-tests v4++/kt.ass.
+    let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 100\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: D,BundledAileron,35,&HFFFFFF,&H0000FF,&H000000,&H000000,0,0,0,0,100,100,0,0,1,0,0,7,20,5,4,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,D,,0,0,0,,{\\kf100}Kara{\\kt50\\kf100}oke")
+        .expect("kt boundary fixture parses");
+    let planes = RenderEngine::new().render_frame_with_provider(
+        &track,
+        &BundledFontProvider::aileron_regular(),
+        0,
+    );
+    let character_colours = planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character)
+        .map(|plane| plane.color.0)
+        .collect::<std::collections::HashSet<_>>();
+
+    assert!(character_colours.contains(&0xFFFF_FF00));
+    assert!(character_colours.contains(&0xFF00_0000));
+}
+
+#[test]
+fn official_karaoke_runsplit_keeps_implicit_word_secondary_until_prior_word_ends() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 640\nPlayResY: 120\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,BundledAileron,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,5,0,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:50.00,Default,,0,0,0,,{\\k162}hodie{\\i1}que{\\r} |{\\k118}{\\board1\\c&HFF9920&}cael{\\b1\\u1}um{\\r} |{\\k24}est |{\\k156}{\\board1\\c&HFF9920&}candid{\\b1\\u1}um")
+        .expect("official runsplit fixture parses");
+    let engine = RenderEngine::new();
+    let provider = BundledFontProvider::aileron_regular();
+    let before_end = engine.render_frame_with_provider(&track, &provider, 3120);
+    let at_end = engine.render_frame_with_provider(&track, &provider, 4600);
+    let has_secondary = |planes: &[ImagePlane]| {
+        planes
+            .iter()
+            .any(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == 0xFF00_0000)
+    };
+
+    assert!(
+        has_secondary(&before_end),
+        "the final implicit word stays secondary during the preceding \\k156 word"
+    );
+    assert!(
+        !has_secondary(&at_end),
+        "the zero-duration implicit word switches at the preceding word's end"
+    );
+}
+
+#[test]
+fn render_frame_keeps_k0_text_in_current_karaoke_word_like_libass() {
+    // libass split_style_runs ignores effect_skip_timing and a zero
+    // effect_timing does not start a new karaoke word by itself.
+    let track = parse_script_text("[Script Info]\nPlayResX: 360\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k100}A{\\k0}BBBB{\\k50}C").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 500);
+    let color_width = |color: u32| {
+        let rects = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == color)
+            .filter_map(plane_ink_bounds)
+            .collect::<Vec<_>>();
+        let min = rects.iter().map(|rect| rect.x_min).min()?;
+        let max = rects.iter().map(|rect| rect.x_max).max()?;
+        Some(max - min)
+    };
+
+    let primary_width = color_width(0x3322_1100).expect("primary karaoke text");
+    let secondary_width = color_width(0x6655_4400).expect("upcoming karaoke text");
+    assert!(
+        primary_width > secondary_width * 2,
+        "\\k0 text should stay in the current primary karaoke word: primary={primary_width}, secondary={secondary_width}"
+    );
+}
+
+#[test]
+fn render_frame_keeps_kt_text_in_current_sweep_until_run_break_like_libass() {
+    // A \kt after text only affects the next karaoke word once a later run
+    // break occurs; it does not stop the active \K sweep for following glyphs.
+    let track = parse_script_text("[Script Info]\nPlayResX: 420\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\K100}A{\\kt50}WWWWWWWW").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let planes = engine.render_frame_with_provider(&track, &provider, 500);
+    let color_width = |color: u32| {
+        let rects = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character && plane.color.0 == color)
+            .filter_map(plane_ink_bounds)
+            .collect::<Vec<_>>();
+        let min = rects.iter().map(|rect| rect.x_min).min()?;
+        let max = rects.iter().map(|rect| rect.x_max).max()?;
+        Some(max - min)
+    };
+
+    let primary_width = color_width(0x3322_1100).expect("primary sweep text");
+    let secondary_width = color_width(0x6655_4400).expect("secondary sweep text");
+    assert!(
+        secondary_width > primary_width / 2,
+        "\\kt text should remain inside the active \\K sweep: primary={primary_width}, secondary={secondary_width}"
+    );
+}
+
+#[test]
+fn render_frame_fills_zero_and_negative_kf_at_syllable_start_like_libass() {
+    // libass ass_parse.c process_karaoke_effects marks \kf fully swept when
+    // tm_current >= tm_end.  For zero or negative durations, tm_end is not
+    // after tm_start, so the syllable is primary right at its start time.
+    let script = |tag: &str| {
+        format!(
+            "[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{{\\an7\\pos(20,20){tag}}}K"
+        )
+    };
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+
+    for tag in ["\\K0", "\\kf0", "\\K-1", "\\kf-1"] {
+        let track = parse_script_text(&script(tag)).expect("script should parse");
+        let planes = engine.render_frame_with_provider(&track, &provider, 0);
+        assert!(
+            planes
+                .iter()
+                .any(|plane| plane.kind == ass::ImageType::Character),
+            "{tag} should render a character plane"
+        );
+        assert!(
+            planes.iter().all(
+                |plane| plane.kind != ass::ImageType::Character || plane.color.0 == 0x3322_1100
+            ),
+            "{tag} should be fully primary at the syllable start"
+        );
+    }
+}
+
+#[test]
+fn render_frame_retimes_pending_karaoke_with_kt_like_libass() {
+    // libass \kt sets effect_skip_timing and clears effect_timing without
+    // clearing the active karaoke type.  When this happens before the next
+    // glyph is emitted, that glyph is a zero-duration karaoke word at the
+    // \kt timestamp.
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k10\\kt50}K").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = FontconfigProvider::new();
+    let before_start = engine.render_frame_with_provider(&track, &provider, 200);
+    let after_start = engine.render_frame_with_provider(&track, &provider, 600);
+
+    assert!(
+        before_start
+            .iter()
+            .any(|plane| plane.kind == ass::ImageType::Character),
+        "the retimed karaoke syllable should render before its start"
+    );
+    assert!(
+        before_start
+            .iter()
+            .all(|plane| plane.kind != ass::ImageType::Character || plane.color.0 == 0x6655_4400),
+        "\\kt-retimed pending karaoke stays secondary before the \\kt timestamp"
+    );
+    assert!(
+        after_start
+            .iter()
+            .all(|plane| plane.kind != ass::ImageType::Character || plane.color.0 == 0x3322_1100),
+        "\\kt-retimed pending karaoke becomes primary at the \\kt timestamp"
+    );
+}
+
+#[test]
+fn karaoke_elapsed_time_keeps_libass_long_long_range() {
+    let event = ParsedEvent {
+        start: 0,
+        duration: i64::from(i32::MAX) + 50_000,
+        ..ParsedEvent::default()
+    };
+    let now_ms = i64::from(i32::MAX) + 20_000;
+    let mut style = ParsedSpanStyle {
+        primary_colour: 0x0011_2233,
+        secondary_colour: 0x0044_5566,
+        ..ParsedSpanStyle::default()
+    };
+    let started_fill = LayoutGlyphRun {
+        karaoke: Some(ParsedKaraokeSpan {
+            start_ms: 10_000,
+            duration_ms: 10_000,
+            mode: ParsedKaraokeMode::FillSwap,
+        }),
+        ..LayoutGlyphRun::default()
+    };
+    assert_eq!(
+        resolve_run_fill_color(&started_fill, &style, Some(&event), now_ms),
+        style.primary_colour,
+        "large elapsed times stay after the \\k syllable start"
+    );
+
+    let started_outline = LayoutGlyphRun {
+        karaoke: Some(ParsedKaraokeSpan {
+            start_ms: 10_000,
+            duration_ms: 10_000,
+            mode: ParsedKaraokeMode::OutlineToggle,
+        }),
+        ..LayoutGlyphRun::default()
+    };
+    assert!(
+        !karaoke_hides_outline(&started_outline, Some(&event), now_ms),
+        "large elapsed times do not wrap into the pre-start \\ko outline state"
+    );
+
+    style.rotation_z = 0.0;
+    let started_sweep = LayoutGlyphRun {
+        karaoke: Some(ParsedKaraokeSpan {
+            start_ms: 10_000,
+            duration_ms: 10_000,
+            mode: ParsedKaraokeMode::Sweep,
+        }),
+        ..LayoutGlyphRun::default()
+    };
+    let planes = apply_karaoke_to_character_planes(
+        vec![ImagePlane {
+            size: Size {
+                width: 8,
+                height: 1,
+            },
+            stride: 8,
+            color: RgbaColor(0),
+            destination: Point { x: 0, y: 0 },
+            kind: ass::ImageType::Character,
+            bitmap: vec![255; 8],
+        }],
+        &started_sweep,
+        &style,
+        Some(&event),
+        now_ms,
+        0,
+        8,
+    );
+    assert!(
+        planes
+            .iter()
+            .all(|plane| plane.kind != ass::ImageType::Character || plane.color.0 == 0x3322_1100),
+        "large elapsed times stay after the \\kf sweep end"
     );
 }
 
@@ -2946,10 +4858,10 @@ fn render_frame_hides_outline_for_ko_until_span_ends() {
 #[test]
 fn vertical_font_raster_advances_rotate_bitmap_like_libass_vertical_faces() {
     // libass DECO_ROTATE (ass_get_glyph_outline + ass_outline_rotate_90):
-    // point (x, y) -> (offs.x + y, offs.y - x), offs = (vertAdvance +
-    // typoDescender, -typoDescender).  Without face metrics (unresolved
-    // font), typoDescender = 0 and vertAdvance falls back to the font size,
-    // so left' = fs + top - height = 50 + 9 - 3 = 56, top' = -left = -4.
+    // FreeType point (x, y) -> (offs.x + y, offs.y - x), but libass first
+    // imports the outline as (x, -y). The resulting screen bitmap is rotated
+    // counterclockwise. Without face metrics, offs=(font size, 0), so the new
+    // bearings are left'=50-9=41, top'=2-4=-2.
     let glyph = RasterGlyph {
         width: 2,
         height: 3,
@@ -2969,18 +4881,114 @@ fn vertical_font_raster_advances_rotate_bitmap_like_libass_vertical_faces() {
     };
     let font = FontMatch::unresolved("Vertical", None, FontProviderKind::Null);
 
-    let glyphs = apply_vertical_font_raster_advances(vec![glyph], &style, &font);
+    let glyph_infos = [GlyphInfo {
+        vertical_rotation_eligible: true,
+        ..GlyphInfo::default()
+    }];
+    let glyphs = apply_vertical_font_raster_advances(vec![glyph], &glyph_infos, &style, &font);
     let rotated = &glyphs[0];
 
     assert_eq!(rotated.width, 3);
     assert_eq!(rotated.height, 2);
     assert_eq!(rotated.stride, 3);
-    assert_eq!(rotated.bitmap, vec![5, 3, 1, 6, 4, 2]);
-    assert_eq!(rotated.left, 56);
-    assert_eq!(rotated.top, -4);
+    assert_eq!(rotated.bitmap, vec![2, 4, 6, 1, 3, 5]);
+    assert_eq!(rotated.left, 41);
+    assert_eq!(rotated.top, -2);
     assert_eq!(rotated.advance_x, 50);
     assert_eq!(rotated.advance_y, 0);
     assert_eq!(rotated.advance_x_26_6, 50 * 64);
+}
+
+#[test]
+fn vertical_font_mixed_run_rotates_only_eligible_glyphs() {
+    let glyph = RasterGlyph {
+        width: 2,
+        height: 3,
+        stride: 2,
+        left: 4,
+        top: 9,
+        advance_x: 7,
+        advance_x_26_6: 7 * 64,
+        bitmap: vec![1, 2, 3, 4, 5, 6],
+        ..RasterGlyph::default()
+    };
+    let glyph_infos = [
+        GlyphInfo {
+            // ASCII remains upright in a vertical face.
+            vertical_rotation_eligible: false,
+            ..GlyphInfo::default()
+        },
+        GlyphInfo {
+            // U+02F1 is libass's inclusive DECO_ROTATE lower bound.
+            vertical_rotation_eligible: true,
+            ..GlyphInfo::default()
+        },
+    ];
+    let style = ParsedSpanStyle {
+        font_name: "@Vertical".to_string(),
+        font_size: 50.0,
+        ..ParsedSpanStyle::default()
+    };
+    let font = FontMatch::unresolved("Vertical", None, FontProviderKind::Null);
+
+    let glyphs = apply_vertical_font_raster_advances(
+        vec![glyph.clone(), glyph],
+        &glyph_infos,
+        &style,
+        &font,
+    );
+
+    assert_eq!(glyphs[0].width, 2);
+    assert_eq!(glyphs[0].height, 3);
+    assert_eq!(glyphs[0].bitmap, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(glyphs[0].advance_x, 7);
+    assert_eq!(glyphs[1].width, 3);
+    assert_eq!(glyphs[1].height, 2);
+    assert_eq!(glyphs[1].bitmap, vec![2, 4, 6, 1, 3, 5]);
+    assert_eq!(glyphs[1].advance_x, 50);
+}
+
+#[test]
+fn bundled_vertical_karaoke_runs_share_one_event_rotation_pivot() {
+    // Mirrors libass-tests karaoke/216-vertical.ass with a small bundled font:
+    // U+02F1 is libass's first DECO_ROTATE codepoint. An @font rotates each
+    // eligible glyph outline, while the style's 270-degree angle turns the
+    // line advance vertical. Every karaoke syllable is a separate style run,
+    // but libass calculates one implicit pivot from the whole event bbox.
+    let track = parse_script_text("[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 320\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Vertical,@BundledAileron,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,270,1,1,0,7,100,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Vertical,,0,0,0,,{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱")
+        .expect("vertical karaoke fixture parses");
+    let engine = RenderEngine::new();
+    let planes =
+        engine.render_frame_with_provider(&track, &BundledFontProvider::aileron_regular(), 700);
+
+    let bounds = visible_bounds(&planes).expect("vertical karaoke fixture renders");
+    assert_eq!(
+        bounds,
+        Rect {
+            x_min: 58,
+            y_min: 11,
+            x_max: 78,
+            y_max: 203,
+        }
+    );
+    assert_eq!(
+        visible_kind_bounds(&planes, ass::ImageType::Outline),
+        Some(Rect {
+            x_min: 58,
+            y_min: 11,
+            x_max: 78,
+            y_max: 203,
+        })
+    );
+    assert_eq!(
+        visible_kind_bounds(&planes, ass::ImageType::Character),
+        Some(Rect {
+            x_min: 59,
+            y_min: 12,
+            x_max: 77,
+            y_max: 202,
+        })
+    );
 }
 
 #[test]
@@ -3030,6 +5038,19 @@ fn render_frame_renders_drawing_plane() {
     assert_eq!(plane.destination.x, 10);
     assert_eq!(plane.destination.y, 10);
     assert!(plane.bitmap.contains(&255));
+}
+
+#[test]
+fn render_frame_collapses_drawing_when_scale_base_is_nonpositive_like_libass() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(10,10)\\p32}m 0 0 l 64 0 64 64 0 64").expect("script should parse");
+    let engine = RenderEngine::new();
+    let provider = NullFontProvider;
+    let planes = engine.render_frame_with_provider(&track, &provider, 500);
+
+    assert!(
+        planes.is_empty(),
+        "libass lshiftwrapi makes \\p32 collapse to a zero-scale drawing"
+    );
 }
 
 #[test]

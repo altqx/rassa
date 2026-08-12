@@ -76,7 +76,10 @@ target/x86_64-pc-windows-gnu/release/ass.dll
 target/wasm32-unknown-unknown/release/ass.wasm
 ```
 
-The compatibility crate sets the ELF SONAME to `libass.so` only on ELF targets, so Windows DLL, Darwin dylib/check, and WebAssembly builds do not receive ELF-only linker flags.
+The compatibility crate sets the ELF SONAME to upstream's ABI name
+`libass.so.9` and emits a `libass.so.9` link next to `libass.so`. Windows DLL,
+Darwin dylib/check, and WebAssembly builds do not receive ELF-only linker
+flags.
 
 Build the checker utility and C ABI crates used during development:
 
@@ -204,7 +207,10 @@ cc /tmp/rassa-smoke.c -Iinclude -Ltarget/release -lass -Wl,-rpath,"$PWD/target/r
 For consumers that currently link against libass:
 
 1. Build `rassa-libass-capi` in release mode.
-2. Put `target/release/libass.so` in the runtime library search path used by your application.
+2. Put `target/release/libass.so` and its generated ABI-name link
+   `target/release/libass.so.9` in the runtime library search path used by your
+   application. The shared object advertises SONAME `libass.so.9`, matching
+   upstream libass for prebuilt consumers.
 3. Put `include/` in the C/C++ compiler include path.
 4. Put `pkgconfig/` in `PKG_CONFIG_PATH` if your build uses `pkg-config --libs libass`.
 5. Rebuild your downstream application and run its subtitle-rendering tests.
@@ -374,31 +380,69 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release -p rassa-check -p rassa -p rassa-libass-capi
 ```
 
-Broad corpus pixel-diff report (runs all generated upstream frames and logs mismatches without treating known parity gaps as a master-branch failure):
+Non-pixel compatibility gates use pinned upstream revisions and fail on API or
+memory/layout invariants, not raster differences. Verify that the public C
+headers structurally match libass master `3087d2b2ffda76602a17f9b09d25cb8addc8d313`
+and that all declared `ass_*` functions are exported:
 
 ```sh
-cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture
+scripts/check-libass-public-api.sh
 ```
 
-Opt-in strict broad corpus gate for renderer-parity work where the references are expected to be pixel-perfect:
+Reuse an existing checkout with `RASSA_LIBASS_UPSTREAM=/path/to/libass`, or set
+`RASSA_LIBASS_COMMIT` when intentionally updating the pin. The checker clones
+the pinned revision into a temporary directory when no checkout is supplied.
+
+Run the deterministic ASS corpus gate, based on libass `fuzz/fuzz.c`.
+It parses the complete pinned libass-tests crash and regression corpus at commit
+`9498737388cbd78cbab6b703821adc213a335995`, renders every event at Start,
+midpoint, and End-1, and checks dimensions, stride, allocation length, and
+frame clipping:
 
 ```sh
-RASSA_STRICT_BROAD_PIXEL_DIFF=1 \
-  cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture
+scripts/run-hostile-corpus.sh
 ```
 
-Dump actual/target compare PNGs for debugging:
+Use `RASSA_LIBASS_TESTS_DIR=/path/to/libass-tests` to reuse the exact pinned
+checkout. Arbitrary local files or directories can also be checked directly:
 
 ```sh
-RASSA_DUMP_COMPARE=/tmp/rassa-compare-dump \
-  cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture
+cargo run --release -p rassa-test --bin rassa-corpus-check -- path/to/corpus
 ```
 
-Filter the broad corpus by fixture name:
+Run the pinned official semantic differential against current libass master and
+the compatible libass-tests corpus:
 
 ```sh
-RASSA_BROAD_FILTER=broad_box RASSA_STRICT_BROAD_PIXEL_DIFF=1 \
-  cargo test -p rassa-test upstream_generated_broad_corpus_pixel_diff_report -- --ignored --nocapture
+scripts/e2e-libass-semantic.sh
+```
+
+The script clones and builds the pinned revisions when local checkouts are not
+provided. Reuse existing checkouts with:
+
+```sh
+RASSA_LIBASS_TESTS_DIR=/path/to/libass-tests \
+RASSA_LIBASS_BUILD_DIR=/path/to/libass-build/libass \
+  scripts/e2e-libass-semantic.sh
+```
+
+This deliberately does not require pixel equality: Rassa has its own
+rasterizer. It compares track/event timing, visibility, image kind and colour
+sets, stable image-kind ordering, and per-kind visible geometry with a
+documented 3% axis tolerance for raster support differences. Filter to a
+fixture family or produce a diagnostic-only report with:
+
+```sh
+RASSA_LIBASS_TEST_FILTER=karaoke/ \
+RASSA_LIBASS_REPORT_ONLY=1 \
+  scripts/e2e-libass-semantic.sh
+```
+
+Exercise the WebAssembly C message-callback ABI, including the C `va_list`
+bridge and a real indirect callback under Node:
+
+```sh
+scripts/e2e-wasm-message-callback.sh
 ```
 
 ## Contributing

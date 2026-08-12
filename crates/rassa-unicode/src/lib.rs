@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use rassa_core::RassaResult;
 use rassa_unibreak::{BreakAnalysis, LineBreakOpportunity, WordBreakOpportunity, analyze_breaks};
-use unicode_bidi::{BidiClass, BidiInfo};
+use unicode_bidi::{BidiClass, BidiDataSource, BidiInfo, HardcodedBidiData};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BidiDirection {
@@ -57,8 +57,21 @@ impl UnicodePipeline {
         language: Option<&str>,
         base_direction: BidiDirection,
     ) -> RassaResult<UnicodeAnalysis> {
+        self.analyze_text_with_base_and_brackets(text, language, base_direction, true)
+    }
+
+    /// Analyze text while allowing ASS's optional paired-bracket extension to
+    /// be selected independently from the rest of Unicode bidi processing.
+    pub fn analyze_text_with_base_and_brackets(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        base_direction: BidiDirection,
+        bidi_brackets: bool,
+    ) -> RassaResult<UnicodeAnalysis> {
         let break_analysis = analyze_breaks(text, language)?;
-        let bidi_analysis = analyze_bidi_with_base(text, base_direction)?;
+        let bidi_analysis =
+            analyze_bidi_with_base_and_brackets(text, base_direction, bidi_brackets)?;
         let segments = segment_by_mandatory_breaks(text, &break_analysis);
 
         Ok(UnicodeAnalysis {
@@ -86,20 +99,62 @@ pub fn analyze_bidi_with_base(
     text: &str,
     base_direction: BidiDirection,
 ) -> RassaResult<BidiAnalysis> {
+    analyze_bidi_with_base_and_brackets(text, base_direction, true)
+}
+
+pub fn analyze_bidi_with_base_and_brackets(
+    text: &str,
+    base_direction: BidiDirection,
+    bidi_brackets: bool,
+) -> RassaResult<BidiAnalysis> {
     if text.is_empty() {
         return Ok(BidiAnalysis::default());
     }
 
-    Ok(analyze_bidi_with_unicode_bidi(text, base_direction))
+    Ok(analyze_bidi_with_unicode_bidi(
+        text,
+        base_direction,
+        bidi_brackets,
+    ))
 }
 
-fn analyze_bidi_with_unicode_bidi(text: &str, base_direction: BidiDirection) -> BidiAnalysis {
+#[derive(Clone, Copy)]
+struct AssBidiData {
+    match_brackets: bool,
+}
+
+impl BidiDataSource for AssBidiData {
+    fn bidi_class(&self, character: char) -> BidiClass {
+        unicode_bidi::bidi_class(character)
+    }
+
+    fn bidi_matched_opening_bracket(
+        &self,
+        character: char,
+    ) -> Option<unicode_bidi::data_source::BidiMatchedOpeningBracket> {
+        self.match_brackets
+            .then(|| HardcodedBidiData.bidi_matched_opening_bracket(character))
+            .flatten()
+    }
+}
+
+fn analyze_bidi_with_unicode_bidi(
+    text: &str,
+    base_direction: BidiDirection,
+    bidi_brackets: bool,
+) -> BidiAnalysis {
     let base_level = match base_direction {
         BidiDirection::LeftToRight => Some(unicode_bidi::Level::ltr()),
         BidiDirection::RightToLeft => Some(unicode_bidi::Level::rtl()),
         _ => None,
     };
-    let bidi_info = BidiInfo::new(text, base_level);
+    let bidi_info = BidiInfo::new_with_data_source(
+        &AssBidiData {
+            match_brackets: bidi_brackets,
+        },
+        text,
+        base_level,
+    );
     let Some(paragraph) = bidi_info.paragraphs.first() else {
         return BidiAnalysis::default();
     };
@@ -224,7 +279,7 @@ mod tests {
 
     #[test]
     fn bidi_fallback_reorders_rtl_runs() {
-        let analysis = analyze_bidi_with_unicode_bidi("abc אבג", BidiDirection::Neutral);
+        let analysis = analyze_bidi_with_unicode_bidi("abc אבג", BidiDirection::Neutral, true);
 
         assert_eq!(analysis.direction, BidiDirection::LeftToRight);
         assert_eq!(analysis.visual_text, "abc גבא");
@@ -234,7 +289,7 @@ mod tests {
 
     #[test]
     fn bidi_fallback_detects_rtl_paragraph_direction() {
-        let analysis = analyze_bidi_with_unicode_bidi("אבג abc", BidiDirection::Neutral);
+        let analysis = analyze_bidi_with_unicode_bidi("אבג abc", BidiDirection::Neutral, true);
 
         assert_eq!(analysis.direction, BidiDirection::RightToLeft);
         assert_ne!(analysis.visual_text, "אבג abc");
@@ -243,6 +298,31 @@ mod tests {
                 .embedding_levels
                 .iter()
                 .any(|level| *level % 2 == 1)
+        );
+    }
+
+    #[test]
+    fn bidi_bracket_feature_changes_paired_neutral_resolution() {
+        let candidates = [
+            "a(א)b",
+            "א(a)ב",
+            "a א(b)c",
+            "א a(ב)c",
+            "a [א] ב",
+            "א [a] b",
+            "a (א 1) b",
+            "א (a 1) ב",
+        ];
+        let differing = candidates.into_iter().find(|text| {
+            let disabled = analyze_bidi_with_unicode_bidi(text, BidiDirection::Neutral, false);
+            let enabled = analyze_bidi_with_unicode_bidi(text, BidiDirection::Neutral, true);
+            disabled.embedding_levels != enabled.embedding_levels
+                || disabled.visual_to_logical != enabled.visual_to_logical
+        });
+
+        assert!(
+            differing.is_some(),
+            "paired-bracket data must affect at least one mixed-direction case"
         );
     }
 }

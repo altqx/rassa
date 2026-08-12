@@ -14,9 +14,8 @@ pub fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {
 pub(crate) fn output_scale_x(track: &ParsedTrack, config: &RendererConfig) -> f64 {
     let frame_width = output_mapping_size(track, config).width;
     let base_width = track.play_res_x.max(1);
-    let aspect = effective_pixel_aspect(track, config);
 
-    f64::from(frame_width.max(1)) / f64::from(base_width) * aspect
+    f64::from(frame_width.max(1)) / f64::from(base_width)
 }
 
 pub(crate) fn output_scale_y(track: &ParsedTrack, config: &RendererConfig) -> f64 {
@@ -27,13 +26,17 @@ pub(crate) fn output_scale_y(track: &ParsedTrack, config: &RendererConfig) -> f6
 }
 
 pub(crate) fn effective_pixel_aspect(track: &ParsedTrack, config: &RendererConfig) -> f64 {
-    if layout_resolution(track).is_some()
-        || !(config.pixel_aspect.is_finite() && config.pixel_aspect > 0.0)
-    {
+    // libass always derives PAR from LayoutRes when both dimensions are
+    // present; LayoutRes explicitly overrides ass_set_storage_size and an
+    // explicit ass_set_pixel_aspect value. Without LayoutRes, a positive
+    // explicit PAR wins and storage is only used when PAR is unset (zero).
+    if layout_resolution(track).is_some() {
         return derived_pixel_aspect(track, config).unwrap_or(1.0);
     }
-
-    config.pixel_aspect
+    if config.pixel_aspect.is_finite() && config.pixel_aspect > 0.0 {
+        return config.pixel_aspect;
+    }
+    derived_pixel_aspect(track, config).unwrap_or(1.0)
 }
 
 pub(crate) fn derived_pixel_aspect(track: &ParsedTrack, config: &RendererConfig) -> Option<f64> {
@@ -81,6 +84,67 @@ pub(crate) fn output_mapping_size(track: &ParsedTrack, config: &RendererConfig) 
     // libass screen_scale always maps PlayRes onto the content frame (frame
     // minus margins); use_margins only changes where events are anchored.
     frame_content_size(track, config)
+}
+
+/// Resolution used by libass for blur and for unscaled borders/shadows.
+/// Unlike text placement, an explicit pixel aspect can synthesize one axis
+/// when neither LayoutRes nor a storage size was supplied.
+pub(crate) fn filter_layout_resolution(track: &ParsedTrack, config: &RendererConfig) -> Size {
+    if let Some(layout) = layout_resolution(track).or_else(|| storage_resolution(config)) {
+        return layout;
+    }
+
+    let frame = frame_content_size(track, config);
+    let par = config.pixel_aspect;
+    if !par.is_finite()
+        || par <= 0.0
+        || (par - 1.0).abs() < f64::EPSILON
+        || frame.width <= 0
+        || frame.height <= 0
+    {
+        return Size {
+            width: track.play_res_x.max(1),
+            height: track.play_res_y.max(1),
+        };
+    }
+
+    if par > 1.0 {
+        Size {
+            width: (f64::from(track.play_res_y.max(1)) * f64::from(frame.width)
+                / f64::from(frame.height)
+                / par)
+                .round()
+                .max(1.0) as i32,
+            height: track.play_res_y.max(1),
+        }
+    } else {
+        Size {
+            width: track.play_res_x.max(1),
+            height: (f64::from(track.play_res_x.max(1)) * f64::from(frame.height)
+                / f64::from(frame.width)
+                * par)
+                .round()
+                .max(1.0) as i32,
+        }
+    }
+}
+
+pub(crate) fn renderer_blur_scales(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    font_scale: f64,
+) -> (f64, f64) {
+    let frame = frame_content_size(track, config);
+    let layout = filter_layout_resolution(track, config);
+    let font_scale = if font_scale.is_finite() {
+        font_scale.max(0.0)
+    } else {
+        1.0
+    };
+    (
+        style_scale(f64::from(frame.width.max(1)) / f64::from(layout.width.max(1))) * font_scale,
+        style_scale(f64::from(frame.height.max(1)) / f64::from(layout.height.max(1))) * font_scale,
+    )
 }
 
 pub(crate) fn frame_size(track: &ParsedTrack, config: &RendererConfig) -> Size {

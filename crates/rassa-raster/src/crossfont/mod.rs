@@ -5,6 +5,7 @@
 //! FreeType is used everywhere else.
 
 #![allow(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
+#![allow(unknown_lints)]
 #![allow(mismatched_lifetime_syntaxes, unsafe_op_in_unsafe_fn, unused_imports)]
 
 use std::fmt::{self, Display, Formatter};

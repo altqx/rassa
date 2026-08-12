@@ -1,14 +1,30 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
-    fs,
+    fmt, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
-static FONT_CHAR_SUPPORT_CACHE: OnceLock<Mutex<HashMap<(PathBuf, char), bool>>> = OnceLock::new();
+mod legacy_arabic_charmap;
+mod legacy_charmap;
 
-fn font_char_support_cache() -> &'static Mutex<HashMap<(PathBuf, char), bool>> {
+pub use legacy_charmap::{
+    FontCharmap, font_data_glyph_index, font_face_charmap, font_face_glyph_index,
+    font_face_uses_legacy_charmap,
+};
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum FontFaceScope {
+    Any,
+    Face(u32),
+}
+
+type FontCharSupportCache = HashMap<(PathBuf, FontFaceScope, char), bool>;
+
+static FONT_CHAR_SUPPORT_CACHE: OnceLock<Mutex<FontCharSupportCache>> = OnceLock::new();
+
+fn font_char_support_cache() -> &'static Mutex<FontCharSupportCache> {
     FONT_CHAR_SUPPORT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -48,7 +64,7 @@ impl FontQuery {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub enum FontProviderKind {
     #[default]
     Null,
@@ -121,6 +137,7 @@ impl FontProvider for NullFontProvider {
 
 pub struct CrossfontProvider {
     fallback_family: Option<String>,
+    config_path: Option<PathBuf>,
     resolve_cache: Mutex<HashMap<FontResolveKey, FontMatch>>,
 }
 
@@ -153,6 +170,7 @@ impl CrossfontProvider {
     pub fn new() -> Self {
         Self {
             fallback_family: Some("Arial".to_string()),
+            config_path: None,
             resolve_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -160,6 +178,33 @@ impl CrossfontProvider {
     pub fn with_fallback_family(fallback_family: impl Into<String>) -> Self {
         Self {
             fallback_family: Some(fallback_family.into()),
+            config_path: None,
+            resolve_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Use a specific fontconfig configuration for `fc-match` queries.
+    ///
+    /// This backend delegates configuration parsing and matching to the host's
+    /// `fc-match` executable instead of owning an `FcConfig`. Cache rebuilding
+    /// and in-process fontconfig database enumeration are therefore unavailable;
+    /// if the command/configuration fails, the provider falls back to fontdb's
+    /// platform system-font database.
+    pub fn with_config(config_path: impl Into<PathBuf>) -> Self {
+        Self {
+            fallback_family: Some("Arial".to_string()),
+            config_path: Some(config_path.into()),
+            resolve_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_config_and_fallback_family(
+        config_path: impl Into<PathBuf>,
+        fallback_family: impl Into<String>,
+    ) -> Self {
+        Self {
+            fallback_family: Some(fallback_family.into()),
+            config_path: Some(config_path.into()),
             resolve_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -179,25 +224,29 @@ impl CrossfontProvider {
         style: Option<String>,
         weight: Option<i32>,
     ) -> Option<FontMatch> {
-        resolve_system_font(&family, style.as_deref(), weight).map(
-            |(resolved_family, resolved_path, face_index)| {
-                let resolved_style = resolved_path
-                    .as_deref()
-                    .and_then(|path| load_face_metadata(path).and_then(|(_, style)| style));
-                let (synthetic_bold, synthetic_italic) =
-                    synthetic_style_flags(style.as_deref(), weight, resolved_style.as_deref());
-
-                FontMatch {
-                    family: resolved_family,
-                    path: resolved_path,
-                    face_index,
-                    style,
-                    synthetic_bold,
-                    synthetic_italic,
-                    provider: FontProviderKind::Fontconfig,
-                }
-            },
+        resolve_system_font(
+            &family,
+            style.as_deref(),
+            weight,
+            self.config_path.as_deref(),
         )
+        .map(|(resolved_family, resolved_path, face_index)| {
+            let resolved_style = resolved_path
+                .as_deref()
+                .and_then(|path| load_face_metadata(path).and_then(|(_, style)| style));
+            let (synthetic_bold, synthetic_italic) =
+                synthetic_style_flags(style.as_deref(), weight, resolved_style.as_deref());
+
+            FontMatch {
+                family: resolved_family,
+                path: resolved_path,
+                face_index,
+                style,
+                synthetic_bold,
+                synthetic_italic,
+                provider: FontProviderKind::Fontconfig,
+            }
+        })
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -207,6 +256,7 @@ impl CrossfontProvider {
         _style: Option<String>,
         _weight: Option<i32>,
     ) -> Option<FontMatch> {
+        let _ = &self.config_path;
         None
     }
 }
@@ -258,16 +308,22 @@ fn resolve_system_font(
     family: &str,
     style: Option<&str>,
     weight: Option<i32>,
+    config_path: Option<&Path>,
 ) -> Option<(String, Option<PathBuf>, Option<u32>)> {
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = config_path;
+
     let mut database = Database::new();
     database.load_system_fonts();
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some((path, face_index)) = fontconfig_match_path(family, style, weight, None) {
+    if let Some((path, face_index)) =
+        fontconfig_match_path(family, style, weight, None, config_path)
+    {
         let resolved_family = load_face_metadata(&path)
             .map(|(family, _)| family)
             .unwrap_or_else(|| family.to_owned());
-        if fontconfig_match_is_acceptable(family, &resolved_family) {
+        if config_path.is_some() || fontconfig_match_is_acceptable(family, &resolved_family) {
             return Some((resolved_family, Some(path), face_index));
         }
     }
@@ -348,8 +404,8 @@ pub fn resolve_system_font_for_char(
     style: Option<&str>,
     character: char,
 ) -> Option<(String, Option<PathBuf>, Option<u32>)> {
-    let (path, face_index) = fontconfig_match_path(family, style, None, Some(character))?;
-    if !font_file_supports_char(&path, character) {
+    let (path, face_index) = fontconfig_match_path(family, style, None, Some(character), None)?;
+    if !font_file_face_supports_char(&path, face_index.unwrap_or(0), character) {
         return None;
     }
     let resolved_family = load_face_metadata(&path)
@@ -373,11 +429,22 @@ pub fn font_match_supports_text(font: &FontMatch, text: &str) -> bool {
     };
     text.chars()
         .filter(|character| !character.is_whitespace() && !character.is_control())
-        .all(|character| font_file_supports_char(path, character))
+        .all(|character| {
+            font_file_face_supports_char(path, font.face_index.unwrap_or(0), character)
+        })
 }
 
 pub fn font_file_supports_char(path: &Path, character: char) -> bool {
-    let cache_key = (path.to_path_buf(), character);
+    font_file_supports_char_in_scope(path, FontFaceScope::Any, character)
+}
+
+/// Check character coverage in one exact face of a font or collection.
+pub fn font_file_face_supports_char(path: &Path, face_index: u32, character: char) -> bool {
+    font_file_supports_char_in_scope(path, FontFaceScope::Face(face_index), character)
+}
+
+fn font_file_supports_char_in_scope(path: &Path, scope: FontFaceScope, character: char) -> bool {
+    let cache_key = (path.to_path_buf(), scope, character);
     if let Some(supports_char) = font_char_support_cache()
         .lock()
         .expect("font char support cache mutex poisoned")
@@ -387,7 +454,7 @@ pub fn font_file_supports_char(path: &Path, character: char) -> bool {
         return supports_char;
     }
 
-    let supports_char = font_file_supports_char_uncached(path, character);
+    let supports_char = font_file_supports_char_uncached(path, scope, character);
     font_char_support_cache()
         .lock()
         .expect("font char support cache mutex poisoned")
@@ -395,17 +462,21 @@ pub fn font_file_supports_char(path: &Path, character: char) -> bool {
     supports_char
 }
 
-fn font_file_supports_char_uncached(path: &Path, character: char) -> bool {
+fn font_file_supports_char_uncached(path: &Path, scope: FontFaceScope, character: char) -> bool {
     let Ok(data) = fs::read(path) else {
         return false;
     };
-    let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
-    (0..face_count).any(|index| {
-        ttf_parser::Face::parse(&data, index)
-            .ok()
-            .and_then(|face| face.glyph_index(character))
-            .is_some_and(|glyph| glyph.0 != 0)
-    })
+    match scope {
+        FontFaceScope::Any => {
+            let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
+            (0..face_count).any(|index| {
+                font_data_glyph_index(&data, index, character).is_some_and(|glyph| glyph.0 != 0)
+            })
+        }
+        FontFaceScope::Face(index) => {
+            font_data_glyph_index(&data, index, character).is_some_and(|glyph| glyph.0 != 0)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -432,6 +503,7 @@ fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn fontconfig_match_is_acceptable(requested_family: &str, resolved_family: &str) -> bool {
     let requested = normalize_font_key(requested_family);
     let resolved = normalize_font_key(resolved_family);
@@ -460,12 +532,15 @@ fn fontconfig_match_path(
     style: Option<&str>,
     weight: Option<i32>,
     character: Option<char>,
+    config_path: Option<&Path>,
 ) -> Option<(PathBuf, Option<u32>)> {
     let pattern = fontconfig_pattern(family, style, weight, character);
-    let output = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}\n%{index}", &pattern])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("fc-match");
+    command.args(["-f", "%{file}\n%{index}", &pattern]);
+    if let Some(config_path) = config_path {
+        command.env("FONTCONFIG_FILE", config_path);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
@@ -477,6 +552,34 @@ fn fontconfig_match_path(
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|index| *index > 0);
     path.exists().then_some((path, face_index))
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+pub fn validate_fontconfig_config(config_path: impl AsRef<Path>) -> Result<(), String> {
+    let output = std::process::Command::new("fc-match")
+        .env("FONTCONFIG_FILE", config_path.as_ref())
+        .args(["-f", "%{file}", "sans"])
+        .output()
+        .map_err(|error| format!("unable to run fc-match: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("fc-match exited with {}", output.status)
+        } else {
+            error
+        });
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err("fontconfig did not return a usable font path".to_string())
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"), not(target_arch = "wasm32"))))]
+pub fn validate_fontconfig_config(_config_path: impl AsRef<Path>) -> Result<(), String> {
+    Err("custom fontconfig configurations are unavailable on this target".to_string())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -607,6 +710,165 @@ impl FontProvider for AttachedFontProvider {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryFontRecord {
+    family: String,
+    path: PathBuf,
+    face_index: Option<u32>,
+    style: Option<String>,
+    aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontDirectoryIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl fmt::Display for FontDirectoryIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.message)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectoryFontProvider {
+    fonts: Vec<DirectoryFontRecord>,
+}
+
+impl DirectoryFontProvider {
+    /// Scan the immediate children of a libass additional-font directory.
+    /// Hidden entries and subdirectories are ignored, matching libass. Files
+    /// are accepted by their contents rather than their extension.
+    pub fn scan(directory: impl AsRef<Path>) -> (Self, Vec<FontDirectoryIssue>) {
+        let directory = directory.as_ref();
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return (
+                    Self::default(),
+                    vec![FontDirectoryIssue {
+                        path: directory.to_path_buf(),
+                        message: format!("unable to read font directory: {error}"),
+                    }],
+                );
+            }
+        };
+
+        let mut fonts = Vec::new();
+        let mut issues = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    issues.push(FontDirectoryIssue {
+                        path: directory.to_path_buf(),
+                        message: format!("unable to read directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(error) => {
+                    issues.push(FontDirectoryIssue {
+                        path,
+                        message: format!("unable to read font file: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let records = directory_font_records(&path, &data);
+            if records.is_empty() {
+                issues.push(FontDirectoryIssue {
+                    path,
+                    message: "not a usable OpenType font".to_string(),
+                });
+            } else {
+                fonts.extend(records);
+            }
+        }
+
+        (Self { fonts }, issues)
+    }
+}
+
+impl FontProvider for DirectoryFontProvider {
+    fn resolve(&self, query: &FontQuery) -> FontMatch {
+        let family_key = normalize_font_key(&query.family);
+        let style_key = query.style.as_deref().map(normalize_font_key);
+        let exact = self.fonts.iter().find(|font| {
+            font.aliases.iter().any(|alias| alias == &family_key)
+                && style_key.as_ref().is_none_or(|style| {
+                    font.style.as_deref().map(normalize_font_key).as_ref() == Some(style)
+                })
+        });
+        let fallback = self
+            .fonts
+            .iter()
+            .find(|font| font.aliases.iter().any(|alias| alias == &family_key));
+
+        if let Some(font) = exact.or(fallback) {
+            let (synthetic_bold, synthetic_italic) =
+                synthetic_style_flags(query.style.as_deref(), query.weight, font.style.as_deref());
+            return FontMatch {
+                family: font.family.clone(),
+                path: Some(font.path.clone()),
+                face_index: font.face_index,
+                style: font.style.clone(),
+                synthetic_bold,
+                synthetic_italic,
+                provider: FontProviderKind::Attached,
+            };
+        }
+
+        FontMatch::unresolved(
+            query.family.clone(),
+            query.style.clone(),
+            FontProviderKind::Attached,
+        )
+    }
+}
+
+fn directory_font_records(path: &Path, data: &[u8]) -> Vec<DirectoryFontRecord> {
+    let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let file_stem = path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned());
+    (0..face_count)
+        .filter_map(|index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let family = font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+                .or_else(|| font_name(&face, ttf_parser::name_id::FAMILY))?;
+            let style = font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
+                .or_else(|| font_name(&face, ttf_parser::name_id::SUBFAMILY));
+            let mut aliases = vec![normalize_font_key(&family)];
+            aliases.extend(file_stem.as_deref().map(normalize_font_key));
+            aliases.extend(file_name.as_deref().map(normalize_font_key));
+            aliases.sort();
+            aliases.dedup();
+            Some(DirectoryFontRecord {
+                family,
+                path: path.to_path_buf(),
+                face_index: Some(index).filter(|index| *index > 0),
+                style,
+                aliases,
+            })
+        })
+        .collect()
+}
+
 pub struct MergedFontProvider<P, S> {
     primary: P,
     secondary: S,
@@ -684,6 +946,7 @@ fn synthetic_style_flags(
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_weight(weight: i32) -> i32 {
     weight.clamp(1, 1000)
 }
@@ -752,11 +1015,32 @@ fn load_face_metadata(path: &Path) -> Option<(String, Option<String>)> {
 }
 
 fn font_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
-    face.names()
+    // libass treats every Microsoft SFNT name as UTF-16BE, even when the
+    // encoding id names a legacy cmap. Some old Japanese fonts correctly
+    // store UTF-16BE family names under Windows encoding 2; ttf-parser's
+    // `is_unicode` intentionally excludes those, which used to make the font
+    // directory scanner reject the face before its legacy cmap could be used.
+    let windows_name = face
+        .names()
         .into_iter()
-        .find(|name| name.name_id == name_id && name.is_unicode())
-        .and_then(|name| name.to_string())
-        .filter(|name| !name.is_empty())
+        .find(|name| name.name_id == name_id && name.platform_id == ttf_parser::PlatformId::Windows)
+        .and_then(|name| {
+            (name.name.len() % 2 == 0).then(|| {
+                name.name
+                    .chunks_exact(2)
+                    .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .and_then(|units| String::from_utf16(&units).ok())
+        .filter(|name| !name.is_empty());
+    windows_name.or_else(|| {
+        face.names()
+            .into_iter()
+            .find(|name| name.name_id == name_id && name.is_unicode())
+            .and_then(|name| name.to_string())
+            .filter(|name| !name.is_empty())
+    })
 }
 
 fn attachment_file_stem(attachment: &FontAttachment) -> Option<String> {
@@ -791,6 +1075,14 @@ fn normalize_font_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rassa-{label}-{}-{nonce}", std::process::id()))
+    }
 
     #[test]
     fn null_provider_returns_unresolved_match() {
@@ -944,6 +1236,87 @@ mod tests {
                 .as_ref()
                 .is_some_and(|materialized| materialized.exists())
         );
+    }
+
+    #[test]
+    fn directory_provider_indexes_only_usable_non_hidden_fonts() {
+        let system = FontconfigProvider::new().resolve(&FontQuery::new("sans"));
+        let source = system.path.expect("system font path should exist");
+        let directory = unique_test_directory("font-directory");
+        fs::create_dir_all(&directory).expect("font directory should be creatable");
+        let copied = directory.join("fixture-without-extension");
+        fs::copy(&source, &copied).expect("font fixture should copy");
+        fs::write(directory.join("not-a-font.txt"), b"not a font")
+            .expect("invalid fixture should write");
+        fs::write(directory.join(".hidden-invalid"), b"not a font")
+            .expect("hidden fixture should write");
+
+        let (provider, issues) = DirectoryFontProvider::scan(&directory);
+        let result = provider.resolve(&FontQuery::new(&system.family));
+
+        assert_eq!(result.provider, FontProviderKind::Attached);
+        assert_eq!(result.path, Some(copied));
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].path.ends_with("not-a-font.txt"));
+        fs::remove_dir_all(&directory).expect("font fixture should clean up");
+    }
+
+    #[test]
+    fn directory_provider_decodes_legacy_windows_family_names_as_utf16be() {
+        let source =
+            Path::new("/tmp/rassa-libass-tests/regression/.fonts/shiftjis_Reishoreiryu.ttf");
+        if !source.is_file() {
+            eprintln!("skipping: compatible_0.17.5 Shift-JIS fixture is unavailable");
+            return;
+        }
+        let directory = unique_test_directory("legacy-windows-name");
+        fs::create_dir_all(&directory).expect("font directory should be creatable");
+        let copied = directory.join("shiftjis.ttf");
+        fs::copy(source, &copied).expect("legacy font fixture should copy");
+
+        let (provider, issues) = DirectoryFontProvider::scan(&directory);
+        let result = provider.resolve(&FontQuery::new("麗流隷書"));
+
+        assert!(
+            issues.is_empty(),
+            "legacy face should be usable: {issues:?}"
+        );
+        assert_eq!(result.path, Some(copied));
+        fs::remove_dir_all(&directory).expect("font fixture should clean up");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn fontconfig_provider_scopes_queries_to_custom_config() {
+        let system = FontconfigProvider::new().resolve(&FontQuery::new("sans"));
+        let source = system.path.expect("system font path should exist");
+        let directory = unique_test_directory("fontconfig");
+        let font_directory = directory.join("fonts");
+        fs::create_dir_all(&font_directory).expect("font directory should be creatable");
+        let copied = font_directory.join("configured-font.ttf");
+        fs::copy(&source, &copied).expect("font fixture should copy");
+        let config = directory.join("fonts.conf");
+        fs::write(
+            &config,
+            format!(
+                "<?xml version=\"1.0\"?><!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\"><fontconfig><dir>{}</dir></fontconfig>",
+                font_directory.display()
+            ),
+        )
+        .expect("fontconfig fixture should write");
+
+        validate_fontconfig_config(&config).expect("custom fontconfig should be usable");
+        let provider = FontconfigProvider::with_config(config.clone());
+        let result = provider.resolve(&FontQuery::new(&system.family));
+
+        assert_eq!(
+            result
+                .path
+                .as_deref()
+                .and_then(|path| path.canonicalize().ok()),
+            copied.canonicalize().ok()
+        );
+        fs::remove_dir_all(&directory).expect("fontconfig fixture should clean up");
     }
 
     #[test]
