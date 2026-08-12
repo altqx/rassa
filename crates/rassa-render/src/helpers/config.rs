@@ -173,6 +173,53 @@ pub(crate) fn renderer_projection_scale_y(
     style_scale(font_screen_height / f64::from(layout.height.max(1))) * font_scale
 }
 
+/// Scales used by libass's pre-render line-breaking pass.
+///
+/// Font glyph bboxes and advances are in device pixels after applying the
+/// vertical font-screen scale.  Drawings instead use the horizontal screen
+/// scale divided by PAR.  The margin span is measured with x2scr, which uses
+/// the same horizontal/PAR mapping and, for non-explicit events with margins
+/// enabled, the aspect-fitted screen.
+pub(crate) fn renderer_wrap_scales(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    explicit: bool,
+) -> LayoutWrapScales {
+    let mapping = event_mapping(track, config, explicit);
+    let par = style_scale(effective_pixel_aspect(track, config));
+    let font_scale = renderer_font_scale_for_event(config, explicit);
+    let font_scale = if font_scale.is_finite() {
+        font_scale.max(0.0)
+    } else {
+        1.0
+    };
+    let text_screen_height = if !explicit && mapping.use_margins {
+        mapping.fit_h
+    } else {
+        f64::from(frame_content_size(track, config).height.max(1))
+    };
+    let horizontal_screen_width = if !explicit && mapping.use_margins {
+        mapping.fit_w
+    } else {
+        f64::from(frame_content_size(track, config).width.max(1))
+    };
+    LayoutWrapScales {
+        text: style_scale(text_screen_height / f64::from(track.play_res_y.max(1))) * font_scale,
+        spacing: style_scale(horizontal_screen_width / f64::from(track.play_res_x.max(1)) / par)
+            * font_scale,
+        drawing: style_scale(horizontal_screen_width / f64::from(track.play_res_x.max(1)) / par)
+            * font_scale,
+        available_width: style_scale(
+            horizontal_screen_width / f64::from(track.play_res_x.max(1)) / par,
+        ),
+        available_width_extra: if !explicit && mapping.use_margins {
+            (mapping.frame_w - mapping.fit_w).max(0.0)
+        } else {
+            0.0
+        },
+    }
+}
+
 pub(crate) fn frame_size(track: &ParsedTrack, config: &RendererConfig) -> Size {
     Size {
         width: if config.frame.width > 0 {
@@ -310,5 +357,84 @@ pub(crate) fn event_mapping(
         fit_h,
         play_res_x: f64::from(track.play_res_x.max(1)),
         play_res_y: f64::from(track.play_res_y.max(1)),
+    }
+}
+
+#[cfg(test)]
+mod wrap_scale_tests {
+    use super::*;
+
+    #[test]
+    fn normal_margin_events_include_right_letterbox_in_wrap_width() {
+        let track = ParsedTrack {
+            play_res_x: 640,
+            play_res_y: 480,
+            ..ParsedTrack::default()
+        };
+        let config = RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            margins: rassa_core::Margins {
+                left: 240,
+                right: 240,
+                ..rassa_core::Margins::default()
+            },
+            use_margins: true,
+            ..RendererConfig::default()
+        };
+
+        let normal = renderer_wrap_scales(&track, &config, false);
+        let explicit = renderer_wrap_scales(&track, &config, true);
+
+        assert_eq!(normal.available_width_extra, 480.0);
+        assert_eq!(explicit.available_width_extra, 0.0);
+        assert_eq!(normal.available_width, 2.25);
+        assert_eq!(explicit.available_width, 2.25);
+        assert_eq!(
+            620.0 * normal.available_width + normal.available_width_extra,
+            1875.0
+        );
+        assert_eq!(
+            620.0 * explicit.available_width + explicit.available_width_extra,
+            1395.0
+        );
+    }
+
+    #[test]
+    fn wrap_scales_honor_storage_par_and_selective_explicit_font_scale() {
+        let track = ParsedTrack {
+            play_res_x: 640,
+            play_res_y: 120,
+            ..ParsedTrack::default()
+        };
+        let config = RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            storage: Size {
+                width: 640,
+                height: 480,
+            },
+            font_scale: 2.0,
+            selective_font_scale: true,
+            ..RendererConfig::default()
+        };
+
+        let normal = renderer_wrap_scales(&track, &config, false);
+        let explicit = renderer_wrap_scales(&track, &config, true);
+
+        // Storage derives PAR 4/3. Glyphs use the vertical 9x screen scale,
+        // while x2scr, drawings and hspacing use 3 / (4/3) = 2.25.
+        assert_eq!(normal.text, 18.0);
+        assert_eq!(normal.spacing, 4.5);
+        assert_eq!(normal.drawing, 4.5);
+        assert_eq!(normal.available_width, 2.25);
+        assert_eq!(explicit.text, 9.0);
+        assert_eq!(explicit.spacing, 2.25);
+        assert_eq!(explicit.drawing, 2.25);
+        assert_eq!(explicit.available_width, 2.25);
     }
 }

@@ -3903,6 +3903,112 @@ mod tests {
     use super::*;
     use std::{ffi::CString, fs, path::PathBuf, ptr};
 
+    fn read_be_u16(data: &[u8], offset: usize) -> u16 {
+        u16::from_be_bytes([data[offset], data[offset + 1]])
+    }
+
+    fn read_be_u32(data: &[u8], offset: usize) -> usize {
+        u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize
+    }
+
+    fn font_with_distinct_typographic_and_legacy_families() -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test/font2.otf");
+        let mut data = fs::read(path).expect("Aileron fixture should be readable");
+        let table_count = read_be_u16(&data, 4) as usize;
+        let name_offset = (0..table_count)
+            .map(|index| 12 + index * 16)
+            .find(|offset| &data[*offset..*offset + 4] == b"name")
+            .map(|offset| read_be_u32(&data, offset + 8))
+            .expect("fixture should contain an SFNT name table");
+        let name_count = read_be_u16(&data, name_offset + 2) as usize;
+        let mut changed = false;
+        for index in 0..name_count {
+            let record = name_offset + 6 + index * 12;
+            let platform = read_be_u16(&data, record);
+            let name_id = read_be_u16(&data, record + 6);
+            if platform == 3 && name_id == 6 {
+                data[record + 6..record + 8].copy_from_slice(&16_u16.to_be_bytes());
+                changed = true;
+            }
+        }
+        assert!(changed, "fixture should contain a Windows PostScript name");
+        data
+    }
+
+    fn font_with_windows_family(path: &str, family: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test")
+            .join(path);
+        let mut data = fs::read(path).expect("font fixture should be readable");
+        let table_count = read_be_u16(&data, 4) as usize;
+        let name_offset = (0..table_count)
+            .map(|index| 12 + index * 16)
+            .find(|offset| &data[*offset..*offset + 4] == b"name")
+            .map(|offset| read_be_u32(&data, offset + 8))
+            .expect("fixture should contain an SFNT name table");
+        let name_count = read_be_u16(&data, name_offset + 2) as usize;
+        let storage_offset = read_be_u16(&data, name_offset + 4) as usize;
+        let encoded = family
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for index in 0..name_count {
+            let record = name_offset + 6 + index * 12;
+            let platform = read_be_u16(&data, record);
+            let name_id = read_be_u16(&data, record + 6);
+            if platform != 3 || name_id != 1 {
+                continue;
+            }
+            let old_length = read_be_u16(&data, record + 8) as usize;
+            assert!(encoded.len() <= old_length, "replacement family must fit");
+            let string_offset = read_be_u16(&data, record + 10) as usize;
+            let start = name_offset + storage_offset + string_offset;
+            data[record + 8..record + 10].copy_from_slice(&(encoded.len() as u16).to_be_bytes());
+            data[start..start + encoded.len()].copy_from_slice(&encoded);
+            changed = true;
+        }
+        assert!(changed, "fixture should contain a Windows family name");
+        data
+    }
+
+    fn collection_from_faces(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let first_offset = 20_usize.next_multiple_of(4);
+        let second_offset = (first_offset + first.len()).next_multiple_of(4);
+        let mut collection = vec![0_u8; second_offset + second.len()];
+        collection[0..4].copy_from_slice(b"ttcf");
+        collection[4..8].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+        collection[8..12].copy_from_slice(&2_u32.to_be_bytes());
+        collection[12..16].copy_from_slice(&(first_offset as u32).to_be_bytes());
+        collection[16..20].copy_from_slice(&(second_offset as u32).to_be_bytes());
+        collection[first_offset..first_offset + first.len()].copy_from_slice(first);
+        collection[second_offset..second_offset + second.len()].copy_from_slice(second);
+        for (font, base_offset) in [(first, first_offset), (second, second_offset)] {
+            let table_count = read_be_u16(font, 4) as usize;
+            for index in 0..table_count {
+                let table = base_offset + 12 + index * 16;
+                let original_offset = read_be_u32(&collection, table + 8);
+                collection[table + 8..table + 12]
+                    .copy_from_slice(&((original_offset + base_offset) as u32).to_be_bytes());
+            }
+        }
+        collection
+    }
+
+    fn two_face_font_collection() -> Vec<u8> {
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test");
+        let first = fs::read(fixture_root.join("font1.ttf")).expect("TTF fixture should read");
+        let second = fs::read(fixture_root.join("font2.otf")).expect("OTF fixture should read");
+        collection_from_faces(&first, &second)
+    }
+
     fn unique_test_directory(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4349,6 +4455,226 @@ mod tests {
             ass_library_done(library);
             fs::remove_dir_all(&directory).expect("font fixture should clean up");
         }
+    }
+
+    #[test]
+    fn fonts_dir_provider_resolves_legacy_family_alias_through_capi_state() {
+        unsafe {
+            let directory = unique_test_directory("capi-font-family-alias");
+            fs::create_dir_all(&directory).expect("font directory should be creatable");
+            let copied = directory.join("unrelated-name.data");
+            fs::write(
+                &copied,
+                font_with_distinct_typographic_and_legacy_families(),
+            )
+            .expect("mutated font fixture should write");
+
+            let library = ass_library_init();
+            let directory_c = CString::new(directory.to_string_lossy().as_bytes())
+                .expect("font directory cstring");
+            ass_set_fonts_dir(library, directory_c.as_ptr());
+            let renderer = ass_renderer_init(library);
+            ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as c_int,
+                ptr::null(),
+                0,
+            );
+
+            let provider = build_font_provider(&*renderer, library);
+            let resolved = provider.resolve_family("Aileron");
+            assert_eq!(resolved.provider, rassa_fonts::FontProviderKind::Attached);
+            assert_eq!(resolved.family, "Aileron");
+            assert_eq!(resolved.path, Some(copied));
+            drop(provider);
+
+            ass_renderer_done(renderer);
+            ass_library_done(library);
+            fs::remove_dir_all(&directory).expect("font fixture should clean up");
+        }
+    }
+
+    #[test]
+    fn added_font_resolves_legacy_family_alias_through_capi_state() {
+        unsafe {
+            let data = font_with_distinct_typographic_and_legacy_families();
+            let library = ass_library_init();
+            let name = CString::new("unrelated-name.data").expect("font attachment name");
+            ass_add_font(
+                library,
+                name.as_ptr(),
+                data.as_ptr().cast(),
+                data.len() as c_int,
+            );
+            let renderer = ass_renderer_init(library);
+            ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as c_int,
+                ptr::null(),
+                0,
+            );
+
+            let provider = build_font_provider(&*renderer, library);
+            let resolved = provider.resolve_family("Aileron");
+            assert_eq!(resolved.provider, rassa_fonts::FontProviderKind::Attached);
+            assert_eq!(resolved.family, "Aileron");
+            assert!(resolved.path.as_ref().is_some_and(|path| path.is_file()));
+            drop(provider);
+
+            ass_renderer_done(renderer);
+            ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn added_font_resolves_nonzero_collection_face_through_capi_state() {
+        unsafe {
+            let data = two_face_font_collection();
+            let library = ass_library_init();
+            let name = CString::new("fixture.ttc").expect("font attachment name");
+            ass_add_font(
+                library,
+                name.as_ptr(),
+                data.as_ptr().cast(),
+                data.len() as c_int,
+            );
+            let renderer = ass_renderer_init(library);
+            ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as c_int,
+                ptr::null(),
+                0,
+            );
+
+            let provider = build_font_provider(&*renderer, library);
+            let first = provider.resolve_family("Pixel Operator Mono");
+            let second = provider.resolve_family("Aileron");
+            assert_eq!(first.provider, rassa_fonts::FontProviderKind::Attached);
+            assert_eq!(first.face_index, None);
+            assert_eq!(second.provider, rassa_fonts::FontProviderKind::Attached);
+            assert_eq!(second.face_index, Some(1));
+            assert_eq!(second.path, first.path);
+            drop(provider);
+
+            ass_renderer_done(renderer);
+            ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn capi_render_preserves_coverage_selected_collection_face() {
+        unsafe fn render_with_font(data: &[u8], name: &str) -> Vec<(c_int, c_int, Vec<u8>)> {
+            let library = unsafe { ass_library_init() };
+            let name = CString::new(name).expect("font attachment name");
+            unsafe {
+                ass_add_font(
+                    library,
+                    name.as_ptr(),
+                    data.as_ptr().cast(),
+                    data.len() as c_int,
+                );
+            }
+            let renderer = unsafe { ass_renderer_init(library) };
+            unsafe {
+                ass_set_frame_size(renderer, 640, 360);
+                ass_set_fonts(
+                    renderer,
+                    ptr::null(),
+                    ptr::null(),
+                    ass::DefaultFontProvider::None as c_int,
+                    ptr::null(),
+                    0,
+                );
+            }
+            let script = "[Script Info]\n\
+                ScriptType: v4.00+\n\
+                PlayResX: 640\n\
+                PlayResY: 360\n\
+                [V4+ Styles]\n\
+                Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+                Style: Default,Shared,64,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1,0,5,10,10,10,1\n\
+                [Events]\n\
+                Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,∂\n";
+            let track = unsafe {
+                ass_read_memory(
+                    library,
+                    script.as_ptr().cast::<c_char>().cast_mut(),
+                    script.len(),
+                    ptr::null(),
+                )
+            };
+            assert!(!track.is_null());
+            assert!(
+                !unsafe { ass_render_frame(renderer, track, 1_000, ptr::null_mut()) }.is_null()
+            );
+            let images = unsafe {
+                (*renderer)
+                    .rendered_images
+                    .as_ref()
+                    .expect("rendered frame should be retained")
+            };
+            let snapshot = images
+                .nodes
+                .iter()
+                .zip(&images.bitmaps)
+                .map(|(node, bitmap)| (node.w, node.h, bitmap.clone()))
+                .collect();
+            unsafe {
+                ass_free_track(track);
+                ass_renderer_done(renderer);
+                ass_library_done(library);
+            }
+            snapshot
+        }
+
+        let first = font_with_windows_family("font1.ttf", "Shared");
+        let second = font_with_windows_family("font2.otf", "Shared");
+        let collection = collection_from_faces(&first, &second);
+
+        unsafe {
+            let library = ass_library_init();
+            let name = CString::new("shared.ttc").expect("font attachment name");
+            ass_add_font(
+                library,
+                name.as_ptr(),
+                collection.as_ptr().cast(),
+                collection.len() as c_int,
+            );
+            let renderer = ass_renderer_init(library);
+            ass_set_fonts(
+                renderer,
+                ptr::null(),
+                ptr::null(),
+                ass::DefaultFontProvider::None as c_int,
+                ptr::null(),
+                0,
+            );
+            let provider = build_font_provider(&*renderer, library);
+            let query = rassa_fonts::FontQuery {
+                family: "Shared".to_owned(),
+                style: Some("Bold".to_owned()),
+                weight: Some(700),
+            };
+            assert_eq!(provider.resolve(&query).face_index, None);
+            assert_eq!(provider.resolve_for_text(&query, "∂").face_index, Some(1));
+            drop(provider);
+            ass_renderer_done(renderer);
+            ass_library_done(library);
+        }
+
+        let collection_render = unsafe { render_with_font(&collection, "shared.ttc") };
+        let standalone_render = unsafe { render_with_font(&second, "shared.otf") };
+        assert_eq!(
+            collection_render, standalone_render,
+            "the selected collection face must render identically to the exact standalone face"
+        );
     }
 
     #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]

@@ -3558,6 +3558,36 @@ fn block_has_libass_hard_override(block: &str) -> bool {
     false
 }
 
+/// Fast raw scan equivalent to libass `ass_event_has_hard_overrides`.
+///
+/// Only backslash tags inside an override block count. Escaped bytes outside
+/// blocks are skipped in pairs, and an unterminated block is scanned through
+/// the end, matching libass's pre-parse explicit-event classification.
+pub fn dialogue_has_libass_hard_override(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if bytes[index] != b'{' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index] != b'}' {
+            if bytes[index] == b'\\'
+                && libass_hard_override_tag_at(text.get(index + 1..).unwrap_or_default())
+            {
+                return true;
+            }
+            index += 1;
+        }
+    }
+    false
+}
+
 fn libass_hard_override_tag_at(value: &str) -> bool {
     value.starts_with("pos")
         || value.starts_with("move")
@@ -8404,6 +8434,17 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
         assert_eq!(second.start_ms, 500);
         assert_eq!(second.duration_ms, 0);
         assert_eq!(second.mode, first.mode);
+    }
+
+    #[test]
+    fn fast_hard_override_scan_matches_libass_block_and_escape_rules() {
+        assert!(dialogue_has_libass_hard_override("{\\pos(1,2)}text"));
+        assert!(dialogue_has_libass_hard_override("{\\clip(0,0,1,1)"));
+        assert!(dialogue_has_libass_hard_override("{\\pbo2}text"));
+        assert!(!dialogue_has_libass_hard_override("\\pos(1,2) text"));
+        assert!(!dialogue_has_libass_hard_override("{pos(1,2)}text"));
+        assert!(!dialogue_has_libass_hard_override("\\{\\pos(1,2)}text"));
+        assert!(!dialogue_has_libass_hard_override("{\\bord2}text"));
     }
 
     #[test]

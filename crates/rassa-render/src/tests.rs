@@ -47,6 +47,12 @@ impl FontProvider for BundledFontProvider {
             provider: FontProviderKind::Fontconfig,
         }
     }
+
+    fn resolve_for_text(&self, query: &FontQuery, _text: &str) -> FontMatch {
+        // This deterministic fixture intentionally fixes every request to one
+        // face, including missing-glyph .notdef coverage.
+        self.resolve(query)
+    }
 }
 
 fn total_plane_area(planes: &[ImagePlane]) -> i32 {
@@ -4725,6 +4731,32 @@ fn official_karaoke_runsplit_keeps_implicit_word_secondary_until_prior_word_ends
         .expect("official runsplit fixture parses");
     let engine = RenderEngine::new();
     let provider = BundledFontProvider::aileron_regular();
+    let prepared = engine.prepare_frame_with_config(
+        &track,
+        &provider,
+        3120,
+        &RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            storage: Size {
+                width: 1920,
+                height: 1080,
+            },
+            ..RendererConfig::default()
+        },
+    );
+    let wrapped = prepared.active_events[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wrapped,
+        vec!["hodieque", "|caelum |est", "|candidum"],
+        "libass wraps this anisotropic PlayRes fixture into three device-space lines before processing karaoke"
+    );
     let before_end = engine.render_frame_with_provider(&track, &provider, 3120);
     let at_end = engine.render_frame_with_provider(&track, &provider, 4600);
     let has_secondary = |planes: &[ImagePlane]| {

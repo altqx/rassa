@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use freetype::{Library, ffi};
 use rassa_core::{ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size, ass};
 use rassa_fonts::{FontMatch, FontProvider, FontconfigProvider};
-use rassa_layout::{LayoutEngine, LayoutEvent, LayoutFeatures, LayoutGlyphRun};
+use rassa_layout::{LayoutEngine, LayoutEvent, LayoutFeatures, LayoutGlyphRun, LayoutWrapScales};
 use rassa_parse::{
     LIBASS_OUTLINE_MAX_D6, ParsedAxisTransform, ParsedColourTransform, ParsedDrawing, ParsedEvent,
     ParsedFade, ParsedFontSizeTransform, ParsedKaraokeMode, ParsedLinearTransform, ParsedMovement,
     ParsedMovementExact, ParsedRectF64, ParsedScaleTransform, ParsedSpanStyle, ParsedTrack,
-    ParsedVectorClip, libass_drawing_scale_base, libass_outline_coordinate_from_f64,
-    libass_outline_point_is_valid, parse_dialogue_vector_clip_d6, parse_drawing_polygons_d6,
+    ParsedVectorClip, dialogue_has_libass_hard_override, libass_drawing_scale_base,
+    libass_outline_coordinate_from_f64, libass_outline_point_is_valid,
+    parse_dialogue_vector_clip_d6, parse_drawing_polygons_d6,
 };
 use rassa_raster::{RasterGlyph, RasterOptions, Rasterizer};
 use rassa_shape::{GlyphInfo, ShapingMode};
@@ -95,8 +96,12 @@ impl RenderEngine {
             .active_event_indices
             .into_iter()
             .filter_map(|index| {
+                let event = track.events.get(index)?;
+                let event_is_explicit = transition_effect_disables_collision(event)
+                    || dialogue_has_libass_hard_override(&event.text);
+                let wrap_scales = renderer_wrap_scales(track, config, event_is_explicit);
                 self.layout
-                    .layout_track_event_with_features(
+                    .layout_track_event_with_features_and_wrap_scales(
                         track,
                         index,
                         provider,
@@ -106,6 +111,7 @@ impl RenderEngine {
                             bidi_brackets: config.bidi_brackets,
                             whole_text_layout: config.whole_text_layout,
                         },
+                        wrap_scales,
                     )
                     .ok()
             })

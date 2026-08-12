@@ -301,6 +301,25 @@ def dense_animation_frames(workspace: Path, regression: Path) -> list[DenseFrame
                 )
             )
 
+    # The upstream karaoke run-split fixture has PlayRes 640x120. At a
+    # 1920x1080 output, font advances use the 9x vertical screen scale while
+    # x2scr margin width uses the 3x horizontal scale. Comparing only the
+    # fixture's native PNG misses the resulting three-line topology.
+    karaoke_runsplits = regression / "karaoke" / "karaoke-and-runsplits.ass"
+    if karaoke_runsplits.is_file():
+        frames.append(
+            DenseFrame(
+                karaoke_runsplits,
+                "karaoke/karaoke-and-runsplits.ass[1920x1080-wrap]",
+                3120,
+                1920,
+                1080,
+                1920,
+                1080,
+                0.015,
+            )
+        )
+
     return frames
 
 

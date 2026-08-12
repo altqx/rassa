@@ -385,6 +385,24 @@ impl ShapeEngine {
         provider: &P,
         request: &ShapeRequest,
     ) -> RassaResult<ShapedText> {
+        let font = provider.resolve(&FontQuery {
+            family: request.family.clone(),
+            style: request.style.clone(),
+            weight: request.weight,
+        });
+        self.shape_text_with_font(request, &font)
+    }
+
+    /// Shape text with an exact font face selected by a caller.
+    ///
+    /// Layout uses this after coverage-aware fallback has selected a specific
+    /// face in a TTC/OTC. Resolving only the family again here could select an
+    /// earlier face that does not contain the run's glyphs.
+    pub fn shape_text_with_font(
+        &self,
+        request: &ShapeRequest,
+        font: &FontMatch,
+    ) -> RassaResult<ShapedText> {
         let mut analysis = self.unicode.analyze_text_with_base_and_brackets(
             &request.text,
             request.language.as_deref(),
@@ -398,11 +416,6 @@ impl ShapeEngine {
         {
             analysis.bidi_analysis.embedding_levels.clone_from(levels);
         }
-        let font = provider.resolve(&FontQuery {
-            family: request.family.clone(),
-            style: request.style.clone(),
-            weight: request.weight,
-        });
         let mut runs = Vec::new();
         for segment in &analysis.segments {
             // FriBidi/libass shapes each resolved embedding-level run in its
@@ -420,16 +433,14 @@ impl ShapeEngine {
                     BidiDirection::RightToLeft
                 };
                 let glyphs = match request.mode {
-                    ShapingMode::Simple => self.simple.shape_segment(
-                        &bidi_segment,
-                        &font,
-                        direction,
-                        request.font_size,
-                    ),
+                    ShapingMode::Simple => {
+                        self.simple
+                            .shape_segment(&bidi_segment, font, direction, request.font_size)
+                    }
                     ShapingMode::Complex => self
                         .shape_segment_complex(
                             &bidi_segment,
-                            &font,
+                            font,
                             direction,
                             request.language.as_deref(),
                             request.font_size,
@@ -440,7 +451,7 @@ impl ShapeEngine {
                         .unwrap_or_else(|| {
                             self.simple.shape_segment(
                                 &bidi_segment,
-                                &font,
+                                font,
                                 direction,
                                 request.font_size,
                             )
@@ -460,7 +471,7 @@ impl ShapeEngine {
 
         Ok(ShapedText {
             analysis,
-            font,
+            font: font.clone(),
             mode: request.mode,
             runs,
         })
@@ -719,6 +730,31 @@ mod tests {
         assert_eq!(shaped.runs.len(), 1);
         assert_eq!(shaped.runs[0].glyphs.len(), 5);
         assert_eq!(shaped.font.provider, FontProviderKind::Null);
+    }
+
+    #[test]
+    fn shape_engine_preserves_an_exact_preselected_font_face() {
+        let engine = ShapeEngine::new();
+        let provider = NullFontProvider;
+        let font = FontMatch {
+            family: "Collection Family".to_owned(),
+            path: Some(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+            ),
+            face_index: Some(7),
+            style: Some("Fallback".to_owned()),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        };
+        let shaped = engine
+            .shape_text_with_font(&ShapeRequest::new("hello", "Collection Family"), &font)
+            .expect("shaping with an exact font should succeed");
+
+        assert_eq!(shaped.font, font);
+        assert!(shaped.runs.iter().all(|run| run.font == font));
+        assert_eq!(provider.resolve_family("Collection Family").path, None);
     }
 
     #[test]
