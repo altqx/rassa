@@ -43,7 +43,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-          rustup toolchain install 1.85.0 --profile minimal
+          rustup toolchain install 1.90.0 --profile minimal
           rustup default stable
 
       - name: Check formatting
@@ -55,8 +55,8 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Check declared Rust 1.85 MSRV
-        run: cargo +1.85.0 check --workspace --all-targets
+      - name: Check declared Rust 1.90 MSRV
+        run: cargo +1.90.0 check --workspace --all-targets
 
       - name: Build shared libraries
         run: cargo build --release -p rassa -p rassa-libass-capi -p rassa-check

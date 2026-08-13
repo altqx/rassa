@@ -26,7 +26,7 @@ The preferred integration target for new applications is the rassa-branded share
 
 ## Requirements
 
-- Rust 1.85 or newer.
+- Rust 1.90 or newer.
 - A Unix-like development environment for the current C ABI packaging flow.
 - A C compiler if you want to compile C smoke tests or downstream C/C++ applications.
 
