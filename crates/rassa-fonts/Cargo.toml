@@ -12,7 +12,7 @@ keywords.workspace = true
 [dependencies]
 encoding_rs = "0.8.35"
 ttf-parser = "0.25.1"
-fontdb = "0.23.0"
+fontdb = "0.24.0"
 
 [lib]
 path = "src/lib.rs"

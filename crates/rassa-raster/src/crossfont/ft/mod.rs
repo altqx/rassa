@@ -430,7 +430,7 @@ impl Rasterize for FreeTypeRasterizer {
         let font_key = self.face_for_glyph(left);
         let mut ft_face = (*self.loader.faces[&font_key].ft_face).clone();
 
-        if !freetype_sys::FT_HAS_KERNING(ft_face.raw_mut()) {
+        if !unsafe { freetype_sys::FT_HAS_KERNING(ft_face.raw_mut()) } {
             return (0., 0.);
         }
 

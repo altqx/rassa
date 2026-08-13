@@ -114,7 +114,7 @@ pub fn font_bytes_identity(path: &Path) -> Option<u64> {
         .map(|entry| entry.identity)
 }
 
-use harfrust::{Direction, Feature, FontRef, Language, ShaperData, UnicodeBuffer};
+use harfrust::{Direction, Feature, FontRef, Language, ShapeOptions, ShaperData, UnicodeBuffer};
 use rassa_core::RassaResult;
 use rassa_fonts::{
     FontMatch, FontProvider, FontQuery, font_face_glyph_index, font_face_uses_legacy_charmap,
@@ -479,7 +479,7 @@ impl ShapeEngine {
         }
 
         let features = libass_run_features(kerning, vertical, horizontal_spacing);
-        let glyph_buffer = shaper.shape(buffer, &features);
+        let glyph_buffer = shaper.shape(buffer, ShapeOptions::new().features(&features));
         // Scale by GDI font height, not units_per_em; ASS font size is line height.
         let units_per_em = shaper.units_per_em().max(1) as f32;
         let gdi_height = gdi_font_height_units(bytes.as_slice(), font.face_index.unwrap_or(0))

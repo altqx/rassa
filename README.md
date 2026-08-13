@@ -243,7 +243,7 @@ Add the crate from crates.io:
 
 ```toml
 [dependencies]
-rassa = "0.1.0"
+rassa = "0.7.0"
 ```
 
 Or, inside this repository, use a path dependency while developing:
@@ -317,7 +317,7 @@ The Rust API is not the same as either shared-library package. Use the `rassa` c
 
 ## Published crates and docs
 
-The first published version is `0.1.0`.
+The current published version is `0.7.0`.
 
 | Crate | Purpose | Docs |
 | --- | --- | --- |

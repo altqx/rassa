@@ -455,7 +455,7 @@ mod tests {
     fn decode_png_compare_target(bytes: &[u8]) -> (usize, usize, Vec<u16>) {
         let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         let mut reader = decoder.read_info().expect("reference PNG should decode");
-        let mut buffer = vec![0; reader.output_buffer_size()];
+        let mut buffer = vec![0; reader.output_buffer_size().expect("reference PNG size")];
         let info = reader.next_frame(&mut buffer).expect("reference PNG frame");
         let data = &buffer[..info.buffer_size()];
         let target = match (info.color_type, info.bit_depth) {
