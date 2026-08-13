@@ -12,10 +12,11 @@ use rassa_raster::{RasterOptions, Rasterizer};
 use rassa_shape::{
     GlyphInfo, GlyphPositioning, ShapeEngine, ShapeRequest, ShapingMode, reorder_bidi_runs,
 };
-use rassa_unibreak::{LineBreakOpportunity, classify_line_breaks};
 #[cfg(test)]
 use rassa_unicode::analyze_bidi_with_base;
-use rassa_unicode::{BidiDirection, analyze_bidi_with_base_and_brackets};
+use rassa_unicode::{
+    BidiDirection, LineBreakOpportunity, analyze_bidi_with_base_and_brackets, classify_line_breaks,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

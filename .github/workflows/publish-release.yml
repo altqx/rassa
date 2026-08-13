@@ -80,7 +80,6 @@ jobs:
               rassa-core
               rassa-fonts
               rassa-parse
-              rassa-unibreak
               rassa-unicode
               rassa-shape
               rassa-raster
@@ -159,7 +158,6 @@ jobs:
             rassa-core
             rassa-fonts
             rassa-parse
-            rassa-unibreak
             rassa-unicode
             rassa-shape
             rassa-raster

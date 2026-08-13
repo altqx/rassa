@@ -4,15 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Pure-Rust Unicode bidi and segmentation helpers for rassa."
+description = "Pure-Rust Unicode bidi, line/word breaking, and segmentation helpers for rassa."
 repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
 rassa-core = { path = "../rassa-core", version = "0.6.0" }
-rassa-unibreak = { path = "../rassa-unibreak", version = "0.6.0" }
 unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-segmentation = "1.13.2"
 
 [lib]
 path = "src/lib.rs"

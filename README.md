@@ -325,8 +325,7 @@ The first published version is `0.1.0`.
 | `rassa-core` | Shared data types and ASS enums | <https://docs.rs/rassa-core> |
 | `rassa-parse` | ASS/SSA parser | <https://docs.rs/rassa-parse> |
 | `rassa-fonts` | Cross-platform font provider traits and discovery | <https://docs.rs/rassa-fonts> |
-| `rassa-unibreak` | Pure-Rust Unicode line and word breaking | <https://docs.rs/rassa-unibreak> |
-| `rassa-unicode` | Pure-Rust Unicode bidi and segmentation helpers | <https://docs.rs/rassa-unicode> |
+| `rassa-unicode` | Pure-Rust Unicode bidi, line/word breaking, and segmentation helpers | <https://docs.rs/rassa-unicode> |
 | `rassa-shape` | Text shaping | <https://docs.rs/rassa-shape> |
 | `rassa-raster` | Glyph rasterization helpers | <https://docs.rs/rassa-raster> |
 | `rassa-layout` | Subtitle event layout | <https://docs.rs/rassa-layout> |

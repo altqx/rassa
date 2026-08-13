@@ -715,7 +715,6 @@ dependencies = [
  "rassa-parse",
  "rassa-raster",
  "rassa-shape",
- "rassa-unibreak",
  "rassa-unicode",
  "unicode-segmentation",
 ]
@@ -801,21 +800,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "rassa-unibreak"
-version = "0.6.0"
-dependencies = [
- "rassa-core",
- "unicode-linebreak",
- "unicode-segmentation",
-]
-
-[[package]]
 name = "rassa-unicode"
 version = "0.6.0"
 dependencies = [
  "rassa-core",
- "rassa-unibreak",
  "unicode-bidi",
+ "unicode-linebreak",
+ "unicode-segmentation",
 ]
 
 [[package]]
