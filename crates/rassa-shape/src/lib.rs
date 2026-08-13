@@ -75,10 +75,10 @@ fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
         let cache = font_bytes_cache()
             .lock()
             .expect("font bytes cache mutex poisoned");
-        if let Some(entry) = cache.get(path) {
-            if entry.source == FontBytesSource::Virtual || source.as_ref() == Some(&entry.source) {
-                return Some(entry.bytes.clone());
-            }
+        if let Some(entry) = cache.get(path)
+            && (entry.source == FontBytesSource::Virtual || source.as_ref() == Some(&entry.source))
+        {
+            return Some(entry.bytes.clone());
         }
     }
 

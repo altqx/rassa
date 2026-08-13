@@ -467,15 +467,15 @@ pub(crate) fn text_decoration_bars(
             y_max: baseline_y + top + thickness,
         });
     };
-    if style.underline {
-        if let Some(line) = metrics.underline_26_6 {
-            push_bar(line);
-        }
+    if style.underline
+        && let Some(line) = metrics.underline_26_6
+    {
+        push_bar(line);
     }
-    if style.strike_out {
-        if let Some(line) = metrics.strikeout_26_6 {
-            push_bar(line);
-        }
+    if style.strike_out
+        && let Some(line) = metrics.strikeout_26_6
+    {
+        push_bar(line);
     }
     bars
 }

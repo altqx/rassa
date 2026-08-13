@@ -738,17 +738,18 @@ fn wrap_layout_line(
     for piece in pieces.iter().cloned() {
         let is_whitespace = is_libass_trimmed_whitespace(&piece.text);
         current.push(piece);
-        if pieces_positioned_width(&current) >= max_width && !is_whitespace {
-            if let Some(split_at) = last_break_pos.filter(|pos| *pos > 0 && *pos < current.len()) {
-                let mut remainder = current.split_off(split_at);
-                trim_wrapped_line_edges(&mut current, false);
-                if !current.is_empty() {
-                    wrapped.push(current);
-                }
-                trim_wrapped_line_edges(&mut remainder, true);
-                current = remainder;
-                last_break_pos = None;
+        if pieces_positioned_width(&current) >= max_width
+            && !is_whitespace
+            && let Some(split_at) = last_break_pos.filter(|pos| *pos > 0 && *pos < current.len())
+        {
+            let mut remainder = current.split_off(split_at);
+            trim_wrapped_line_edges(&mut current, false);
+            if !current.is_empty() {
+                wrapped.push(current);
             }
+            trim_wrapped_line_edges(&mut remainder, true);
+            current = remainder;
+            last_break_pos = None;
         }
         if current.last().map(&piece_breakable).unwrap_or(false) {
             last_break_pos = Some(current.len());
@@ -1281,11 +1282,11 @@ fn split_text_by_font<P: FontProvider>(
         let mut cluster = std::mem::take(&mut leading_ignorables);
         cluster.push_str(&grapheme);
 
-        if let Some((chunk, chunk_font)) = chunks.last_mut() {
-            if same_font_match(chunk_font, &font) {
-                chunk.push_str(&cluster);
-                continue;
-            }
+        if let Some((chunk, chunk_font)) = chunks.last_mut()
+            && same_font_match(chunk_font, &font)
+        {
+            chunk.push_str(&cluster);
+            continue;
         }
         chunks.push((cluster, font));
     }

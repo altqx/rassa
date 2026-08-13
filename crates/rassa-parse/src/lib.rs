@@ -4466,15 +4466,15 @@ pub fn parse_drawing_outline_cbox_d6(drawing: &str, scale: i32) -> Option<Rect> 
                 points += 3;
                 cursor.parse_many_points(mode, 1, |batch| {
                     let len = history.len();
-                    if len >= 3 {
-                        if let Some(controls) = spline_controls([
+                    if len >= 3
+                        && let Some(controls) = spline_controls([
                             history[len - 3],
                             history[len - 2],
                             history[len - 1],
                             batch[0],
-                        ]) {
-                            add_curve(&mut bounds, &mut started, controls);
-                        }
+                        ])
+                    {
+                        add_curve(&mut bounds, &mut started, controls);
                     }
                     pen = batch[0];
                     history.push(pen);
@@ -4487,15 +4487,15 @@ pub fn parse_drawing_outline_cbox_d6(drawing: &str, scale: i32) -> Option<Rect> 
                 }
                 cursor.parse_many_points(mode, 1, |batch| {
                     let len = history.len();
-                    if len >= 3 {
-                        if let Some(controls) = spline_controls([
+                    if len >= 3
+                        && let Some(controls) = spline_controls([
                             history[len - 3],
                             history[len - 2],
                             history[len - 1],
                             batch[0],
-                        ]) {
-                            add_curve(&mut bounds, &mut started, controls);
-                        }
+                        ])
+                    {
+                        add_curve(&mut bounds, &mut started, controls);
                     }
                     pen = batch[0];
                     history.push(pen);
@@ -4506,15 +4506,15 @@ pub fn parse_drawing_outline_cbox_d6(drawing: &str, scale: i32) -> Option<Rect> 
                 if let Some(close_points) = spline_close_points.take() {
                     for point in close_points {
                         let len = history.len();
-                        if len >= 3 {
-                            if let Some(controls) = spline_controls([
+                        if len >= 3
+                            && let Some(controls) = spline_controls([
                                 history[len - 3],
                                 history[len - 2],
                                 history[len - 1],
                                 point,
-                            ]) {
-                                add_curve(&mut bounds, &mut started, controls);
-                            }
+                            ])
+                        {
+                            add_curve(&mut bounds, &mut started, controls);
                         }
                         pen = point;
                         history.push(point);
@@ -4824,10 +4824,10 @@ fn parse_drawing_number_prefix(token: &str) -> Option<(f64, usize)> {
         .find_map(|(index, character)| (!is_ass_c_space(character)).then_some(index))?;
 
     let mut index = start;
-    if let Some(character) = token.get(index..)?.chars().next() {
-        if character == '+' || character == '-' {
-            index += character.len_utf8();
-        }
+    if let Some(character) = token.get(index..)?.chars().next()
+        && (character == '+' || character == '-')
+    {
+        index += character.len_utf8();
     }
 
     let mut seen_digit = false;
@@ -4850,24 +4850,24 @@ fn parse_drawing_number_prefix(token: &str) -> Option<(f64, usize)> {
 
     let mantissa_end = index;
     let mut parse_end = mantissa_end;
-    if let Some(character) = token.get(index..)?.chars().next() {
-        if character == 'e' || character == 'E' {
+    if let Some(character) = token.get(index..)?.chars().next()
+        && (character == 'e' || character == 'E')
+    {
+        index += character.len_utf8();
+        if let Some(character) = token.get(index..)?.chars().next()
+            && (character == '+' || character == '-')
+        {
             index += character.len_utf8();
-            if let Some(character) = token.get(index..)?.chars().next() {
-                if character == '+' || character == '-' {
-                    index += character.len_utf8();
-                }
+        }
+        let exponent_start = index;
+        while let Some(character) = token.get(index..)?.chars().next() {
+            if !character.is_ascii_digit() {
+                break;
             }
-            let exponent_start = index;
-            while let Some(character) = token.get(index..)?.chars().next() {
-                if !character.is_ascii_digit() {
-                    break;
-                }
-                index += character.len_utf8();
-            }
-            if index > exponent_start {
-                parse_end = index;
-            }
+            index += character.len_utf8();
+        }
+        if index > exponent_start {
+            parse_end = index;
         }
     }
 

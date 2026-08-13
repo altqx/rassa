@@ -483,8 +483,8 @@ impl RenderEngine {
                         }
                         let box_shadow_x = effective_style.shadow_x.round() as i32;
                         let box_shadow_y = effective_style.shadow_y.round() as i32;
-                        if box_shadow_x != 0 || box_shadow_y != 0 {
-                            if let Some(shadow_plane) = opaque_box_plane_from_rects(
+                        if (box_shadow_x != 0 || box_shadow_y != 0)
+                            && let Some(shadow_plane) = opaque_box_plane_from_rects(
                                 &[rect],
                                 effective_style.back_colour,
                                 ass::ImageType::Shadow,
@@ -492,9 +492,9 @@ impl RenderEngine {
                                     x: box_shadow_x,
                                     y: box_shadow_y,
                                 },
-                            ) {
-                                shadow_planes.push(shadow_plane);
-                            }
+                            )
+                        {
+                            shadow_planes.push(shadow_plane);
                         }
                     }
                     if let Some(drawing) = &run.drawing {
@@ -590,62 +590,61 @@ impl RenderEngine {
                             if !drawing_fill_blur.is_zero() {
                                 plane = blur_image_plane_xy(plane, drawing_fill_blur);
                             }
-                            if effective_style.border_x > 0.0 || effective_style.border_y > 0.0 {
-                                if let Some(outline_glyph) = plane_to_raster_glyph(&plane) {
-                                    let rasterizer = Rasterizer::with_options(RasterOptions {
-                                        size_26_6: 64,
-                                        hinting: config.hinting,
-                                    });
-                                    let radius_for = |border: f64| {
-                                        if border > 0.0 {
-                                            border.round().max(1.0) as i32
-                                        } else {
-                                            0
-                                        }
-                                    };
-                                    let outline_glyphs = rasterizer.outline_glyphs_xy(
-                                        &[outline_glyph],
-                                        radius_for(effective_style.border_x),
-                                        radius_for(effective_style.border_y),
-                                    );
-                                    outline_planes.extend(
-                                        image_planes_from_absolute_glyphs(
-                                            &outline_glyphs,
-                                            effective_style.outline_colour,
-                                            ass::ImageType::Outline,
-                                        )
-                                        .into_iter()
-                                        .map(|plane| blur_image_plane_xy(plane, bitmap_blur)),
-                                    );
-                                }
+                            if (effective_style.border_x > 0.0 || effective_style.border_y > 0.0)
+                                && let Some(outline_glyph) = plane_to_raster_glyph(&plane)
+                            {
+                                let rasterizer = Rasterizer::with_options(RasterOptions {
+                                    size_26_6: 64,
+                                    hinting: config.hinting,
+                                });
+                                let radius_for = |border: f64| {
+                                    if border > 0.0 {
+                                        border.round().max(1.0) as i32
+                                    } else {
+                                        0
+                                    }
+                                };
+                                let outline_glyphs = rasterizer.outline_glyphs_xy(
+                                    &[outline_glyph],
+                                    radius_for(effective_style.border_x),
+                                    radius_for(effective_style.border_y),
+                                );
+                                outline_planes.extend(
+                                    image_planes_from_absolute_glyphs(
+                                        &outline_glyphs,
+                                        effective_style.outline_colour,
+                                        ass::ImageType::Outline,
+                                    )
+                                    .into_iter()
+                                    .map(|plane| blur_image_plane_xy(plane, bitmap_blur)),
+                                );
                             }
                             character_planes.push(plane);
                             if style.border_style != 4
                                 && (effective_style.shadow_x.abs() > f64::EPSILON
                                     || effective_style.shadow_y.abs() > f64::EPSILON)
-                            {
-                                if let Some(shadow_glyph) = plane_to_raster_glyph(
+                                && let Some(shadow_glyph) = plane_to_raster_glyph(
                                     character_planes.last().expect("drawing plane"),
-                                ) {
-                                    // Positive \xshad/\yshad offsets down-right; bitmap top is baseline-relative, so add shadow_y.
-                                    shadow_planes.extend(
-                                        image_planes_from_absolute_glyphs(
-                                            &[RasterGlyph {
-                                                left: shadow_glyph.left.saturating_add(
-                                                    effective_style.shadow_x.round() as i32,
-                                                ),
-                                                top: shadow_glyph.top.saturating_add(
-                                                    effective_style.shadow_y.round() as i32,
-                                                ),
-                                                ..shadow_glyph
-                                            }],
-                                            effective_style.back_colour,
-                                            ass::ImageType::Shadow,
-                                        )
-                                        .into_iter()
-                                        .map(|plane| blur_image_plane_xy(plane, bitmap_blur)),
-                                    );
-                                }
+                                )
+                            {
+                                // Positive \xshad/\yshad offsets down-right; bitmap top is baseline-relative, so add shadow_y.
+                                shadow_planes.extend(
+                                    image_planes_from_absolute_glyphs(
+                                        &[RasterGlyph {
+                                            left: shadow_glyph.left.saturating_add(
+                                                effective_style.shadow_x.round() as i32,
+                                            ),
+                                            top: shadow_glyph.top.saturating_add(
+                                                effective_style.shadow_y.round() as i32,
+                                            ),
+                                            ..shadow_glyph
+                                        }],
+                                        effective_style.back_colour,
+                                        ass::ImageType::Shadow,
+                                    )
+                                    .into_iter()
+                                    .map(|plane| blur_image_plane_xy(plane, bitmap_blur)),
+                                );
                             }
                         }
                         apply_run_transform_to_recent_planes(
@@ -1004,36 +1003,36 @@ impl RenderEngine {
                     }
                 }
             }
-            if style.border_style == 4 {
-                if let Some(rect) = event_line_box {
-                    // Background is the event box expanded by positive shadow offsets, clamped to the frame.
-                    let size_x = if event_shadow.0 > 0.0 {
-                        event_shadow.0.round() as i32
-                    } else {
-                        0
-                    };
-                    let size_y = if event_shadow.1 > 0.0 {
-                        event_shadow.1.round() as i32
-                    } else {
-                        0
-                    };
-                    let frame = frame_clip_rect(track, config, event_is_explicit);
-                    let background = Rect {
-                        x_min: (rect.x_min - size_x).clamp(frame.x_min, frame.x_max),
-                        y_min: (rect.y_min - size_y).clamp(frame.y_min, frame.y_max),
-                        x_max: (rect.x_max + size_x).clamp(frame.x_min, frame.x_max),
-                        y_max: (rect.y_max + size_y).clamp(frame.y_min, frame.y_max),
-                    };
-                    if background.width() > 0 && background.height() > 0 {
-                        event_planes.insert(
-                            0,
-                            solid_plane_from_rect(
-                                background,
-                                event_back_colour,
-                                ass::ImageType::Shadow,
-                            ),
-                        );
-                    }
+            if style.border_style == 4
+                && let Some(rect) = event_line_box
+            {
+                // Background is the event box expanded by positive shadow offsets, clamped to the frame.
+                let size_x = if event_shadow.0 > 0.0 {
+                    event_shadow.0.round() as i32
+                } else {
+                    0
+                };
+                let size_y = if event_shadow.1 > 0.0 {
+                    event_shadow.1.round() as i32
+                } else {
+                    0
+                };
+                let frame = frame_clip_rect(track, config, event_is_explicit);
+                let background = Rect {
+                    x_min: (rect.x_min - size_x).clamp(frame.x_min, frame.x_max),
+                    y_min: (rect.y_min - size_y).clamp(frame.y_min, frame.y_max),
+                    x_max: (rect.x_max + size_x).clamp(frame.x_min, frame.x_max),
+                    y_max: (rect.y_max + size_y).clamp(frame.y_min, frame.y_max),
+                };
+                if background.width() > 0 && background.height() > 0 {
+                    event_planes.insert(
+                        0,
+                        solid_plane_from_rect(
+                            background,
+                            event_back_colour,
+                            ass::ImageType::Shadow,
+                        ),
+                    );
                 }
             }
             if let Some(fade) = event.fade {

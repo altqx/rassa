@@ -756,11 +756,11 @@ pub unsafe extern "C" fn ass_set_message_cb(
     msg_cb: *mut c_void,
     data: *mut c_void,
 ) {
-    if let Some(library) = priv_.as_mut() {
-        if !msg_cb.is_null() {
-            library.message_cb = msg_cb;
-            library.message_data = data;
-        }
+    if let Some(library) = priv_.as_mut()
+        && !msg_cb.is_null()
+    {
+        library.message_cb = msg_cb;
+        library.message_data = data;
     }
 }
 
@@ -1578,13 +1578,13 @@ fn parse_signed_i32(value: &str, base: u32, allow_hex_prefix: bool) -> c_int {
         negative = true;
     }
 
-    if allow_hex_prefix && base == 16 {
-        if let Some(rest) = value
+    if allow_hex_prefix
+        && base == 16
+        && let Some(rest) = value
             .strip_prefix("0x")
             .or_else(|| value.strip_prefix("0X"))
-        {
-            value = rest;
-        }
+    {
+        value = rest;
     }
 
     let mut parsed = 0_u32;
@@ -1659,13 +1659,12 @@ pub unsafe extern "C" fn ass_prune_events(track: *mut ASS_Track, deadline: i64) 
         keep
     });
     store_events(track_ref, events);
-    if clear_read_order {
-        if let Some(state) = track_state_mut(track) {
-            if let Some(seen) = state.read_order_seen.as_mut() {
-                for read_order in removed_read_orders {
-                    seen.remove(&read_order);
-                }
-            }
+    if clear_read_order
+        && let Some(state) = track_state_mut(track)
+        && let Some(seen) = state.read_order_seen.as_mut()
+    {
+        for read_order in removed_read_orders {
+            seen.remove(&read_order);
         }
     }
 }
@@ -2036,32 +2035,30 @@ fn build_crossfont_provider(
         renderer.default_provider,
         value if value == ass::DefaultFontProvider::Autodetect as c_int
             || value == ass::DefaultFontProvider::Fontconfig as c_int
-    ) {
-        if let Some(config) = renderer
-            .fontconfig_config
-            .as_deref()
-            .filter(|config| !config.is_empty())
-        {
-            if let Err(error) = validate_fontconfig_config(config) {
-                unsafe {
-                    emit_library_message(
-                        library,
-                        MESSAGE_LEVEL_WARNING,
-                        format!(
-                            "No usable fontconfig configuration file '{config}' found ({error}); using fallback"
-                        ),
-                    );
-                }
+    ) && let Some(config) = renderer
+        .fontconfig_config
+        .as_deref()
+        .filter(|config| !config.is_empty())
+    {
+        if let Err(error) = validate_fontconfig_config(config) {
+            unsafe {
+                emit_library_message(
+                    library,
+                    MESSAGE_LEVEL_WARNING,
+                    format!(
+                        "No usable fontconfig configuration file '{config}' found ({error}); using fallback"
+                    ),
+                );
             }
-            return if let Some(fallback_family) = renderer.default_family.as_deref() {
-                Box::new(CrossfontProvider::with_config_and_fallback_family(
-                    config,
-                    fallback_family,
-                ))
-            } else {
-                Box::new(CrossfontProvider::with_config(config))
-            };
         }
+        return if let Some(fallback_family) = renderer.default_family.as_deref() {
+            Box::new(CrossfontProvider::with_config_and_fallback_family(
+                config,
+                fallback_family,
+            ))
+        } else {
+            Box::new(CrossfontProvider::with_config(config))
+        };
     }
 
     if let Some(fallback_family) = renderer.default_family.as_deref() {
@@ -2309,10 +2306,10 @@ fn parse_force_f64_prefix(value: &str) -> Option<f64> {
         .find_map(|(index, character)| (!is_force_c_space(character)).then_some(index))?;
 
     let mut index = start;
-    if let Some(character) = value.get(index..)?.chars().next() {
-        if character == '+' || character == '-' {
-            index += character.len_utf8();
-        }
+    if let Some(character) = value.get(index..)?.chars().next()
+        && (character == '+' || character == '-')
+    {
+        index += character.len_utf8();
     }
 
     let mut seen_digit = false;
@@ -2335,24 +2332,24 @@ fn parse_force_f64_prefix(value: &str) -> Option<f64> {
 
     let mantissa_end = index;
     let mut parse_end = mantissa_end;
-    if let Some(character) = value.get(index..)?.chars().next() {
-        if character == 'e' || character == 'E' {
+    if let Some(character) = value.get(index..)?.chars().next()
+        && (character == 'e' || character == 'E')
+    {
+        index += character.len_utf8();
+        if let Some(character) = value.get(index..)?.chars().next()
+            && (character == '+' || character == '-')
+        {
             index += character.len_utf8();
-            if let Some(character) = value.get(index..)?.chars().next() {
-                if character == '+' || character == '-' {
-                    index += character.len_utf8();
-                }
+        }
+        let exponent_start = index;
+        while let Some(character) = value.get(index..)?.chars().next() {
+            if !character.is_ascii_digit() {
+                break;
             }
-            let exponent_start = index;
-            while let Some(character) = value.get(index..)?.chars().next() {
-                if !character.is_ascii_digit() {
-                    break;
-                }
-                index += character.len_utf8();
-            }
-            if index > exponent_start {
-                parse_end = index;
-            }
+            index += character.len_utf8();
+        }
+        if index > exponent_start {
+            parse_end = index;
         }
     }
 
