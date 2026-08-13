@@ -31,11 +31,7 @@ pub struct PreparedFrame {
 #[derive(Default)]
 pub struct RenderEngine {
     layout: LayoutEngine,
-    // libass keeps a per-event ASS_RenderPriv with the rect the event was
-    // assigned by fix_collisions; while the event keeps rendering with the
-    // same height it stays at that position across frames.  The cache is
-    // invalidated when the renderer settings change (libass bumps render_id
-    // on every ass_set_*).
+    // Per-event collision rect stays while height is unchanged; invalidated when renderer settings change.
     collision_cache: std::sync::Mutex<HashMap<usize, Rect>>,
     collision_render_id: std::sync::Mutex<u64>,
 }
@@ -152,10 +148,7 @@ impl RenderEngine {
             format!("{config:?}").hash(&mut hasher);
             track.play_res_x.hash(&mut hasher);
             track.play_res_y.hash(&mut hasher);
-            // libass invalidates per-event collision placement whenever the
-            // track's effective render data changes. Counting events alone
-            // leaves stale cached rectangles after in-place event/style edits
-            // through the C API, so hash every render-observable field.
+            // Hash every render-observable field: event-count alone leaves stale collision rects after in-place C API edits.
             format!("{track:?}").hash(&mut hasher);
             let render_id = hasher.finish();
             let mut current = self
@@ -190,9 +183,7 @@ impl RenderEngine {
             let effect_disables_collision = source_event
                 .map(transition_effect_disables_collision)
                 .unwrap_or(false);
-            // libass computes "explicit" before parsing override tags:
-            // transition effects set evt_type immediately, and all other
-            // hard overrides come from ass_event_has_hard_overrides' raw scan.
+            // Explicit is decided before override-tag parse: transition effects plus the raw hard-override scan.
             let event_is_explicit = event.hard_override || effect_disables_collision;
             let event_font_scale = renderer_font_scale_for_event(config, event_is_explicit);
             let mapping = event_mapping(track, config, event_is_explicit);
@@ -200,9 +191,7 @@ impl RenderEngine {
                 renderer_projection_scale_y(track, config, event_font_scale, &mapping);
             let resolved_position_exact = resolve_event_position_exact(track, event, now_ms);
             let mapped_position_exact = scale_position_exact(resolved_position_exact, &mapping);
-            // Keep the established integer layout/collision path: it rounded
-            // in script space before x2scr/y2scr. The drawing residual then
-            // corrects that compatibility anchor to libass's mapped 1/8 grid.
+            // Integer layout/collision still rounds in script space; the drawing residual maps that to the 1/8 grid.
             let effective_position =
                 resolved_position_exact
                     .map(round_exact_point)
@@ -212,9 +201,7 @@ impl RenderEngine {
                             mapping.map_y_pos(f64::from(y)).round() as i32,
                         )
                     });
-            // Parsing and scaling a vector outline dominates small drawing
-            // events. Share the exact D6 geometry between line metrics and
-            // rasterization instead of constructing it twice.
+            // Share exact D6 drawing geometry between line metrics and rasterization.
             let scaled_event_drawings = event
                 .lines
                 .iter()
@@ -255,11 +242,7 @@ impl RenderEngine {
                 config,
                 &mapping,
             );
-            // libass computes one untransformed string bbox before rendering
-            // glyphs, then uses its alignment base point as the implicit
-            // \frx/\fry/\frz origin for every glyph.  Precompute equivalent
-            // advance/line-metric geometry so style and karaoke runs do not
-            // each pick a different origin from their own rendered ink.
+            // One untransformed string bbox supplies the implicit \frx/\fry/\frz origin for every glyph.
             let line_widths = event
                 .lines
                 .iter()
@@ -275,14 +258,9 @@ impl RenderEngine {
                     )
                 })
                 .collect::<Vec<_>>();
-            // libass's align_lines starts max_width at zero, so pathological
-            // negative line advances never make the alignment block negative.
+            // align_lines starts max_width at zero so negative line advances cannot shrink the block.
             let block_width = line_widths.iter().copied().max().unwrap_or(0).max(0);
-            // A narrowly scoped outline-space path keeps positioned, plain
-            // identity text on libass's continuous line geometry.  The
-            // legacy integer layout remains authoritative for collision and
-            // every feature the exact path does not yet model (outlines,
-            // shadows, karaoke, decoration, drawings, or 3D transforms).
+            // Exact outline path is only for positioned identity text; collision and other features stay integer.
             let exact_positioned_text_layout = mapped_position_exact.and_then(|(x, y)| {
                 let [line] = event.lines.as_slice() else {
                     return None;
@@ -292,12 +270,7 @@ impl RenderEngine {
                     && source_event.is_some_and(|source| {
                         source.text.contains("\\fscx") || source.text.contains("\\fscy")
                     })
-                    // The positioned raster API owns one libass Q8 residual
-                    // per call. Adjacent layout partitions with identical
-                    // style (for example bidi or fallback-font chunks) belong
-                    // to one composite run upstream, so leave those on the
-                    // legacy path until residual state is carried across
-                    // calls. Real style/color splits intentionally reset it.
+                    // Positioned raster owns one Q8 residual per call; same-style partitions stay on the integer path.
                     && line
                         .runs
                         .windows(2)
@@ -449,13 +422,7 @@ impl RenderEngine {
                     let run_character_start = character_planes.len();
                     let run_transform =
                         style_transform(&effective_style, effective_pixel_aspect(track, config));
-                    // libass quantizes the fully transformed outline cbox
-                    // centre, not the event anchor. Rassa's geometric
-                    // transforms currently operate on raster planes, so only
-                    // bake anchor phase for the untransformed top-left case,
-                    // where the exact event anchor is the outline translation.
-                    // This fixes the frame-baked sign without claiming cbox
-                    // quantization parity for transforms or other alignments.
+                    // Bake 1/8-pixel anchor phase only for untransformed top-left drawings.
                     let run_drawing_exact_anchor_d6 =
                         if line_index == 0 && line.runs.len() == 1 && run_transform.is_identity() {
                             let horizontal = event.alignment & 0x3;
@@ -485,12 +452,7 @@ impl RenderEngine {
                         };
                     if style.border_style == 3 && (run.drawing.is_some() || !run.glyphs.is_empty())
                     {
-                        // OUTLINE_BOX is produced per style run in libass. In
-                        // particular, inline \bord/\xbord/\ybord, \3c,
-                        // \xshad/\yshad and \4c overrides must not inherit the
-                        // base event style. Compatible adjacent boxes are
-                        // merged later, preserving the traditional one-box
-                        // result when every run has the same style.
+                        // OUTLINE_BOX is per style run; merge compatible adjacent boxes later.
                         let box_padding_x = (effective_style.border_x
                             * style_scale(effective_style.scale_x))
                         .round()
@@ -504,9 +466,7 @@ impl RenderEngine {
                             * (effective_style.font_size / source_size)
                             * effective_pixel_aspect(track, config))
                         .round() as i32;
-                        // libass OUTLINE_BOX: the opaque box spans the run's
-                        // advance horizontally and -asc..desc vertically,
-                        // expanded by the border on each side.
+                        // Opaque box is run advance by -asc..desc, expanded by the border on each side.
                         let rect = Rect {
                             x_min: run_origin_x - box_padding_x,
                             y_min: line_top - box_padding_y,
@@ -538,10 +498,7 @@ impl RenderEngine {
                         }
                     }
                     if let Some(drawing) = &run.drawing {
-                        // BorderStyle3 boxes were emitted before the drawing
-                        // and do not carry its baked coverage phase. Transform
-                        // them with the legacy integer pivot, then isolate the
-                        // phased drawing-derived fill/outline/shadow planes.
+                        // BorderStyle 3 boxes lack the drawing's baked phase; transform them with the integer pivot first.
                         apply_run_transform_to_recent_planes(
                             &mut shadow_planes,
                             &mut outline_planes,
@@ -571,9 +528,7 @@ impl RenderEngine {
                             .get(line_index)
                             .and_then(|line| line.get(run_index))
                             .and_then(Option::as_ref);
-                        // libass places a drawing's ink box so its bottom sits
-                        // at baseline + pbo (drawing asc = height - pbo,
-                        // desc = pbo); the plane top is baseline - height + pbo.
+                        // Drawing ink bottom is baseline + pbo (asc = height - pbo); plane top is baseline - height + pbo.
                         let drawing_height = drawing_polygons
                             .map(Vec::as_slice)
                             .and_then(drawing_height_from_d6)
@@ -672,10 +627,7 @@ impl RenderEngine {
                                 if let Some(shadow_glyph) = plane_to_raster_glyph(
                                     character_planes.last().expect("drawing plane"),
                                 ) {
-                                    // libass offsets shadows down-right for
-                                    // positive \xshad/\yshad; top here is the
-                                    // baseline-relative bitmap top, so moving the
-                                    // ink down means lowering it by shadow_y.
+                                    // Positive \xshad/\yshad offsets down-right; bitmap top is baseline-relative, so add shadow_y.
                                     shadow_planes.extend(
                                         image_planes_from_absolute_glyphs(
                                             &[RasterGlyph {
@@ -712,8 +664,7 @@ impl RenderEngine {
                                 shear_pivot_y: Some(f64::from(line_top)),
                             },
                         );
-                        // run.width already includes \fscx (layout applies the
-                        // style scale when measuring the drawing).
+                        // run.width already includes \fscx from layout measurement.
                         let drawing_advance_26_6 = (f64::from(run.width) * render_scale_x * 64.0)
                             .round()
                             .max(0.0) as i32;
@@ -796,9 +747,7 @@ impl RenderEngine {
                                 .saturating_add((pen_x * 64.0).round_ties_even() as i32);
                             continue;
                         }
-                        // Keep subsequent exact runs on the whole-line pen even
-                        // when this backend has to use the legacy bitmap path
-                        // for one unsupported glyph.
+                        // Keep later exact runs on the whole-line pen if this glyph falls back to the bitmap path.
                         exact_line_pen_x += pen_x;
                     }
                     let raster_glyphs = scale_raster_glyphs(
@@ -811,8 +760,7 @@ impl RenderEngine {
                     let has_outline = style.border_style != 3
                         && (effective_style.border_x > 0.0 || effective_style.border_y > 0.0)
                         && !karaoke_hides_outline(run, source_event, now_ms);
-                    // libass render_text skips shadow bitmaps entirely for
-                    // BorderStyle 4 (the background box replaces them).
+                    // BorderStyle 4 skips shadow bitmaps; the background box replaces them.
                     let has_shadow = style.border_style != 4
                         && (effective_style.shadow_x.abs() > f64::EPSILON
                             || effective_style.shadow_y.abs() > f64::EPSILON);
@@ -823,9 +771,7 @@ impl RenderEngine {
                     };
                     let mut outlined_shadow_source_glyphs = None;
                     if has_outline {
-                        // libass strokes with independent x/y radii
-                        // (\xbord/\ybord); a zero radius keeps that axis
-                        // unexpanded.
+                        // Stroke with independent \xbord/\ybord radii; a zero radius leaves that axis unexpanded.
                         let radius_for = |border: f64| {
                             if border > 0.0 {
                                 border.round().max(1.0) as i32
@@ -1005,18 +951,14 @@ impl RenderEngine {
                     }
                     line_pen_x_26_6 += run_advance_26_6;
                 }
-                // libass measure_text retains the first line's maximum border
-                // as border_top and overwrites border_bottom for every line.
-                // A large border on an earlier line must therefore not pad the
-                // bottom of a multiline collision rectangle.
+                // border_top is the first line's max border; border_bottom is overwritten per line.
                 if line_index == 0 {
                     event_border_top = line_border_y;
                 }
                 event_border_bottom = line_border_y;
             }
 
-            // libass EventImages: top = device_y - lines[0].asc - border_top,
-            // height = text height + borders, width = bbox + 2 * border_x.
+            // EventImages: top = device_y - first asc - border_top; height = text + borders; width = bbox + 2*border_x.
             let event_line_box = (!event.lines.is_empty() && event_left < event_right).then(|| {
                 let total_height = total_text_height(&line_metrics, config).round() as i32;
                 Rect {
@@ -1031,25 +973,18 @@ impl RenderEngine {
             let mut event_planes = shadow_planes;
             event_planes.extend(outline_planes);
             event_planes.extend(character_planes);
-            // Each plane above already represents one libass bitmap-combine
-            // run. Do not merge distinct runs here merely because their
-            // padded rectangles overlap: blur/filter state is a run key in
-            // libass even when type and colour match. Coalescing such runs
-            // changes coverage and collapses public ASS_Image nodes.
+            // Do not merge overlapping runs: blur/filter is a run key even when type/colour match.
             let apply_script_clip = event_is_explicit || !config.use_margins;
             if apply_script_clip {
                 if let Some((clip_rect, inverse_clip)) =
                     resolve_rect_clip(event, track, source_event, now_ms)
                 {
                     let clip_rect = scale_clip_rect_exact(clip_rect, &mapping);
-                    // libass render_and_apply_clip uses the exact clip rectangle for
-                    // both \clip and \iclip; it does not bleed the inverse region by
-                    // the border/shadow extent.
+                    // \clip and \iclip use the exact clip rectangle; inverse does not bleed by border/shadow.
                     event_planes = apply_event_clip(event_planes, clip_rect, inverse_clip);
                 }
                 if let Some(vector_clip) = &event.vector_clip {
-                    // A failed outline transform makes libass skip vector
-                    // clipping altogether, for both regular and inverse clips.
+                    // A failed outline transform skips vector clipping for both regular and inverse clips.
                     if let Some(exact_clip) =
                         source_event.and_then(|source| parse_dialogue_vector_clip_d6(&source.text))
                     {
@@ -1071,9 +1006,7 @@ impl RenderEngine {
             }
             if style.border_style == 4 {
                 if let Some(rect) = event_line_box {
-                    // libass add_background: the event box expanded by the
-                    // positive shadow offsets, clamped to the frame, filled
-                    // with the final back colour and drawn first.
+                    // Background is the event box expanded by positive shadow offsets, clamped to the frame.
                     let size_x = if event_shadow.0 > 0.0 {
                         event_shadow.0.round() as i32
                     } else {
@@ -1106,10 +1039,7 @@ impl RenderEngine {
             if let Some(fade) = event.fade {
                 event_planes = apply_fade_to_planes(event_planes, fade, source_event, now_ms);
             } else if planes_have_translucent_fill(&event_planes) {
-                // libass leaves FILTER_FILL_IN_BORDER clear when the primary or
-                // secondary colour is translucent, carving the fill out of the
-                // border so the two do not double-composite. The fade path above
-                // already does this when a fade is present.
+                // Translucent fill: carve it out of the border (FILTER_FILL_IN_BORDER stays clear).
                 carve_fill_out_of_outline(&mut event_planes);
             }
             event_planes = apply_effect_to_planes(
@@ -1121,8 +1051,7 @@ impl RenderEngine {
                 &mapping,
                 event_line_box,
             );
-            // Coordinates are already in final screen space: the per-event
-            // mapping folds the margin offsets in.
+            // Collision coords are already screen space; the event mapping folded in margins.
             let collision_rect = event_line_box;
             rendered_events.push(RenderedEvent {
                 event_index: event.event_index,
@@ -1144,8 +1073,7 @@ impl RenderEngine {
             });
         }
 
-        // libass runs fix_collisions independently for each same-layer group,
-        // then concatenates the finished image lists and clips to the frame.
+        // fix_collisions runs independently per same-layer group, then lists are concatenated and frame-clipped.
         {
             let mut cache = self
                 .collision_cache
@@ -1158,10 +1086,7 @@ impl RenderEngine {
         for record in rendered_events {
             planes.extend(apply_event_clip(record.planes, record.frame_clip, false));
         }
-        // libass 0.17.5 filters fully transparent ASS_Image nodes only after
-        // rendering, collision handling, and final clipping.  Preserve all
-        // earlier work (including zero-sized clip nodes) but do not expose a
-        // plane whose ASS alpha byte is 0xFF to callers.
+        // Drop ASS alpha 0xFF planes only after render, collision, and clip (keep zero-sized clip nodes).
         planes.retain(|plane| plane.color.0 & 0xFF != 0xFF);
         planes
     }

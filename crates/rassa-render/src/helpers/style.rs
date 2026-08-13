@@ -118,11 +118,7 @@ pub(crate) fn resolve_run_style(
             }
             style.border = style.border_x.max(style.border_y);
         } else {
-            // The parser expands \bord into border + border_x + border_y, so
-            // all three can be present in one transform. Interpolate
-            // border_x/border_y from the base (pre-\bord) values rather than
-            // the value \bord just wrote, otherwise a plain \t(\bord)
-            // compounds and overshoots.
+            // Interpolate \xbord/\ybord from the pre-\bord base; \t(\bord) would otherwise compound.
             let base_border_x = style.border_x;
             let base_border_y = style.border_y;
             if let Some(border) = transform.style.border {
@@ -295,11 +291,7 @@ fn transform_progress(
     }
 }
 
-/// Resolve the event's rectangular clip at `now_ms`, interpolating animated
-/// \t(\clip(...)) and \t(\iclip(...)) targets like libass ass_parse.c:
-/// each coordinate is lerped with the transform's power from the current clip
-/// (the static \clip, or the full frame when none is set), while clip mode
-/// follows the latest animated clip tag.
+/// Lerp animated \t(\clip/\iclip) from the static clip (or full frame); mode follows the latest clip tag.
 pub(crate) fn resolve_rect_clip(
     event: &LayoutEvent,
     track: &ParsedTrack,
@@ -384,9 +376,7 @@ pub(crate) fn apply_renderer_style_scale(
     let screen_x = style_scale(render_scale.x);
     let screen_y = style_scale(render_scale.y);
     style.font_size *= font_scale * screen_y;
-    // libass scales \fsp using screen_scale_x / PAR, then applies PAR while
-    // placing the resulting glyphs. Rassa emits final device-space planes,
-    // so the net scale is screen_scale_x.
+    // Net \fsp scale is screen_scale_x (libass uses screen_scale_x/PAR then reapplies PAR).
     style.spacing *= font_scale * screen_x;
 
     let (geometry_x, geometry_y) = if track.scaled_border_and_shadow {
@@ -403,8 +393,7 @@ pub(crate) fn apply_renderer_style_scale(
     style.shadow_y *= geometry_y;
     style.shadow = style.shadow_x.abs().max(style.shadow_y.abs());
 
-    // Blur keeps script-space values here. The bitmap filter applies libass's
-    // independent blur_scale_x/y later; \be is an unscaled pass count.
+    // Blur stays in script space here; blur_scale_x/y apply later and \be is an unscaled pass count.
     style
 }
 
@@ -427,8 +416,7 @@ pub(crate) fn apply_text_spacing(
         .collect()
 }
 
-/// \fsp advance per glyph in 26.6 units; libass adds `double_to_d6(spacing)
-/// * scale_x` to each cluster advance without rounding to whole pixels.
+/// \fsp advance in 26.6: double_to_d6(spacing)*scale_x per cluster, not rounded to whole pixels.
 pub(crate) fn text_spacing_advance_26_6(style: &ParsedSpanStyle) -> i32 {
     if !style.spacing.is_finite() {
         return 0;
@@ -485,11 +473,7 @@ pub(crate) fn scale_glyph_infos(
         .collect()
 }
 
-/// Convert positions produced at layout-time `run.style.font_size` into the
-/// effective device-space font size for this frame. Like libass, font glyphs
-/// use the PlayResY-derived size in both dimensions; a non-square PlayResX
-/// must not stretch HarfBuzz advances or offsets. Coordinate/drawing scales
-/// remain independently anisotropic.
+/// Scale layout positions to this frame's font size; PlayResX must not stretch HarfBuzz advances.
 pub(crate) fn shaped_position_render_scale(
     run: &LayoutGlyphRun,
     effective_style: &ParsedSpanStyle,
@@ -509,16 +493,7 @@ pub(crate) fn shaped_position_render_scale(
     (size_scale, size_scale)
 }
 
-/// Rotate eligible `@font` glyphs the way libass does (`DECO_ROTATE` plus
-/// `ass_outline_rotate_90`).  FreeType outlines use y-up coordinates, but
-/// libass flips y while importing them, so the resulting screen-space bitmap
-/// rotation is counterclockwise. For a bitmap with FreeType bearings `(left,
-/// top)` and source width `width`, the rotated bearings are
-/// `(offs.x - top, width - left - offs.y)`.
-///
-/// libass only sets `DECO_ROTATE` for source codepoints at or above U+02F1.
-/// Shaping records that decision from each output glyph's source cluster so
-/// substitutions cannot make us rotate low codepoints such as ASCII.
+/// Counterclockwise @font rotation for source codepoints ≥ U+02F1 (cluster property, not glyph id).
 pub(crate) fn apply_vertical_font_raster_advances(
     mut glyphs: Vec<RasterGlyph>,
     glyph_infos: &[GlyphInfo],

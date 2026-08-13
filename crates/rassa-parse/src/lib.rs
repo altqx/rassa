@@ -198,10 +198,8 @@ pub struct ParsedAnimatedStyle {
     pub blur_steps: Vec<ParsedLinearTransform>,
     pub be: Option<f64>,
     pub be_steps: Vec<ParsedLinearTransform>,
-    /// Animated rectangular \clip target (libass interpolates rect clips
-    /// inside \t; vector clips never animate).
+    /// Animated rectangular \clip target (\t interpolates rect clips; vector clips never animate).
     pub clip_rect: Option<ParsedRectF64>,
-    /// Whether the animated clip target came from \iclip.
     pub clip_inverse: Option<bool>,
 }
 
@@ -469,25 +467,19 @@ pub struct ParsedDrawing {
     pub polygons: Vec<Vec<Point>>,
 }
 
-/// libass stores outline coordinates in signed 26.6 fixed point and requires
-/// every point to stay in `[-OUTLINE_MAX, OUTLINE_MAX]`.  Keep the upstream
-/// limit here so hostile ASS drawings are rejected before converting them to
-/// Rassa's integer-pixel representation.
+/// Signed 26.6 outline domain `[-OUTLINE_MAX, OUTLINE_MAX]`; reject hostile drawings before integer conversion.
 pub const LIBASS_OUTLINE_MAX_D6: i32 = (1_i32 << 28) - 1;
 
-// Rassa stores parsed drawing points as integer pixels rather than 26.6 fixed
-// point.  A valid fractional libass coordinate can round to this ceiling.
+// Integer-pixel ceiling: a valid fractional 26.6 coordinate can round up to this.
 const RASSA_OUTLINE_MAX_COORD: i64 = (LIBASS_OUTLINE_MAX_D6 as i64 + ((1_i64 << 6) - 1)) >> 6;
 
-/// Convert an ASS drawing coordinate to libass's 26.6 representation while
-/// enforcing the same outline range invariant as `ass_outline_add_point`.
+/// Convert to 26.6 and enforce ass_outline_add_point's outline range.
 pub fn libass_drawing_coordinate_to_d6(value: f64) -> Option<i32> {
     let scaled = value * 64.0;
     if !scaled.is_finite() {
         return None;
     }
-    // libass's double_to_d6 uses ass_lrint under FE_TONEAREST: exact
-    // half-D6 coordinates select the even integer, including negatives.
+    // double_to_d6 / ass_lrint FE_TONEAREST: exact half-D6 values pick the even integer, including negatives.
     let rounded = scaled.round_ties_even();
     if rounded < -f64::from(LIBASS_OUTLINE_MAX_D6) || rounded > f64::from(LIBASS_OUTLINE_MAX_D6) {
         return None;
@@ -495,8 +487,7 @@ pub fn libass_drawing_coordinate_to_d6(value: f64) -> Option<i32> {
     Some(rounded as i32)
 }
 
-/// Round a transformed outline coordinate into Rassa's integer-pixel space,
-/// rejecting values which no longer fit libass's outline-domain policy.
+/// Round a transformed outline coordinate to integer pixels; reject values outside the outline domain.
 pub fn libass_outline_coordinate_from_f64(value: f64) -> Option<i32> {
     if !value.is_finite() {
         return None;
@@ -3560,11 +3551,7 @@ fn block_has_libass_hard_override(block: &str) -> bool {
     false
 }
 
-/// Fast raw scan equivalent to libass `ass_event_has_hard_overrides`.
-///
-/// Only backslash tags inside an override block count. Escaped bytes outside
-/// blocks are skipped in pairs, and an unterminated block is scanned through
-/// the end, matching libass's pre-parse explicit-event classification.
+/// Raw scan matching libass ass_event_has_hard_overrides (backslash tags inside override blocks).
 pub fn dialogue_has_libass_hard_override(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -4073,19 +4060,14 @@ fn parse_vector_clip(value: &str) -> Option<ParsedVectorClip> {
 
     let polygons = match parse_drawing_polygons_checked(drawing, scale) {
         DrawingParseOutcome::Parsed(polygons) => polygons.unwrap_or_default(),
-        // libass leaves both regular and inverse vector clips unapplied when
-        // outline construction rejects an out-of-range point.
+        // Out-of-range outline construction leaves both regular and inverse vector clips unapplied.
         DrawingParseOutcome::InvalidOutline => return None,
     };
 
     Some(ParsedVectorClip { scale, polygons })
 }
 
-/// Recover the first claimed vector clip in dialogue text without discarding
-/// libass's 26.6 outline precision.  The regular dialogue parser keeps its
-/// long-standing integer `ParsedVectorClip` representation for API
-/// compatibility; renderers can use this companion when the original event
-/// text is available.
+/// First claimed vector clip in 26.6; the dialogue parser's ParsedVectorClip stays integer for API compatibility.
 pub fn parse_dialogue_vector_clip_d6(text: &str) -> Option<ParsedVectorClip> {
     let bytes = text.as_bytes();
     let mut cursor = 0;
@@ -4120,11 +4102,8 @@ fn vector_clip_d6_claim_in_override_block(
             }
             continue;
         }
-        // `apply_transform_immediate_tags` scans one transform layer only.
-        // Do the same here: recursively accepting nested `\t(\t(\clip))`
-        // would select a clip the regular dialogue parser ignores, and an
-        // attacker-controlled nesting chain could otherwise exhaust the
-        // stack while reparsing an event for fixed-point rendering.
+        // One \t layer only, matching apply_transform_immediate_tags; nested \t(\t(\clip)) is ignored.
+        // Recursion would also let hostile nesting exhaust the stack.
         if !inside_transform {
             let Some(rest) = tag.strip_prefix('t') else {
                 continue;
@@ -4163,9 +4142,7 @@ fn vector_clip_args(value: &str) -> Option<(i32, &str)> {
     let parts = split_complex_args(inside);
     match parts.as_slice() {
         [drawing] => Some((1, *drawing)),
-        // libass master (4af3320) and VSFilter clamp explicit vector-clip
-        // scales to at least one.  This differs from \p, where zero remains a
-        // valid way to leave drawing mode.
+        // Explicit vector-clip scales clamp to at least 1; unlike \p, zero is not a leave-drawing-mode.
         [scale, drawing] => Some((parse_override_i32_arg(scale).unwrap_or(1).max(1), *drawing)),
         _ => None,
     }
@@ -4180,19 +4157,12 @@ enum DrawingParseOutcome {
 fn parse_drawing_polygons(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> {
     match parse_drawing_polygons_checked(drawing, scale) {
         DrawingParseOutcome::Parsed(polygons) => polygons,
-        // A drawing-mode span must remain a drawing even when its outline is
-        // rejected; returning an empty outline prevents its command text from
-        // being shaped as visible characters.
+        // Keep a drawing-mode span even if the outline is rejected, so its command text is not shaped as text.
         DrawingParseOutcome::InvalidOutline => Some(Vec::new()),
     }
 }
 
-/// Parse an ASS drawing into libass's signed 26.6 outline coordinate space.
-///
-/// [`ParsedDrawing::polygons`] intentionally remains integer-valued for API
-/// compatibility.  Renderers which still have the original drawing text can
-/// use this representation to avoid collapsing fractional geometry (for
-/// example, a sub-pixel-thick ring later reduced with `\fscx`/`\fscy`).
+/// Parse a drawing in libass 26.6 space; ParsedDrawing stays integer for API compatibility.
 pub fn parse_drawing_polygons_d6(drawing: &str, scale: i32) -> Option<Vec<Vec<Point>>> {
     if drawing.is_empty() {
         return None;
@@ -4206,20 +4176,12 @@ pub fn parse_drawing_polygons_d6(drawing: &str, scale: i32) -> Option<Vec<Vec<Po
     }
 }
 
-/// Return the raw 26.6 tokenizer box used by libass for drawing metrics.
-///
-/// This intentionally differs from the bounds of [`parse_drawing_polygons_d6`]:
-/// cubic and B-spline input points contribute to libass's drawing bbox even
-/// when the evaluated curve never reaches them. Drawing ascent, descent, and
-/// advance derive from this exact box. Transform quantization instead uses
-/// [`parse_drawing_outline_cbox_d6`].
+/// Tokenizer bbox in 26.6: control points count even if the curve never reaches them.
 pub fn parse_drawing_bbox_d6(drawing: &str, scale: i32) -> Option<Rect> {
     if drawing.is_empty() || libass_drawing_scale_base(scale) <= 0 {
         return None;
     }
-    // Reuse the full parser as the validity oracle.  In particular, a point
-    // outside libass's outline domain only invalidates a drawing once a
-    // visible segment actually consumes it.
+    // Parser is the validity oracle: an out-of-domain point only invalidates a drawing once a visible segment consumes it.
     match parse_drawing_polygons_checked_with_mode(drawing, DrawingCoordinateMode::FixedD6) {
         DrawingParseOutcome::InvalidOutline => return None,
         DrawingParseOutcome::Parsed(_) => {}
@@ -4334,8 +4296,7 @@ pub fn parse_drawing_bbox_d6(drawing: &str, scale: i32) -> Option<Rect> {
                 });
             }
             'c' => {
-                // Closing a B-spline reuses its first three tokens, which are
-                // already present in the union box.
+                // Closing a B-spline reuses its first three tokens, already in the union box.
                 spline_start = None;
             }
             _ => {}
@@ -4346,12 +4307,7 @@ pub fn parse_drawing_bbox_d6(drawing: &str, scale: i32) -> Option<Rect> {
     bounds
 }
 
-/// Return the 26.6 control-point box of the constructed libass outline.
-///
-/// Unlike [`parse_drawing_bbox_d6`], this applies libass's B-spline to cubic
-/// conversion before measuring and ignores move-only points which never enter
-/// an outline.  `quantize_transform` uses this box to quantize matrix
-/// coefficients and bitmap phase.
+/// Constructed-outline cbox in 26.6 (B-spline converted; move-only points ignored).
 pub fn parse_drawing_outline_cbox_d6(drawing: &str, scale: i32) -> Option<Rect> {
     if drawing.is_empty() || libass_drawing_scale_base(scale) <= 0 {
         return None;
@@ -5105,10 +5061,7 @@ fn approximate_spline_segment(
 }
 
 fn scale_drawing_point(x: f64, y: f64, scale: i32) -> Point {
-    // Keep an invalid token as an unmistakably invalid sentinel.  libass
-    // tokenizes INT32_MIN too and only rejects it when the point is actually
-    // added to an outline; an unused move therefore remains an empty, valid
-    // outline while a line/curve using it invalidates the whole drawing.
+    // Out-of-range tokens become INT32_MIN; unused moves stay valid, but a line/curve using them invalidates the drawing.
     if libass_drawing_coordinate_to_d6(x).is_none() || libass_drawing_coordinate_to_d6(y).is_none()
     {
         return Point {
@@ -5347,11 +5300,7 @@ fn flush_span_for_run_break(
         line,
     );
     if had_text {
-        // libass split_style_runs makes every real style/drawing run a
-        // karaoke-word boundary.  A run without its own karaoke tag inherits
-        // the active effect type, starts when the preceding word ends, and
-        // has zero duration.  A deferred \kt/zero-duration tag overrides that
-        // implicit start when one occurred inside the just-flushed run.
+        // Every real style/drawing run is a karaoke-word boundary; missing tags inherit mode with zero duration.
         *pending_karaoke = deferred_karaoke.take().or_else(|| {
             pending_karaoke.map(|karaoke| ParsedKaraokeSpan {
                 start_ms: karaoke.start_ms.wrapping_add(karaoke.duration_ms),
@@ -5389,10 +5338,7 @@ fn push_line(
     transforms: &[ParsedSpanTransform],
 ) {
     if line.spans.is_empty() {
-        // libass keeps every explicit newline as a styled glyph record. Even
-        // an otherwise empty line therefore contributes half of the current
-        // font's ascent/descent to block metrics. Preserve a metric-only run;
-        // layout never rasterizes it and its advance remains zero.
+        // Explicit newlines stay as metric-only glyph records; empty lines still contribute half ascent/descent.
         line.spans.push(ParsedTextSpan {
             text: String::new(),
             style: style.clone(),
@@ -7442,9 +7388,7 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
             "the last whole-pixel coordinate within libass OUTLINE_MAX stays valid"
         );
 
-        // libass only applies the range check when a token is added to an
-        // outline.  A hostile move with no following segment is still a valid
-        // empty clip (regular clips everything; inverse clips nothing).
+        // Range check applies only when a token is added to an outline; an unused hostile move is a valid empty clip.
         for tag in ["clip", "iclip"] {
             let parsed = parse_dialogue_text(
                 &format!("{{\\{tag}(m -33554432 0)}}visible text"),
@@ -8839,10 +8783,6 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
 
     #[test]
     fn style_run_break_starts_implicit_karaoke_word_like_libass() {
-        // libass split_style_runs marks the bold change as a new run, and
-        // process_karaoke_effects treats every run as a karaoke-word
-        // boundary.  With no new karaoke tag the mode is inherited and the
-        // new word is zero-duration at the preceding word's end.
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\k50}ab{\\b1}cd", &base_style, &[]);
 
@@ -8872,9 +8812,6 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
 
     #[test]
     fn official_runsplit_fixture_advances_each_implicit_karaoke_word() {
-        // libass-tests regression/karaoke/karaoke-and-runsplits.ass.  The
-        // final bold/underline "um" is a new run without a karaoke tag, so it
-        // starts only when the preceding \k156 word ends (3040 + 1560).
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text(
             "{\\k162}hodie{\\i1}que{\\r} |{\\k118}{\\board1\\c&HFF9920&}cael{\\b1\\u1}um{\\r} |{\\k24}est |{\\k156}{\\board1\\c&HFF9920&}candid{\\b1\\u1}um",
@@ -8901,9 +8838,6 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
 
     #[test]
     fn zero_duration_karaoke_without_run_break_stays_in_current_word_like_libass() {
-        // VSFilter/libass: \k123\k0 without a run break keeps subsequent text
-        // in the same karaoke word; the zero-duration timing only becomes a
-        // word boundary if another run break happens before the next glyph.
         let base_style = ParsedStyle::default();
         let parsed = parse_dialogue_text("{\\k100}A{\\k0}B{\\k50}C", &base_style, &[]);
 

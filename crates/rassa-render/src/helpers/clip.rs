@@ -20,10 +20,7 @@ pub(crate) fn apply_event_clip(
     clipped
 }
 
-/// Map a vector `\clip`/`\iclip` drawing from script (PlayRes) coordinates into
-/// render space, mirroring how `scale_clip_rect` and position tags are scaled.
-/// libass scales clip drawings by the same frame transform as glyph positions;
-/// without this the polygon stays in the PlayRes corner and clips everything.
+/// Map a vector \clip/\iclip from PlayRes to render space with the same transform as glyph positions.
 pub(crate) fn scale_vector_clip(
     clip: &ParsedVectorClip,
     mapping: &EventMapping,
@@ -51,8 +48,7 @@ pub(crate) fn scale_vector_clip(
     })
 }
 
-/// Map a vector clip represented in libass's 26.6 source coordinate space to
-/// 26.6 render coordinates, preserving fractional edges through masking.
+/// Map a 26.6 vector clip to 26.6 render coordinates, keeping fractional edges.
 pub(crate) fn scale_vector_clip_d6(
     clip: &ParsedVectorClip,
     mapping: &EventMapping,
@@ -265,9 +261,7 @@ pub(crate) fn mask_plane_with_vector_clip(
         .copied()
         .any(|point| !libass_outline_point_is_valid(point))
     {
-        // Programmatically constructed clips bypass the ASS parser.  Mirror
-        // libass's invalid-outline behavior here too: do not apply either
-        // regular or inverse clipping.
+        // Invalid outline: skip both regular and inverse vector clipping.
         return Some(plane);
     }
     if clip.polygons.is_empty() {
@@ -336,10 +330,7 @@ fn zero_size_plane(plane: ImagePlane) -> ImagePlane {
     }
 }
 
-/// libass rasterizes drawings (and vector clips) with its standard
-/// nonzero-winding rasterizer (ass_rasterizer.c get_fill_flags: solid when
-/// the winding count is non-zero); holes require opposite-direction
-/// subpaths, not even-odd alternation.
+/// Nonzero winding: solid when winding ≠ 0; holes need opposite-direction subpaths, not even-odd.
 pub(crate) fn point_in_drawing_polygons_at(
     sample_x: f64,
     sample_y: f64,

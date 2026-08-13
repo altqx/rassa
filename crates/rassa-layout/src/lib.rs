@@ -25,13 +25,7 @@ pub struct LayoutFeatures {
     pub whole_text_layout: bool,
 }
 
-/// Device-space scales used by libass while deciding automatic line breaks.
-///
-/// Direct layout callers normally work in ASS script coordinates and keep
-/// the identity default.  A renderer supplies the event-specific values:
-/// text is shaped from the vertical font screen scale, drawing geometry uses
-/// the horizontal coordinate scale, and the available margin width is already
-/// mapped through `x2scr_left`/`x2scr_right`.
+/// Device-space wrap scales (identity for script-space callers; renderer supplies screen scales).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutWrapScales {
     pub text: f64,
@@ -224,8 +218,7 @@ impl LayoutEngine {
         let max_width = auto_wrap_width(track, event, style, parsed_text.position, alignment)
             * finite_nonnegative_or_one(wrap_scales.available_width) as f32
             + finite_nonnegative_or_zero(wrap_scales.available_width_extra) as f32;
-        // libass wrap_lines_smart wraps the whole event, treating \N as a
-        // forced break; each explicit segment still auto-wraps on its own.
+        // wrap_lines_smart: \N is a forced break; each explicit segment still auto-wraps.
         let lines = wrap_layout_lines(
             explicit_lines,
             max_width,
@@ -312,9 +305,7 @@ fn layout_line_from_text<P: FontProvider>(
 ) -> RassaResult<LayoutLine> {
     let mut runs = Vec::new();
     let mut line_direction = BidiDirection::LeftToRight;
-    // `\fe-1` implicitly enables whole-text layout in libass. An explicit
-    // feature request does the same while preserving the normal forced-LTR
-    // base direction for other encodings.
+    // `\fe-1` enables whole-text layout; an explicit feature request does too but keeps forced-LTR for other encodings.
     let base_direction = if line
         .spans
         .first()
@@ -387,8 +378,7 @@ fn layout_line_from_text<P: FontProvider>(
         );
         let mut span_chunk_cursor = 0;
         for (chunk_text, chunk_font) in shaped_chunks {
-            // libass ass_resolve_base_direction: \fe-1 enables bidi base
-            // auto-detection; any other encoding forces an LTR base.
+            // ass_resolve_base_direction: \fe-1 auto-detects bidi base; any other encoding forces LTR.
             let base_direction = if span.style.encoding == -1 {
                 BidiDirection::Neutral
             } else {
@@ -495,8 +485,7 @@ fn bounded_drawing_layout_width(width: f64) -> f32 {
     if width.is_finite() && (0.0..=max_pixels).contains(&width) {
         width as f32
     } else {
-        // libass rejects transforms which move an outline outside its valid
-        // coordinate domain; an invalid drawing contributes no advance.
+        // Out-of-domain outline transforms are rejected; an invalid drawing contributes no advance.
         0.0
     }
 }
@@ -710,8 +699,7 @@ fn wrap_layout_line(
         return Ok(vec![line]);
     }
 
-    // libass ALLOWBREAK: with ASS_FEATURE_WRAP_UNICODE off (the default),
-    // only ASCII spaces are break opportunities.
+    // ALLOWBREAK default (WRAP_UNICODE off): only ASCII spaces are break opportunities.
     let breaks = if wrap_unicode {
         classify_line_breaks(&line.text, Some(language))?
     } else {
@@ -730,9 +718,7 @@ fn wrap_layout_line(
     if pieces.len() <= 1 {
         return Ok(vec![line]);
     }
-    // libass tests the positioned glyph bounding box, not just the sum of
-    // advances. Italic overhang and negative bearings can therefore overflow
-    // a line whose logical advance still fits the margin.
+    // Wrap tests the positioned glyph bbox, not advance sums; italic overhang can overflow a fitting advance.
     if pieces_max_positioned_width(&pieces) < max_width {
         return Ok(vec![line]);
     }
@@ -743,10 +729,7 @@ fn wrap_layout_line(
         )
     };
 
-    // libass wrap_lines_naive: break at the last breakable character once the
-    // line overflows; a word with no break opportunity overflows and breaks
-    // at the first breakable after it.  Spaces never trigger the overflow
-    // check (they get trimmed).
+    // wrap_lines_naive: last breakable on overflow; unbreakable words overflow then break at the next space.
     let mut wrapped: Vec<Vec<LayoutPiece>> = Vec::new();
     let mut current: Vec<LayoutPiece> = Vec::new();
     let mut last_break_pos: Option<usize> = None;
@@ -776,10 +759,7 @@ fn wrap_layout_line(
         wrapped.push(current);
     }
 
-    // libass wrap_lines_rebalance: for wrap styles other than 1, repeatedly
-    // move the last word of a line to the start of the next one whenever it
-    // reduces the width difference of the (soft-broken) pair.  libass treats
-    // styles 0 and 3 identically here (FIXME in ass_render.c).
+    // wrap_lines_rebalance (styles != 1; 0 and 3 are identical): move the last word if it evens the pair.
     if wrap_style != 1 {
         let mut changed = true;
         while changed {
@@ -808,16 +788,12 @@ fn wrap_layout_line(
     }
 }
 
-/// Try moving the last word of `left` to the front of `right`, accepting the
-/// move when it reduces the absolute width difference of the pair (libass
-/// wrap_lines_rebalance).
+/// Accept moving left's last word onto right when that evens the pair (wrap_lines_rebalance).
 fn rebalance_pair(
     left: &[LayoutPiece],
     right: &[LayoutPiece],
     piece_breakable: &dyn Fn(&LayoutPiece) -> bool,
 ) -> Option<(Vec<LayoutPiece>, Vec<LayoutPiece>)> {
-    // Find the start of the last word: rewind over trailing whitespace, then
-    // to the piece after the last break opportunity.
     let mut word_start = left.len();
     while word_start > 0 && is_libass_trimmed_whitespace(&left[word_start - 1].text) {
         word_start -= 1;
@@ -827,7 +803,7 @@ fn rebalance_pair(
         word_start -= 1;
     }
     if word_start == 0 || word_end == 0 {
-        // Merging line breaks is never beneficial (libass comment).
+        // Merging line breaks is never beneficial.
         return None;
     }
 
@@ -936,9 +912,7 @@ fn line_to_pieces(line: &LayoutLine, wrap_scales: LayoutWrapScales) -> Vec<Layou
     pieces
 }
 
-/// Map shaped byte-offset (or simple-shaper character-offset) cluster values
-/// onto character ranges and glyph slices. Glyph storage is reversed for RTL;
-/// grouping by value keeps either representation intact.
+/// Map cluster values to char ranges and glyph slices; grouping by value survives RTL-reversed storage.
 fn glyph_cluster_ranges(text: &str, glyphs: &[GlyphInfo]) -> Vec<(usize, usize, usize, usize)> {
     if glyphs.is_empty() {
         return Vec::new();
@@ -1000,11 +974,7 @@ fn glyph_cluster_ranges(text: &str, glyphs: &[GlyphInfo]) -> Vec<(usize, usize, 
 }
 
 fn trim_line_edge_whitespace(mut line: LayoutLine) -> LayoutLine {
-    // libass wrap_lines_smart calls trim_whitespace after wrapping.  Only
-    // ASCII space and a newline glyph which did not become a line break are
-    // skipped; tabs have already become spaces and \h remains NBSP.  Do this
-    // over the complete line so style/font run boundaries cannot protect
-    // otherwise-trimmable edge whitespace.
+    // trim_whitespace after wrap: ASCII space and unused newline only; do the whole line, not per-run.
     let mut found_content = false;
     for run in &mut line.runs {
         if run.drawing.is_some() {
@@ -1083,9 +1053,7 @@ fn is_libass_trimmed_character(character: char) -> bool {
     matches!(character, ' ' | '\n')
 }
 
-/// Partition text into extended grapheme clusters, then remove every boundary
-/// that falls inside a HarfBuzz cluster. This keeps `ffi`/Indic ligatures
-/// atomic without making the rest of the shaped run unwrappable.
+/// Grapheme clusters minus HarfBuzz-internal boundaries, so ligatures stay atomic without freezing the run.
 fn atomic_text_cluster_ranges(
     text: &str,
     glyph_clusters: &[(usize, usize, usize, usize)],
@@ -1193,9 +1161,7 @@ fn pieces_positioned_width(pieces: &[LayoutPiece]) -> f32 {
     let Some(first) = pieces.first() else {
         return 0.0;
     };
-    // libass measures a candidate line from the first cluster's left bbox
-    // edge to the current (last) cluster's right bbox edge. It does not use
-    // the sum of advances, nor the union of every intermediate outline.
+    // Width is first-cluster left bbox to last-cluster right bbox, not advance sum or intermediate union.
     let start = if first.has_ink { first.ink_min } else { 0.0 };
     let (last, prefix) = pieces.split_last().expect("non-empty pieces");
     let pen = prefix.iter().map(|piece| piece.width).sum::<f32>();
@@ -1659,9 +1625,6 @@ mod tests {
 
     #[test]
     fn wrap_keeps_each_ligature_cluster_atomic_without_freezing_the_run() {
-        // Two three-character ligatures separated by a normal break. The old
-        // `chars.len() != glyphs.len()` fallback made this entire run one
-        // unwrappable piece.
         let run = LayoutGlyphRun {
             text: "ffi ffi".to_owned(),
             font: FontMatch::unresolved("Fixture", None, FontProviderKind::Null),
@@ -2035,8 +1998,6 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta gamma delt
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
 
-        // libass wrap_lines_naive breaks only at break opportunities; a word
-        // wider than the wrap width overflows and breaks at the next space.
         assert_eq!(
             layout
                 .lines
@@ -2164,8 +2125,6 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,alpha beta",
             .layout_track_event_with_mode(&track, 0, &provider, ShapingMode::Simple)
             .expect("layout should succeed");
 
-        // libass wrap_lines_naive never splits inside a word: each word
-        // overflows its 4px line and breaks at the following space.
         assert_eq!(
             layout.lines.len(),
             2,
@@ -2376,8 +2335,6 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,日本語日本語",
         );
         let engine = LayoutEngine::new();
         let provider = NullFontProvider;
-        // libass only breaks inside CJK text when ASS_FEATURE_WRAP_UNICODE is
-        // enabled; the default is ASCII-space-only breaking.
         let unicode = engine
             .layout_track_event_with_options(&track, 0, &provider, ShapingMode::Simple, true)
             .expect("layout should succeed");

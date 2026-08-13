@@ -1,9 +1,4 @@
-//! Compatibility for Microsoft non-Unicode OpenType charmaps.
-//!
-//! This mirrors libass 0.17.5's `ass_charmap_magic` and
-//! `ass_font_index_magic`: prefer Microsoft UCS-4/BMP Unicode subtables, but
-//! when a face only has a legacy Microsoft subtable, translate the Unicode
-//! scalar into that subtable's code space before asking for a glyph ID.
+//! Map Unicode to Microsoft legacy cmaps as in libass `ass_charmap_magic`.
 
 use encoding_rs::{BIG5, EUC_KR, EncoderResult, Encoding, GBK, SHIFT_JIS};
 use ttf_parser::{Face, GlyphId, PlatformId, Tag, cmap::Subtable};
@@ -22,7 +17,7 @@ const WINDOWS_UNICODE_FULL: u16 = 10;
 const ARABIC_CHARSET_SIMPLIFIED: u8 = 178;
 const ARABIC_CHARSET_TRADITIONAL: u8 = 179;
 
-/// The cmap selected using libass's Microsoft-preference policy.
+/// Cmap chosen by libass's Microsoft-preference policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontCharmap {
     Unicode,
@@ -37,7 +32,7 @@ pub enum FontCharmap {
 }
 
 impl FontCharmap {
-    /// Whether Unicode must be converted before querying this cmap.
+    /// True when Unicode must be remapped before querying this cmap.
     pub const fn is_legacy(self) -> bool {
         matches!(
             self,
@@ -51,7 +46,6 @@ impl FontCharmap {
     }
 }
 
-/// Report the cmap Rassa/libass will use for a parsed face.
 pub fn font_face_charmap(face: &Face<'_>) -> FontCharmap {
     selected_microsoft_charmap(face)
         .map(|(_, kind)| kind)
@@ -68,15 +62,12 @@ pub fn font_face_charmap(face: &Face<'_>) -> FontCharmap {
         })
 }
 
-/// Return whether complex shaping must use the legacy-compatible glyph path.
+/// True when shaping must use the legacy-compatible glyph path.
 pub fn font_face_uses_legacy_charmap(face: &Face<'_>) -> bool {
     font_face_charmap(face).is_legacy()
 }
 
-/// Resolve a Unicode character to the real glyph ID of the selected cmap.
-///
-/// The returned ID is suitable for shaping metrics and direct raster loading;
-/// callers must not feed the translated legacy codepoint to the rasterizer.
+/// Glyph ID from the selected cmap; do not pass the remapped codepoint to the rasterizer.
 pub fn font_face_glyph_index(face: &Face<'_>, character: char) -> Option<GlyphId> {
     let Some((subtable, kind)) = selected_microsoft_charmap(face) else {
         return face.glyph_index(character);
@@ -85,7 +76,6 @@ pub fn font_face_glyph_index(face: &Face<'_>, character: char) -> Option<GlyphId
     subtable.glyph_index(codepoint)
 }
 
-/// Resolve a glyph directly from a font payload and collection face index.
 pub fn font_data_glyph_index(data: &[u8], face_index: u32, character: char) -> Option<GlyphId> {
     let face = Face::parse(data, face_index).ok()?;
     font_face_glyph_index(&face, character)
@@ -133,9 +123,7 @@ fn classify_microsoft_charmap(face: &Face<'_>, encoding_id: u16) -> FontCharmap 
 }
 
 fn os2_charset(face: &Face<'_>) -> Option<u8> {
-    // OS/2.fsSelection is a big-endian u16 at byte offset 62. Microsoft used
-    // its otherwise-reserved high byte to tag legacy Arabic fonts as charset
-    // 178 (simplified) or 179 (traditional).
+    // OS/2.fsSelection (BE u16 at 62) stores Arabic charset 178/179 in the reserved high byte.
     let os2 = face.raw_face().table(Tag::from_bytes(b"OS/2"))?;
     let selection = u16::from_be_bytes([*os2.get(62)?, *os2.get(63)?]);
     Some((selection >> 8) as u8)
@@ -163,9 +151,7 @@ fn encode_multibyte(encoding: &'static Encoding, symbol: u32) -> Option<u32> {
     let character = char::from_u32(symbol)?;
     let mut input = [0; 4];
     let input = character.encode_utf8(&mut input);
-    // Some encoding_rs encoders conservatively require room for their
-    // maximum unit even though every accepted Microsoft cmap code is <= 2
-    // bytes. Match libass by rejecting, rather than truncating, longer output.
+    // encoding_rs may want a 4-byte buffer; reject encodings that are not 1-2 bytes.
     let mut output = [0; 4];
     let (result, read, written) =
         encoding
@@ -218,9 +204,7 @@ fn encode_johab(symbol: u32) -> Option<u32> {
         return Some(JAMO[(symbol - 0x3131) as usize]);
     }
 
-    // CP1361 reuses KS X 1001 for non-Hangul characters, rearranging its
-    // rows into the Johab byte ranges. EUC_KR is encoding_rs's Windows-949
-    // encoder, so clearing each high bit yields the 7-bit KS coordinates.
+    // Non-Hangul Johab remaps KS X 1001; strip the high bit from Windows-949 bytes.
     let cp949 = encode_multibyte(EUC_KR, symbol)?;
     if cp949 <= 0x7F {
         return Some(cp949);

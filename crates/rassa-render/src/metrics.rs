@@ -4,22 +4,15 @@ use super::*;
 pub(crate) struct FontVerticalMetrics {
     pub(crate) ascender_26_6: i32,
     pub(crate) descender_26_6: i32,
-    /// Underline (top offset below baseline, thickness), both 26.6, from the
-    /// post table the way libass ass_get_glyph_outline derives it:
-    /// top = -underlinePosition - thickness/2.
+    /// Underline (top, thickness) in 26.6: top = -underlinePosition - thickness/2 from the raw post table.
     pub(crate) underline_26_6: Option<(i32, i32)>,
-    /// Strikeout (top offset relative baseline, negative above, thickness)
-    /// from OS/2 yStrikeoutPosition/ySize.
+    /// Strikeout (top, thickness) in 26.6 from OS/2 yStrikeoutPosition/ySize.
     pub(crate) strikeout_26_6: Option<(i32, i32)>,
-    /// OS/2 sTypoDescender scaled (negative below baseline); libass uses it
-    /// to offset rotated @font glyphs (DECO_ROTATE), 0 without an OS/2 table.
+    /// Scaled OS/2 sTypoDescender for DECO_ROTATE @font offset; 0 without OS/2.
     pub(crate) typo_descender_26_6: i32,
 }
 
-/// Per-line ascent/descent in device pixels, mirroring libass
-/// `measure_text` (ass_render.c): line asc/desc is the max over the line's
-/// glyphs of the font's scaled win-metrics (`ass_font_get_asc_desc`),
-/// multiplied by \fscy; drawings contribute asc = height - pbo, desc = pbo.
+/// Line asc/desc is max win-metrics × \fscy; drawings use asc = height - pbo, desc = pbo.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct LineMetrics {
     pub(crate) asc: f64,
@@ -66,9 +59,7 @@ fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> L
             desc: f64::from(metrics.descender_26_6) / 64.0 * scale_y,
         };
     }
-    // No face metrics available (unresolved font path / unparsable font
-    // data).  FT_SIZE_REQUEST_TYPE_REAL_DIM guarantees asc + desc ==
-    // font_size, so recover the split from rendered ink and keep the sum.
+    // Without face metrics, REAL_DIM keeps asc+desc == font_size; split from ink.
     let mut ink_ascender = 0_i32;
     if !run.glyphs.is_empty() {
         let rasterizer = Rasterizer::with_options(RasterOptions {
@@ -101,20 +92,13 @@ fn drawing_run_metrics(
     let Some(drawing) = run.drawing.as_ref() else {
         return LineMetrics::default();
     };
-    // Use the same exact 26.6 outline and endpoint rounding as the drawing
-    // raster path.  Deriving metrics from ParsedDrawing's integer compatibility
-    // polygons makes the line ascender cross whole-pixel thresholds at a
-    // different fscy value than the rendered height, which shows up as a
-    // one-pixel vertical bounce during slow frame-baked scaling.
+    // Use the same 26.6 outline as rasterization so metrics and ink cross pixel thresholds together.
     let effective_style = resolve_run_style(run, context.source_event, context.now_ms);
     let Some(height) = scaled_polygons.and_then(drawing_height_exact_from_d6) else {
         return LineMetrics::default();
     };
     let scale_y = style_scale(effective_style.scale_y) * style_scale(context.render_scale.y);
-    // libass (ass_render.c get_bitmap_glyph): drawing desc = pbo, asc =
-    // bbox height - pbo, both scaled by scale.y which already includes the
-    // 1/2^(\p - 1) drawing-scale division (rassa pre-divides the polygon
-    // coordinates at parse time, so only pbo needs the division here).
+    // Drawing desc = pbo, asc = bbox height - pbo; only pbo still needs the 2^(\p-1) divide.
     let height = height.max(0.0);
     let pbo = drawing_pbo_script_pixels(&effective_style, drawing) * scale_y;
     if libass_outline_coordinate_from_f64(height).is_none()
@@ -128,8 +112,7 @@ fn drawing_run_metrics(
     }
 }
 
-/// \pbo in script pixels: libass keeps pbo in drawing-coordinate units, so
-/// it is divided by the same 2^(\p - 1) factor as the drawing itself.
+/// \pbo in script pixels: divide drawing-coordinate pbo by the same 2^(\p-1) as the drawing.
 pub(crate) fn drawing_pbo_script_pixels(style: &ParsedSpanStyle, drawing: &ParsedDrawing) -> f64 {
     if !style.pbo.is_finite() {
         return 0.0;
@@ -158,9 +141,7 @@ pub(crate) fn line_metrics_for_line(
     line_index: usize,
     context: &LineMetricsContext<'_>,
 ) -> LineMetrics {
-    // libass measure_text ignores the metrics of line-leading/trailing
-    // trimmed whitespace, except when the line is empty after trimming;
-    // an empty line counts at half height (scale = 0.5/64).
+    // Trimmed leading/trailing whitespace is ignored; an empty line is half height.
     let content_runs = line
         .runs
         .iter()
@@ -205,16 +186,13 @@ pub(crate) fn line_spacing(config: &RendererConfig) -> f64 {
     }
 }
 
-/// Total text height per libass measure_text: sum of per-line asc+desc plus
-/// `line_spacing` per line break.
+/// Sum of per-line asc+desc plus line_spacing per break.
 pub(crate) fn total_text_height(metrics: &[LineMetrics], config: &RendererConfig) -> f64 {
     let height: f64 = metrics.iter().map(|line| line.height()).sum();
     height + line_spacing(config) * metrics.len().saturating_sub(1) as f64
 }
 
-/// Line advance width in device pixels: sum of scaled glyph advances
-/// (including \fsp spacing and \fscx), matching libass compute_string_bbox
-/// which measures from cluster advances, never from rendered ink.
+/// Line advance from cluster advances (\fsp/\fscx), never from rendered ink.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rendered_text_alignment_width(
     line: &rassa_layout::LayoutLine,
@@ -273,18 +251,11 @@ pub(crate) fn rendered_text_alignment_width(
             + 32)
             >> 6;
     }
-    // Keep a true zero advance: libass uses this width for EventImages and
-    // excludes zero-area events from collision placement. A combining-only
-    // event can still produce visible ink while having no horizontal advance.
+    // Keep a true zero advance so combining-only events stay out of collision placement.
     width
 }
 
-/// Unrounded device-space line advance used by positioned text rasterization.
-///
-/// Collision/layout compatibility still uses the integer helper above.  The
-/// exact companion prevents a centred `\an5` line from changing its origin by
-/// a whole pixel when a slowly animated `\fscx` crosses a bitmap-size rounding
-/// threshold.
+/// Unrounded line advance for positioned text; integer width still owns collision/layout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rendered_text_alignment_width_exact(
     line: &rassa_layout::LayoutLine,
@@ -353,13 +324,7 @@ pub(crate) fn font_vertical_metrics(
     let ascender = scale(face.ascender().into());
     let descender = scale((-face.descender()).into());
 
-    // libass ass_get_glyph_outline: underline from the *raw* post table when
-    // underlinePosition <= 0 and underlineThickness > 0, scaled with the exact
-    // ((val * y_scale + 0x8000) >> 16) arithmetic libass uses (ass_font.c:769).
-    // Note: this reads TT_Postscript (the raw post values), NOT
-    // FT_FaceRec.underline_position, which FreeType has already recentered by
-    // -thickness/2 at face load (sfobjs.c). Using the recentered value here and
-    // then applying -size/2 again double-recenters the bar ~thickness/2 lower.
+    // Underline from raw post (not FreeType's recentered face value); scale (val*y_scale+0x8000)>>16.
     let scale_libass = |value: i32| ((i64::from(value) * metrics.y_scale + 0x8000) >> 16) as i32;
     let post = unsafe {
         ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_post)
@@ -381,7 +346,6 @@ pub(crate) fn font_vertical_metrics(
         .then(|| unsafe { &*os2 })
         .filter(|os2| os2.yStrikeoutPosition >= 0 && os2.yStrikeoutSize > 0)
         .map(|os2| {
-            // Same exact arithmetic libass uses (ass_font.c:782).
             let pos = scale_libass(os2.yStrikeoutPosition.into());
             let size = scale_libass(os2.yStrikeoutSize.into());
             (-pos - size / 2, size)
@@ -410,11 +374,7 @@ pub(crate) fn font_vertical_metrics(
     font_vertical_metrics_from_data(&data, font.face_index.unwrap_or(0), size_26_6)
 }
 
-/// FreeType-free `font_vertical_metrics` used on targets without the
-/// FreeType rasterizer.  Replicates apply_gdi_font_metrics (win → typo →
-/// bbox ascender/descender) and FT_SIZE_REQUEST_TYPE_REAL_DIM scaling with
-/// FreeType's FT_DivFix/FT_MulFix rounding so it matches the FreeType path
-/// bit for bit (asserted by a test on the FreeType targets).
+/// FreeType-free metrics: win → typo → bbox, then REAL_DIM via FT_DivFix/FT_MulFix rounding.
 #[cfg(any(test, target_os = "macos", target_arch = "wasm32", not(unix)))]
 pub(crate) fn font_vertical_metrics_from_data(
     data: &[u8],
@@ -429,8 +389,7 @@ pub(crate) fn font_vertical_metrics_from_data(
     let mut descender = i32::from(hhea.descender);
     let mut height = ascender - descender + i32::from(hhea.line_gap);
     if let Some(os2) = tables.os2 {
-        // ttf-parser reads the unsigned spec fields as signed (like libass)
-        // and returns the descender already negated.
+        // ttf-parser treats the unsigned spec fields as signed and already negates the descender.
         let win_ascender = i32::from(os2.windows_ascender());
         let win_descender = i32::from(os2.windows_descender());
         if win_ascender - win_descender != 0 {
@@ -456,8 +415,7 @@ pub(crate) fn font_vertical_metrics_from_data(
         }
     }
 
-    // REAL_DIM maps ascender - descender onto the requested height:
-    // y_scale = FT_DivFix(size, asc - desc), values FT_MulFix'ed by it.
+    // REAL_DIM: y_scale = FT_DivFix(size, asc - desc); values are FT_MulFix'ed by it.
     let units = i64::from(ascender - descender);
     if units <= 0 {
         return None;
@@ -467,9 +425,7 @@ pub(crate) fn font_vertical_metrics_from_data(
         let product = i64::from(value) * y_scale;
         ((product + 0x8000 - i64::from(product < 0)) >> 16) as i32
     };
-    // Decoration bars use libass's exact rounding (ass_font.c:769): a plain
-    // arithmetic shift of (val * y_scale + 0x8000), with NO negative-bias
-    // adjustment, on the *raw* post/OS-2 values.
+    // Decoration bars: (val * y_scale + 0x8000) >> 16 on raw post/OS/2, no negative bias.
     let scale_deco = |value: i32| ((i64::from(value) * y_scale + 0x8000) >> 16) as i32;
 
     let underline = tables
@@ -477,8 +433,7 @@ pub(crate) fn font_vertical_metrics_from_data(
         .map(|post| post.underline_metrics)
         .filter(|line| line.position <= 0 && line.thickness > 0)
         .map(|line| {
-            // Raw post-table position (not FreeType's recentered face value);
-            // libass recenters exactly once via -pos - size/2.
+            // Raw post-table position; recenter once as -pos - size/2.
             let pos = scale_deco(line.position.into());
             let size = scale_deco(line.thickness.into());
             (-pos - size / 2, size)

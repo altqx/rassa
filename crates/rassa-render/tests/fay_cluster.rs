@@ -75,10 +75,7 @@ fn visible_bounds(planes: &[ImagePlane]) -> Option<Rect> {
 
 #[test]
 fn positive_fay_shears_every_glyph_inside_a_harfbuzz_cluster_downward() {
-    // Aileron's `a` + U+0326 shapes into a single two-glyph cluster. Before
-    // libass 582630d, only the first glyph's advance contributed to the
-    // baseline shear, leaving the later glyph raised. Current libass lowers
-    // the visible bottom by 26 pixels for this deterministic fixture.
+    // a+U+0326 is one two-glyph cluster; \fay0.5 must lower the visible bottom by ~26px.
     let provider = FixtureFontProvider::new();
     let plain = parse_script_text(&fay_cluster_script(None)).expect("plain fixture parses");
     let sheared =

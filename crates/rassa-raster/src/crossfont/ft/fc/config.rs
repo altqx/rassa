@@ -11,15 +11,12 @@ foreign_type! {
 }
 
 impl Config {
-    /// Get the current configuration.
     pub fn get_current() -> &'static ConfigRef {
         unsafe { ConfigRef::from_ptr(FcConfigGetCurrent()) }
     }
 }
 
 impl ConfigRef {
-    /// Returns one of the two sets of fonts from the configuration as
-    /// specified by `set`.
     pub fn get_fonts(&self, set: SetName) -> &FontSetRef {
         unsafe {
             let ptr = FcConfigGetFonts(self.as_ptr(), set as u32);

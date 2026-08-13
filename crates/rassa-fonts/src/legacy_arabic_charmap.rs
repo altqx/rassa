@@ -16,13 +16,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-// Generated from libass 0.17.5's legacy_arabic_cmap/ArabicPUA*.txt.
-// Source hashes:
-// ArabicPUASimplified.txt:
-//   50c8d88f395c11d3c66a3e985a8f7cd6ac274cfbcfd1bb8e68f64bb145c2a928
-// ArabicPUATraditional.txt:
-//   aefe2312c75bf55c9b92c3809cd33ce6f0218157b41d2012c1e3ec597fd7b5ee
-// Keep this data in sync with upstream ass_arabic_charmap.c.
+// Generated from libass 0.17.5 ArabicPUA*.txt; keep in sync with ass_arabic_charmap.c.
+// ArabicPUASimplified.txt: 50c8d88f395c11d3c66a3e985a8f7cd6ac274cfbcfd1bb8e68f64bb145c2a928
+// ArabicPUATraditional.txt: aefe2312c75bf55c9b92c3809cd33ce6f0218157b41d2012c1e3ec597fd7b5ee
 
 fn lookup(table: &[(u32, u32)], symbol: u32) -> u32 {
     table

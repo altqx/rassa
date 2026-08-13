@@ -42,9 +42,7 @@ unsafe fn character_summary(mut image: *mut rassa_capi::ASS_Image) -> CharacterS
 
 #[test]
 fn public_event_and_style_mutations_invalidate_render_cache() {
-    // ASS_Track exposes writable event/style arrays. libass reads them again
-    // on every render, so same-address in-place changes must not be hidden by
-    // Rassa's parsed-track/frame caches.
+    // In-place ASS_Track event/style writes must invalidate parsed-track/frame caches.
     const SCRIPT: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,50,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an7\\pos(20,20)}A\n";
 
     unsafe {

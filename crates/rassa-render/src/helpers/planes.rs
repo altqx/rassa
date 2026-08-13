@@ -11,9 +11,7 @@ pub(crate) fn translate_planes(mut planes: Vec<ImagePlane>, offset: Point) -> Ve
     planes
 }
 
-/// \clip coordinates map like positioned coordinates (libass
-/// x2scr_pos_scaled / y2scr_pos: content scale plus margin offsets). Animated
-/// clips keep fractional script-space edges until this final mapping step.
+/// Map \clip like \pos (content scale + margin offsets); keep fractional edges until this step.
 pub(crate) fn scale_clip_rect_exact(rect: ParsedRectF64, mapping: &EventMapping) -> Rect {
     Rect {
         x_min: mapping.map_x_pos(rect.x_min).round() as i32,
@@ -23,9 +21,7 @@ pub(crate) fn scale_clip_rect_exact(rect: ParsedRectF64, mapping: &EventMapping)
     }
 }
 
-/// libass clip policy (ass_render_event): normal events under use_margins
-/// clip only to the full frame; everything else (use_margins off, or
-/// explicit events) clips to the content area between the margins.
+/// use_margins normal events clip to the full frame; others clip to the content area.
 pub(crate) fn frame_clip_rect(
     track: &ParsedTrack,
     config: &RendererConfig,
@@ -59,8 +55,7 @@ pub(crate) fn compute_horizontal_origin(
     mapping: &EventMapping,
 ) -> i32 {
     let block_width = block_width.max(line_width);
-    // libass makes horizontal scrolling use the event's alignment as its
-    // justification, regardless of the style's Justify value.
+    // Horizontal scroll justifies from the event alignment, ignoring style Justify.
     let requested_justify = if horizontal_scroll {
         match event.alignment & 0x3 {
             ass::HALIGN_CENTER => ass::ASS_JUSTIFY_CENTER,
@@ -94,11 +89,7 @@ pub(crate) fn compute_horizontal_origin(
         };
         return block_origin + line_offset;
     }
-    // libass: left edge = x2scr_left(MarginL), right edge =
-    // x2scr_right(PlayResX - MarginR); halign anchors the widest line
-    // within them, then Justify aligns every shorter line inside that block.
-    // This mirrors ass_render.c align_lines(), including selective Justify
-    // overrides supplied through the public API.
+    // Left = x2scr_left(MarginL), right = x2scr_right(PlayResX - MarginR); Justify aligns shorter lines in that block.
     let left_edge = mapping.x_left(f64::from(event.margin_l));
     let right_edge = mapping.x_right(f64::from(track.play_res_x) - f64::from(event.margin_r));
     let block_origin = match event.alignment & 0x3 {
@@ -109,12 +100,7 @@ pub(crate) fn compute_horizontal_origin(
     block_origin + line_offset
 }
 
-/// Map a positioned event without discarding its script-space fraction.
-///
-/// libass keeps `\\pos` / `\\move` coordinates as doubles through x2scr/y2scr
-/// and only quantizes the finished outline translation.  Mapping an already
-/// rounded script coordinate makes slow frame-baked motion pause for several
-/// frames and then jump by a whole output pixel.
+/// Map \pos/\move as doubles; quantize only the finished outline translation.
 pub(crate) fn scale_position_exact(
     position: Option<(f64, f64)>,
     mapping: &EventMapping,
@@ -122,17 +108,12 @@ pub(crate) fn scale_position_exact(
     position.map(|(x, y)| (mapping.map_x_pos(x), mapping.map_y_pos(y)))
 }
 
-/// Quantize an output-space anchor to libass's bitmap-cache phase grid.
-///
-/// `quantize_transform` uses `SUBPIXEL_ORDER == 3`, retaining one eighth of
-/// an output pixel in the rasterized bitmap while exposing an integer image
-/// destination through the public API.
+/// Quantize the output-space anchor to the 1/8-pixel bitmap-cache phase grid.
 #[cfg(test)]
 pub(crate) fn quantize_libass_subpixel_point((x, y): (f64, f64)) -> (f64, f64) {
     let quantize = |value: f64| {
         if value.is_finite() {
-            // ass_lrint follows the default FE_TONEAREST mode: halfway
-            // values go to the even phase bucket, including negative ties.
+            // Halfway values go to the even phase bucket, including negative ties.
             (value * 8.0).round_ties_even() / 8.0
         } else {
             value
@@ -141,8 +122,7 @@ pub(crate) fn quantize_libass_subpixel_point((x, y): (f64, f64)) -> (f64, f64) {
     (quantize(x), quantize(y))
 }
 
-/// Resolve `\\pos` / `\\move` in script coordinates while retaining the
-/// fractional position used by libass until its final outline quantization.
+/// Resolve \pos/\move in script space, keeping the fraction until outline quantization.
 pub(crate) fn resolve_event_position_exact(
     track: &ParsedTrack,
     event: &LayoutEvent,
@@ -267,11 +247,7 @@ fn move_wrapping_delta(to: i32, from: i32) -> i32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Compute per-line tops (top = baseline - asc) following libass
-/// ass_render_event (ass_render.c): the event's total text height is the sum
-/// of per-line asc+desc (measure_text), the first baseline is anchored per
-/// valign / \pos base point (get_base_point), and successive baselines step
-/// by desc[i] + asc[i+1] + line_spacing.
+/// Per-line tops (baseline - asc); first baseline from valign/\pos, then desc[i]+asc[i+1]+line_spacing.
 pub(crate) fn compute_vertical_layout(
     track: &ParsedTrack,
     metrics: &[LineMetrics],
@@ -300,8 +276,7 @@ pub(crate) fn compute_vertical_layout(
                 let scr_top = mapping.y_top(0.0);
                 let line_position = config.line_position.clamp(0.0, 100.0);
                 let mut top = scr_bottom + (scr_top - scr_bottom) * line_position / 100.0 - total;
-                // libass clips to the top edge when line_position pushes the
-                // subtitle off-screen, but never otherwise.
+                // Clip to the top edge only when line_position pushes the subtitle off-screen.
                 if top < scr_top && line_position > 0.0 {
                     top = scr_top;
                 }
@@ -319,21 +294,17 @@ pub(crate) fn compute_vertical_layout(
     positions
 }
 
-/// One event's finished images plus the collision metadata libass keeps in
-/// EventImages.
 pub(crate) struct RenderedEvent {
     pub(crate) event_index: usize,
     pub(crate) planes: Vec<ImagePlane>,
-    /// libass EventImages rect: metric line box plus borders, not ink.
+    /// Metric line box plus borders, not ink.
     pub(crate) collision_rect: Option<Rect>,
     pub(crate) detect_collisions: bool,
     pub(crate) shift_direction: i32,
     pub(crate) frame_clip: Rect,
 }
 
-/// Port of libass fit_rect (ass_render.c): accumulate the shift needed to
-/// clear every already-used rect in the given direction; `used` is sorted by
-/// y_min.
+/// Accumulate the shift that clears every used rect in this direction; used is sorted by y_min.
 fn fit_rect(rect: Rect, used: &[Rect], direction: i32) -> i32 {
     let mut shift = 0;
     if direction >= 0 {
@@ -366,17 +337,13 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.y_min < b.y_max && b.y_min < a.y_max && a.x_min < b.x_max && b.x_min < a.x_max
 }
 
-/// Port of libass fix_collisions (ass_render.c): events already positioned
-/// in a previous frame stay put while their height is unchanged and they
-/// don't overlap another fixed event; everything else is shifted into free
-/// space with fit_rect and becomes fixed.
+/// Cached events stay put if height is unchanged and they do not overlap a fixed event; else fit_rect.
 pub(crate) fn fix_collisions(
     cache: &mut std::collections::HashMap<usize, Rect>,
     records: &mut [RenderedEvent],
 ) {
     let mut used: Vec<Rect> = Vec::new();
 
-    // Pass 1: keep events at their cached positions where still valid.
     let mut fixed_shift = vec![None; records.len()];
     for (index, record) in records.iter().enumerate() {
         if !record.detect_collisions {
@@ -403,7 +370,6 @@ pub(crate) fn fix_collisions(
     }
     used.sort_by_key(|rect| rect.y_min);
 
-    // Pass 2: fit the remaining events into free space and fix them.
     for (index, record) in records.iter_mut().enumerate() {
         if !record.detect_collisions {
             continue;
@@ -436,8 +402,7 @@ pub(crate) fn fix_collisions(
     }
 }
 
-/// libass sorts events by layer and fixes collisions independently for each
-/// contiguous same-layer group before concatenating the image lists.
+/// Fix collisions independently for each contiguous same-layer group.
 pub(crate) fn fix_collisions_by_layer(
     cache: &mut std::collections::HashMap<usize, Rect>,
     records: &mut [RenderedEvent],
@@ -475,10 +440,7 @@ pub(crate) fn translate_planes_y(planes: &mut [ImagePlane], delta_y: i32) {
     }
 }
 
-/// Decoration bars per libass ass_get_glyph_outline: underline from the post
-/// table, strikeout from OS/2, each a rect spanning the run advance at
-/// font-metric position/thickness (scaled by \fscy), part of the glyph
-/// geometry so it inherits border and shadow treatment.
+/// Underline (post) and strikeout (OS/2) rects across the run advance, scaled by \fscy.
 pub(crate) fn text_decoration_bars(
     style: &ParsedSpanStyle,
     font: &FontMatch,
@@ -534,9 +496,7 @@ pub(crate) fn solid_plane_from_rect(rect: Rect, color: u32, kind: ass::ImageType
     }
 }
 
-/// Composite a run's glyph bitmaps into one plane.  Glyphs sit on the
-/// line baseline: y = ascender - glyph.top, where ascender is the line's
-/// metric ascent (libass: pos.y = baseline; bitmaps offset by glyph top).
+/// Composite glyphs onto the line baseline: y = ascender - glyph.top.
 #[cfg(test)]
 pub(crate) fn combined_image_plane_from_glyphs(
     glyphs: &[RasterGlyph],
@@ -573,8 +533,7 @@ pub(crate) fn combined_image_plane_from_glyphs_xy(
 ) -> Option<ImagePlane> {
     let ascender =
         ascender.unwrap_or_else(|| glyphs.iter().map(|glyph| glyph.top).max().unwrap_or(0));
-    // libass accumulates the pen in 26.6 units and floors per glyph
-    // (render_and_combine_glyphs: x = pos.x >> 6).
+    // Accumulate the pen in 26.6 and floor per glyph (x = pos.x >> 6).
     let mut pen_x = origin_x_26_6;
     let mut pen_y = 0_i32;
     let mut min_x = i32::MAX;
@@ -642,8 +601,7 @@ pub(crate) fn combined_image_plane_from_glyphs_xy(
             for x in 0..glyph_width {
                 let src = glyph.bitmap[y * glyph_stride + x];
                 let dst = &mut bitmap[(y0 + y) * width + x0 + x];
-                // Glyph outlines within a composite are coverage masks, not
-                // set membership: overlapping coverage adds and clips at 255.
+                // Overlapping glyph coverage adds and clips at 255.
                 *dst = dst.saturating_add(src);
             }
         }
@@ -668,9 +626,7 @@ pub(crate) fn combined_image_plane_from_glyphs_xy(
     })
 }
 
-/// Composite glyphs whose outline-space rasterization already resolved their
-/// absolute libass-style Q8 position. Blur is intentionally applied only
-/// after the run is combined, matching `render_and_combine_glyphs`.
+/// Composite glyphs already placed in Q8; blur only after the run is combined.
 pub(crate) fn combined_image_plane_from_positioned_glyphs(
     glyphs: &[PositionedRasterGlyph],
     color: u32,

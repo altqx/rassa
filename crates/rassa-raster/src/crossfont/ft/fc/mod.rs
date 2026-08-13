@@ -30,9 +30,7 @@ pub use char_set::{CharSet, CharSetRef};
 pub mod pattern;
 pub use pattern::{FtFaceLocation, Pattern, PatternHash, PatternRef};
 
-/// Find the font closest matching the provided pattern.
-///
-/// The returned pattern is the result of Pattern::render_prepare.
+/// Closest match after Pattern::render_prepare.
 pub fn font_match(config: &ConfigRef, pattern: &PatternRef) -> Option<Pattern> {
     unsafe {
         let mut result = FcResultNoMatch;
@@ -46,21 +44,19 @@ pub fn font_match(config: &ConfigRef, pattern: &PatternRef) -> Option<Pattern> {
     }
 }
 
-/// Reloads the Fontconfig configuration files.
 pub fn update_config() {
     unsafe {
         let _ = FcInitBringUptoDate();
     }
 }
 
-/// List fonts by closeness to the pattern.
 pub fn font_sort(config: &ConfigRef, pattern: &PatternRef) -> Option<FontSet> {
     let ptr = unsafe {
         let mut result = FcResultNoMatch;
         FcFontSort(
             config.as_ptr(),
             pattern.as_ptr(),
-            // Disable font list trimming, since we manually exclude fonts we cannot render.
+            // No FcFontSort trim; we drop unusable faces ourselves.
             0,
             ptr::null_mut(),
             &mut result,
@@ -74,7 +70,6 @@ pub fn font_sort(config: &ConfigRef, pattern: &PatternRef) -> Option<FontSet> {
     }
 }
 
-/// List fonts matching pattern.
 pub fn font_list(
     config: &ConfigRef,
     pattern: &PatternRef,
@@ -91,14 +86,12 @@ pub fn font_list(
     }
 }
 
-/// Available font sets.
 #[derive(Debug, Copy, Clone)]
 pub enum SetName {
     System = FcSetSystem as isize,
     Application = FcSetApplication as isize,
 }
 
-/// When matching, how to match.
 #[derive(Debug, Copy, Clone)]
 pub enum MatchKind {
     Font = FcMatchFont as isize,
@@ -226,7 +219,6 @@ impl From<isize> for Rgba {
     }
 }
 
-/// Hinting Style.
 #[derive(Debug, Copy, Clone)]
 pub enum HintStyle {
     None,
@@ -246,7 +238,7 @@ impl fmt::Display for HintStyle {
     }
 }
 
-/// Lcd filter, used to reduce color fringing with subpixel rendering.
+/// LCD filter for subpixel color fringing.
 pub enum LcdFilter {
     None,
     Default,

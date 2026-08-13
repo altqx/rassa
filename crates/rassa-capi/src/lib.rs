@@ -103,9 +103,7 @@ unsafe fn emit_library_message(library: *mut ASS_Library, level: c_int, message:
     }
 }
 
-/// Executes the complete wasm C-callback bridge for the standalone Node smoke
-/// test. This symbol is absent unless the build script's explicit test cfg is
-/// enabled, so it cannot extend or conflict with the production libass ABI.
+/// Test-only wasm C-callback probe; compiled only with the explicit test cfg.
 #[cfg(all(target_arch = "wasm32", rassa_wasm_message_callback_test))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rassa_wasm_message_callback_lifecycle_test() -> c_int {
@@ -641,9 +639,7 @@ fn next_raster_cache_namespace() -> u64 {
 fn raster_cache_limits_from_c(glyph_max: c_int, bitmap_max_size: c_int) -> RasterCacheLimits {
     let defaults = RasterCacheLimits::default();
     RasterCacheLimits {
-        // libass assigns a nonzero int directly to size_t. Preserve the useful
-        // consequence for negative values (effectively unlimited) without any
-        // overflowing allocation or multiplication.
+        // libass assigns a nonzero int to size_t; negatives mean unlimited.
         glyph_max: if glyph_max == 0 {
             defaults.glyph_max
         } else {

@@ -58,9 +58,7 @@ pub(crate) fn blur_bitmap_xy(
         return (source, width, height, 0, 0);
     }
 
-    // libass reserves a small zero border before applying \be.  The box
-    // filter itself keeps the bitmap dimensions unchanged; this padding is
-    // enough for every supported number of passes (MAX_BE = 127).
+    // Zero-pad before \be (box filter does not grow the bitmap); enough for MAX_BE = 127.
     let be = blur.be.min(127);
     let be_pad = ass_be_padding(be);
     if be_pad > 0 {
@@ -287,9 +285,7 @@ pub(crate) struct LibassBlurMethod {
     pub(crate) coeff: [i16; 8],
 }
 
-/// Quantize an authored `\blur` value after applying libass's per-axis
-/// renderer scale.  libass stores this logarithmic index in the bitmap-cache
-/// key, so nearby animated values deliberately share one filter kernel.
+/// Logarithmic `\blur` cache key after per-axis scale; nearby values share one kernel.
 pub(crate) fn libass_quantize_blur(blur: f64) -> u32 {
     const POSITION_PRECISION: f64 = 8.0;
     const BLUR_PRECISION: f64 = 1.0 / 256.0;
@@ -305,9 +301,7 @@ pub(crate) fn libass_quantize_blur(blur: f64) -> u32 {
     qblur.round_ties_even().clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
-/// Restore libass's squared Gaussian sigma from its cached quantization
-/// index.  Keeping the index intact avoids the old quarter-pixel ceiling,
-/// which made `\blur2.01` jump to the kernel for `\blur2.25`.
+/// Squared Gaussian sigma from the cached qblur index (do not re-quantize).
 pub(crate) fn libass_blur_r2_from_qblur(qblur: u32) -> f64 {
     const POSITION_PRECISION: f64 = 8.0;
     const BLUR_PRECISION: f64 = 1.0 / 256.0;

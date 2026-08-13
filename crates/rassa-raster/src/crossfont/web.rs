@@ -1,7 +1,4 @@
-//! Web/wasm rasterization backend.
-//!
-//! This backend intentionally avoids native font APIs. It can rasterize explicit
-//! font bytes supplied by the caller and provides no system font discovery.
+//! Wasm backend: rasterize caller-supplied font bytes; no system font discovery.
 
 use std::collections::HashMap;
 use std::path::Path;

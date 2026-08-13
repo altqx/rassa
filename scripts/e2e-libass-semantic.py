@@ -142,13 +142,7 @@ def bounds_close(
 ) -> bool:
     if left is None or right is None:
         return left == right
-    # Geometry is semantic, but ink extents also contain the rasterizer's
-    # outline/blur support. Rassa intentionally does not use libass's raster
-    # backend, so allow a caller-selected fraction of each output axis while
-    # still comparing timing, visibility, plane kinds/colours/order and
-    # per-kind placement. Official PNG snapshots use 3%; dense animation and
-    # high-resolution transform probes use 1.5% to catch partial wipes and
-    # projective drift hidden by the broader raster-support allowance.
+    # Allow a fraction of each axis for raster vs outline extents; official PNGs use 3%, dense probes 1.5%.
     tolerance_x = max(6, math.ceil(width * tolerance_fraction))
     tolerance_y = max(6, math.ceil(height * tolerance_fraction))
     return (
@@ -230,10 +224,7 @@ def dense_animation_frames(workspace: Path, regression: Path) -> list[DenseFrame
     """Animation/high-resolution oracles not represented by upstream PNG snapshots."""
     frames: list[DenseFrame] = []
 
-    # Projective camera distance depends on storage resolution.  The original
-    # 220x140 fixture can look close while the same script diverges by hundreds
-    # of pixels at 1080p, so exercise its complete one-second animation at the
-    # resolution used by the visual comparison.
+    # Re-run the 220x140 projective fixture at 1080p; camera distance depends on storage size.
     vector = workspace / "crates/rassa-test/fixtures/libass/compare/edge/vector_transform.ass"
     for time_ms in frame_times(0, 1000):
         frames.append(
@@ -301,10 +292,7 @@ def dense_animation_frames(workspace: Path, regression: Path) -> list[DenseFrame
                 )
             )
 
-    # The upstream karaoke run-split fixture has PlayRes 640x120. At a
-    # 1920x1080 output, font advances use the 9x vertical screen scale while
-    # x2scr margin width uses the 3x horizontal scale. Comparing only the
-    # fixture's native PNG misses the resulting three-line topology.
+    # Karaoke PlayRes 640x120 wraps to three lines at 1920x1080 due to anisotropic x2scr scale.
     karaoke_runsplits = regression / "karaoke" / "karaoke-and-runsplits.ass"
     if karaoke_runsplits.is_file():
         frames.append(
@@ -354,13 +342,7 @@ def compare_vertical_karaoke_curve(
     rassa_lib_dir: Path,
     libass_tests: Path,
 ) -> tuple[int, int, int]:
-    """Compare every encoded-frame sample of upstream's rotated `\\K` fixture.
-
-    Whole-event ink bounds are intentionally not used here: immediately after
-    a syllable boundary, one rasterizer can light an antialiased edge while the
-    other still has zero coverage, making a union bound jump by a full glyph.
-    The observable semantic is the monotonic, progressive red reveal.
-    """
+    """Compare the rotated `\\K` fixture via progressive red widths, not union bounds."""
     regression = libass_tests / "regression"
     script = regression / "karaoke" / "216-vertical.ass"
     fonts = regression / ".fonts"

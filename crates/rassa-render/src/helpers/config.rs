@@ -26,10 +26,7 @@ pub(crate) fn output_scale_y(track: &ParsedTrack, config: &RendererConfig) -> f6
 }
 
 pub(crate) fn effective_pixel_aspect(track: &ParsedTrack, config: &RendererConfig) -> f64 {
-    // libass always derives PAR from LayoutRes when both dimensions are
-    // present; LayoutRes explicitly overrides ass_set_storage_size and an
-    // explicit ass_set_pixel_aspect value. Without LayoutRes, a positive
-    // explicit PAR wins and storage is only used when PAR is unset (zero).
+    // LayoutRes always wins for PAR; else a positive explicit PAR beats storage (used only when PAR is 0).
     if layout_resolution(track).is_some() {
         return derived_pixel_aspect(track, config).unwrap_or(1.0);
     }
@@ -81,14 +78,11 @@ pub(crate) fn frame_content_size(track: &ParsedTrack, config: &RendererConfig) -
 }
 
 pub(crate) fn output_mapping_size(track: &ParsedTrack, config: &RendererConfig) -> Size {
-    // libass screen_scale always maps PlayRes onto the content frame (frame
-    // minus margins); use_margins only changes where events are anchored.
+    // screen_scale maps PlayRes onto the content frame; use_margins only changes anchoring.
     frame_content_size(track, config)
 }
 
-/// Resolution used by libass for blur and for unscaled borders/shadows.
-/// Unlike text placement, an explicit pixel aspect can synthesize one axis
-/// when neither LayoutRes nor a storage size was supplied.
+/// Blur/unscaled-border layout: explicit PAR can synthesize one axis if LayoutRes and storage are absent.
 pub(crate) fn filter_layout_resolution(track: &ParsedTrack, config: &RendererConfig) -> Size {
     if let Some(layout) = layout_resolution(track).or_else(|| storage_resolution(config)) {
         return layout;
@@ -156,12 +150,8 @@ pub(crate) fn renderer_blur_scales(
     )
 }
 
-/// Vertical scale libass uses for the 3D projection camera distance.
-///
-/// `calc_transform_matrix` uses `blur_scale_y`, whose source height follows
-/// the event's font screen: normal margin-placed events use the aspect-fitted
-/// height, while explicit events use the full content height.  Its denominator
-/// is storage/LayoutRes rather than PlayRes.
+/// 3D camera distance uses blur_scale_y (fitted height for margin events, content height for explicit).
+/// Denominator is storage/LayoutRes, not PlayRes.
 pub(crate) fn renderer_projection_scale_y(
     track: &ParsedTrack,
     config: &RendererConfig,
@@ -182,13 +172,8 @@ pub(crate) fn renderer_projection_scale_y(
     style_scale(font_screen_height / f64::from(layout.height.max(1))) * font_scale
 }
 
-/// Scales used by libass's pre-render line-breaking pass.
-///
-/// Font glyph bboxes and advances are in device pixels after applying the
-/// vertical font-screen scale.  Drawings instead use the horizontal screen
-/// scale divided by PAR.  The margin span is measured with x2scr, which uses
-/// the same horizontal/PAR mapping and, for non-explicit events with margins
-/// enabled, the aspect-fitted screen.
+/// Wrap scales: glyphs use the vertical font-screen scale; drawings and x2scr use horizontal/PAR.
+/// Non-explicit use_margins events measure the span on the aspect-fitted screen.
 pub(crate) fn renderer_wrap_scales(
     track: &ParsedTrack,
     config: &RendererConfig,
@@ -244,13 +229,7 @@ pub(crate) fn frame_size(track: &ParsedTrack, config: &RendererConfig) -> Size {
     }
 }
 
-/// Per-event script-to-screen coordinate mapping, mirroring the libass
-/// x2scr/y2scr family (ass_render.c): positioned coordinates (and all
-/// coordinates of explicit events, or every event when use_margins is off)
-/// map onto the content frame offset by the margins; margin-anchored
-/// coordinates of normal events under use_margins map onto the content
-/// frame aspect-fitted into the full frame, letterboxed right/bottom-heavy
-/// exactly like fit_width/fit_height.
+/// Script-to-screen mapping: explicit/pos use the content frame; use_margins letterboxes normal events.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EventMapping {
     pub(crate) explicit: bool,
@@ -333,7 +312,7 @@ pub(crate) fn event_mapping(
     let frame_h = f64::from(frame.height.max(0));
     let content_w = f64::from(track.play_res_x.max(1)) * style_scale(scale_x);
     let content_h = f64::from(track.play_res_y.max(1)) * style_scale(scale_y);
-    // libass ass_reconfigure: aspect-fit the content into the full frame.
+    // Aspect-fit the content into the full frame.
     let (fit_w, fit_h) = if content_w * frame_h >= content_h * frame_w {
         (
             frame_w,
@@ -435,8 +414,7 @@ mod wrap_scale_tests {
         let normal = renderer_wrap_scales(&track, &config, false);
         let explicit = renderer_wrap_scales(&track, &config, true);
 
-        // Storage derives PAR 4/3. Glyphs use the vertical 9x screen scale,
-        // while x2scr, drawings and hspacing use 3 / (4/3) = 2.25.
+        // Storage PAR is 4/3: glyphs use the 9× vertical scale; x2scr/drawings/hspacing use 2.25.
         assert_eq!(normal.text, 18.0);
         assert_eq!(normal.spacing, 4.5);
         assert_eq!(normal.drawing, 4.5);

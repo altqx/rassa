@@ -200,13 +200,7 @@ impl CrossfontProvider {
         }
     }
 
-    /// Use a specific fontconfig configuration for `fc-match` queries.
-    ///
-    /// This backend delegates configuration parsing and matching to the host's
-    /// `fc-match` executable instead of owning an `FcConfig`. Cache rebuilding
-    /// and in-process fontconfig database enumeration are therefore unavailable;
-    /// if the command/configuration fails, the provider falls back to fontdb's
-    /// platform system-font database.
+    /// Use a host fc-match config; fall back to fontdb if it fails.
     pub fn with_config(config_path: impl Into<PathBuf>) -> Self {
         Self {
             fallback_family: Some("Arial".to_string()),
@@ -455,7 +449,6 @@ pub fn font_file_supports_char(path: &Path, character: char) -> bool {
     font_file_supports_char_in_scope(path, FontFaceScope::Any, character)
 }
 
-/// Check character coverage in one exact face of a font or collection.
 pub fn font_file_face_supports_char(path: &Path, face_index: u32, character: char) -> bool {
     font_file_supports_char_in_scope(path, FontFaceScope::Face(face_index), character)
 }
@@ -931,9 +924,7 @@ pub struct DirectoryFontProvider {
 }
 
 impl DirectoryFontProvider {
-    /// Scan the immediate children of a libass additional-font directory.
-    /// Hidden entries and subdirectories are ignored, matching libass. Files
-    /// are accepted by their contents rather than their extension.
+    /// Scan a libass font dir: skip hidden/subdirs; accept files by contents, not extension.
     pub fn scan(directory: impl AsRef<Path>) -> (Self, Vec<FontDirectoryIssue>) {
         let directory = directory.as_ref();
         let entries = match fs::read_dir(directory) {
@@ -1357,11 +1348,7 @@ fn font_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
 }
 
 fn font_names(face: &ttf_parser::Face<'_>, name_id: u16) -> Vec<String> {
-    // libass treats every Microsoft SFNT name as UTF-16BE, even when the
-    // encoding id names a legacy cmap. Some old Japanese fonts correctly
-    // store UTF-16BE family names under Windows encoding 2; ttf-parser's
-    // `is_unicode` intentionally excludes those, which used to make the font
-    // directory scanner reject the face before its legacy cmap could be used.
+    // Decode every Microsoft SFNT name as UTF-16BE, including Windows encoding 2.
     let mut names = windows_font_names(face, name_id);
     names.extend(
         face.names()

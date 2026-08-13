@@ -41,22 +41,16 @@ pub struct RasterGlyph {
     pub top: i32,
     pub offset_x: i32,
     pub offset_y: i32,
-    /// Horizontal shaped offset in 26.6 fixed point.
     pub offset_x_26_6: i32,
-    /// Vertical shaped offset in 26.6 fixed point, in screen coordinates
-    /// (positive values move the glyph down).
+    /// Screen-space y; positive moves the glyph down.
     pub offset_y_26_6: i32,
     pub advance_x: i32,
     pub advance_y: i32,
-    /// Horizontal advance in 26.6 fixed point.  libass accumulates the pen in
-    /// 26.6 units and floors per glyph; rounding each advance to whole pixels
-    /// drifts up to half a pixel per glyph across a run.
+    /// Pen is accumulated in 26.6 and floored per glyph; pixel-rounded advances drift.
     pub advance_x_26_6: i32,
-    /// Vertical advance in 26.6 fixed point, in font coordinates. Renderers
-    /// subtract this from the screen-space pen position.
+    /// Font-space y; renderers subtract this from the screen-space pen.
     pub advance_y_26_6: i32,
-    /// Vertical advance in 26.6 fixed point (FT_Glyph_Metrics.vertAdvance),
-    /// used by libass for rotated @font glyphs (DECO_ROTATE).
+    /// FT_Glyph_Metrics.vertAdvance for rotated @font glyphs (DECO_ROTATE).
     pub vert_advance_26_6: i32,
     pub pixel_mode: RasterPixelMode,
     pub bitmap: Vec<u8>,
@@ -68,20 +62,13 @@ pub struct RasterOptions {
     pub hinting: ass::Hinting,
 }
 
-/// Quantized affine transform applied to a glyph outline before rasterization.
-///
-/// ASS text animation needs the scale and the subpixel translation to be part
-/// of the raster-cache identity.  Keeping the representation integral also
-/// makes cache hits deterministic across platforms and floating-point modes.
+/// Quantized outline affine; integral scale/phase are the raster-cache identity.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct RasterOutlineTransform {
-    /// Horizontal outline scale in signed 16.16 fixed point.
     pub scale_x_16_16: i32,
-    /// Vertical outline scale in signed 16.16 fixed point.
     pub scale_y_16_16: i32,
-    /// Horizontal translation in FreeType 26.6 outline coordinates.
     pub translate_x_26_6: i32,
-    /// Vertical translation in FreeType 26.6 outline coordinates (y up).
+    /// Outline-space y-up translation (26.6).
     pub translate_y_26_6: i32,
 }
 
@@ -100,11 +87,7 @@ impl Default for RasterOutlineTransform {
     }
 }
 
-/// A transformed glyph bitmap together with its absolute output destination.
-///
-/// The integer destination is deliberately kept out of the glyph-cache key.
-/// Only the restored outline matrix and its 1/8-pixel phase affect coverage;
-/// moving the same bitmap by whole pixels must remain a cache hit.
+/// Bitmap plus destination; whole-pixel dest is outside the cache key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PositionedRasterGlyph {
     pub glyph: RasterGlyph,
@@ -166,9 +149,7 @@ thread_local! {
         }) };
 }
 
-/// Temporarily route raster-cache traffic into a renderer-owned namespace.
-/// The guard is deliberately `!Send`; it must be dropped on the thread where
-/// it installed the thread-local context.
+/// Thread-local cache namespace; `!Send` and must drop on the installing thread.
 pub struct RasterCacheScope {
     previous: RasterCacheContext,
     _not_send: PhantomData<Rc<()>>,
@@ -282,15 +263,7 @@ impl Rasterizer {
         rasterize_system_glyphs(font, glyphs, self.options)
     }
 
-    /// Rasterize a positioned identity-transform ASS run in outline space.
-    ///
-    /// `baseline_positions` are absolute output-space glyph origins after
-    /// shaped offsets have been applied.  The implementation mirrors
-    /// libass's `quantize_transform`: it restores a cbox-dependent scale,
-    /// quantizes the transformed cbox centre to 1/8 pixel, and carries the
-    /// first glyph's residual through the rest of this composite/style run.
-    /// This keeps slow `\pos` + `\fscx/\fscy` animation smooth without
-    /// resampling an already rasterized (and possibly blurred) bitmap.
+    /// Outline-space identity rasterization: cbox-dependent scale, 1/8-pixel phase, shared Q8 run residual.
     pub fn rasterize_positioned_identity_glyphs(
         &self,
         _font: &FontMatch,
@@ -307,10 +280,7 @@ impl Rasterizer {
         if !(scale_x.is_finite() && scale_x > 0.0 && scale_y.is_finite() && scale_y > 0.0) {
             return Err(RassaError::new("invalid outline transform scale"));
         }
-        // The exact path below mirrors libass's unhinted `fix_glyph_scaling`
-        // pipeline. Hinted rendering loads the face at a scale-dependent size
-        // and needs a different matrix normalization, so reject it explicitly
-        // instead of exposing subtly incorrect public behavior.
+        // Unhinted `fix_glyph_scaling` only; hinted faces need a different matrix.
         if self.options.hinting != ass::Hinting::None {
             return Err(RassaError::new(
                 "outline-space positioned rasterization requires unhinted glyphs",
@@ -345,8 +315,7 @@ impl Rasterizer {
             .collect()
     }
 
-    /// Anisotropic outline expansion: libass strokes borders with separate
-    /// x/y radii (\xbord/\ybord), so the ink may grow on one axis only.
+    /// Anisotropic outline: `\xbord`/`\ybord` may grow one axis only.
     pub fn outline_glyphs_xy(
         &self,
         glyphs: &[RasterGlyph],
@@ -482,9 +451,7 @@ impl Rasterizer {
 
 impl GlyphCache {
     fn next_access(&mut self) -> u64 {
-        // Avoid duplicate LRU keys after the counter wraps. Reaching this path
-        // requires 2^64 cache operations; clearing is deterministic and keeps
-        // the cache/accounting invariants intact.
+        // Clear after u64 wrap so LRU keys stay unique.
         if self.access_clock == u64::MAX {
             self.clear();
         }
@@ -643,8 +610,7 @@ fn glyph_cache_key(
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-/// Mirror libass ass_face_is_postscript (ass_font.c): CFF/Type1-based faces
-/// take a gentler synthetic-italic slant than TrueType.
+/// CFF/Type1 faces use a gentler synthetic-italic slant than TrueType.
 fn face_is_postscript(face: &freetype::Face) -> bool {
     unsafe extern "C" {
         fn FT_Get_Font_Format(face: ffi::FT_Face) -> *const core::ffi::c_char;
@@ -664,9 +630,7 @@ fn face_is_postscript(face: &freetype::Face) -> bool {
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn apply_synthetic_style_transform(face: &freetype::Face, synthetic_italic: bool) {
     if synthetic_italic {
-        // Match libass ass_glyph_italicize (ass_font.c): TrueType faces shear by
-        // 0x05700 (~tan 18.77deg), PostScript (CFF/Type1) faces by 0x02d24
-        // (~tan 10deg).
+        // TrueType shear 0x05700 (~18.77°); PostScript (CFF/Type1) 0x02d24 (~10°).
         let xy = if face_is_postscript(face) {
             0x02d24
         } else {
@@ -688,9 +652,7 @@ fn maybe_embolden_slot(slot: &GlyphSlot, synthetic_bold: bool) {
     if !synthetic_bold {
         return;
     }
-    // Match libass ass_glyph_embolden (ass_font.c): emboldening strength is
-    // FT_MulFix(units_per_EM, y_scale) / 64, applied to the outline. FreeType's
-    // FT_GlyphSlot_Embolden uses /24, which over-emboldens by 64/24 ~= 2.67x.
+    // Outline embolden is FT_MulFix(units_per_EM, y_scale)/64; FT_GlyphSlot_Embolden uses /24.
     unsafe {
         let raw = slot.raw() as *const ffi::FT_GlyphSlotRec as *mut ffi::FT_GlyphSlotRec;
         if (*raw).format != ffi::FT_GLYPH_FORMAT_OUTLINE {
@@ -821,10 +783,7 @@ fn rasterize_freetype_positioned_identity_glyphs(
                 font_path.display()
             ))
         })?;
-    // libass's unhinted path shapes/rasterizes a 256px outline and folds the
-    // requested font size into the bitmap transform (`fix_glyph_scaling`).
-    // Loading directly at the final 50–60px size changes cbox-dependent matrix
-    // buckets and causes visible mass pops during tiny scale animation.
+    // Unhinted path rasterizes a 256px outline; final-size load changes cbox scale buckets.
     let outline_size_26_6 = 256 * 64;
     request_real_dim_size(&mut face, outline_size_26_6)?;
     apply_synthetic_style_transform(&face, font.synthetic_italic);
@@ -873,9 +832,7 @@ fn rasterize_freetype_positioned_identity_glyphs(
             yMax: 0,
         };
         unsafe {
-            // libass's bitmap key uses the constructed outline control box,
-            // not the raster ink box. FreeType's CBox is the equivalent for
-            // the loaded, synthetic-style-adjusted outline.
+            // Cache key uses outline CBox, not raster ink box.
             ffi::FT_Outline_Get_CBox(&(*raw_slot).outline, &mut cbox);
         }
         let centre_x = (cbox.xMin as f64 + cbox.xMax as f64) * 0.5;
@@ -889,9 +846,7 @@ fn rasterize_freetype_positioned_identity_glyphs(
             )));
         }
 
-        // POSITION_PRECISION is 8 D6 units in libass. Quantize each diagonal
-        // matrix coefficient relative to this glyph's cbox radius, then
-        // restore the canonical scale stored by the bitmap cache.
+        // Quantize scale vs cbox radius at 8 D6 (POSITION_PRECISION), then restore cache scale.
         let qm_x = (requested_scale_x * radius_x / 8.0).round_ties_even();
         let qm_y = (requested_scale_y * radius_y / 8.0).round_ties_even();
         let restored_scale_x = qm_x * 8.0 / radius_x;
@@ -907,10 +862,8 @@ fn rasterize_freetype_positioned_identity_glyphs(
             )));
         }
 
-        // FreeType uses y-up outlines while output positions use screen y
-        // down, hence the subtraction on the transformed vertical centre.
-        // render_and_combine_glyphs first applies double_to_d6 to the global
-        // glyph position, before the outline cbox centre enters the matrix.
+        // y-up outline vs screen y-down: subtract the transformed vertical centre.
+        // Baseline is double_to_d6 first, then the outline cbox centre enters the matrix.
         let baseline_x_d6 = (baseline_x * 64.0).round_ties_even();
         let baseline_y_d6 = (baseline_y * 64.0).round_ties_even();
         let centre_global_x_d6 = baseline_x_d6 + requested_scale_x * centre_x;
@@ -953,7 +906,7 @@ fn rasterize_freetype_positioned_identity_glyphs(
                 .ok_or_else(|| RassaError::new("vertical outline scale is out of range"))?,
             translate_x_26_6: to_d6(f64::from(phase_x_d6) - restored_scale_x * centre_x)
                 .ok_or_else(|| RassaError::new("horizontal outline phase is out of range"))?,
-            // Put the y-up outline centre at the negative screen-space phase.
+            // Map y-up outline centre onto the negative screen-space phase.
             translate_y_26_6: to_d6(-f64::from(phase_y_d6) - restored_scale_y * centre_y)
                 .ok_or_else(|| RassaError::new("vertical outline phase is out of range"))?,
         };
@@ -1123,9 +1076,7 @@ fn rasterize_system_glyphs(
         })?;
         let (bitmap, stride, pixel_mode) =
             crossfont_bitmap_to_gray(rendered.width.max(0) as usize, &rendered.buffer);
-        // Preserve the pre-existing simple-shaper fallback on backends that
-        // report a zero nominal advance. Complex positioning is reapplied by
-        // `glyph_from_cache` below and never depends on these cached values.
+        // Zero nominal advance: keep simple-shaper fallback; shaped metrics come from glyph_from_cache.
         let nominal_advance_x = if rendered.advance.0 != 0 {
             rendered.advance.0
         } else {
@@ -1207,11 +1158,7 @@ pub fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> Rassa
     }
 }
 
-/// Mirror libass set_font_metrics (ass_font.c): GDI uses OS/2 usWinAscent and
-/// usWinDescent as the face ascender/descender, falling back to the typo
-/// metrics and finally the face bbox.  Must run before FT_Request_Size so
-/// FT_SIZE_REQUEST_TYPE_REAL_DIM scales the em against the win height, which
-/// is what makes an ASS font size mean "line height" like VSFilter.
+/// GDI win→typo→bbox metrics; must run before FT_Request_Size so ASS size is line height.
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 pub fn apply_gdi_font_metrics(face: &mut freetype::Face) {
     let raw = unsafe { &mut *(face.raw_mut() as *mut ffi::FT_FaceRec) };
@@ -1220,7 +1167,7 @@ pub fn apply_gdi_font_metrics(face: &mut freetype::Face) {
     };
     if !os2.is_null() {
         let os2 = unsafe { &*os2 };
-        // libass reads the unsigned spec fields as signed, mirroring GDI.
+        // GDI reads usWinAscent/usWinDescent as signed.
         let win_ascent = os2.usWinAscent as i16;
         let win_descent = os2.usWinDescent as i16;
         if i32::from(win_ascent) + i32::from(win_descent) != 0 {
@@ -1382,11 +1329,7 @@ fn rasterize_ft_outline(outline: &ffi::FT_Outline, glyph_id: u32) -> RassaResult
         tile_height as usize,
     );
 
-    // Bitmap row r spans glyph-space y in [y_max - r - 1, y_max - r], so the
-    // top edge of row 0 sits exactly y_max above the baseline.  top must be
-    // y_max itself for callers placing rows at `ascender - top + r`.  The
-    // tile-aligned allocation is an internal detail; crop to ink so bitmap
-    // extents reflect glyph coverage like libass bitmaps do.
+    // Bitmap top is y_max so rows sit at ascender - top + r; crop the tile to ink.
     Ok(trim_outline_bitmap_to_ink(OutlineBitmap {
         width: tile_width,
         height: tile_height,
@@ -1818,9 +1761,7 @@ fn apply_rectilinear_boundary_antialias(
     }
 }
 
-// Keep eager bitmap operations within the same default budget libass assigns
-// its bitmap cache.  In particular, do not let drawing borders or blur turn a
-// valid (but large) vector fill into an unchecked multi-gigabyte allocation.
+// Cap eager outline/blur allocations at the default libass bitmap-cache budget.
 const MAX_EAGER_BITMAP_BYTES: usize = 128 * 1024 * 1024;
 
 fn empty_bitmap_glyph(glyph: &RasterGlyph) -> RasterGlyph {

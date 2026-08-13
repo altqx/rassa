@@ -1,9 +1,4 @@
-//! FreeType OT-SVG renderer hooks backed by `resvg`.
-//!
-//! FreeType loads SVG documents from the OpenType `SVG ` table, but it only
-//! rasterizes them when the client provides the `ot-svg.svg-hooks` property.
-//! These hooks render into FreeType's already-allocated BGRA bitmap buffer so
-//! the normal `FT_GlyphSlot` -> `BitmapBuffer::Rgba` path can consume it.
+//! resvg OT-SVG hooks: fill FreeType's preallocated BGRA bitmap via `ot-svg.svg-hooks`.
 
 use std::ptr;
 use std::slice;
@@ -58,7 +53,6 @@ static SVG_HOOKS: SvgRendererHooks = SvgRendererHooks {
     preset_slot,
 };
 
-/// Register OT-SVG hooks for one FreeType library.
 pub fn register(library: freetype_sys::FT_Library) -> Result<(), freetype::Error> {
     let error = unsafe {
         freetype_sys::FT_Property_Set(
@@ -79,8 +73,7 @@ unsafe extern "C" fn init_svg(
     data_pointer: *mut freetype_sys::FT_Pointer,
 ) -> freetype_sys::FT_Error {
     if !data_pointer.is_null() {
-        // The resvg-backed implementation is stateless; use a non-null marker
-        // so FreeType still considers the hook initialized and calls `free_svg`.
+        // Stateless hooks still need a non-null marker so FreeType calls `free_svg`.
         unsafe { *data_pointer = std::ptr::dangling_mut::<c_void>() };
     }
     freetype_sys::FT_Err_Ok
@@ -128,8 +121,7 @@ unsafe extern "C" fn preset_slot(
             (*slot).metrics.vertAdvance / 2 - (height as freetype_sys::FT_Pos) * 32;
     }
 
-    // Parsing above validates the SVG document during both preset phases; the
-    // render hook reparses into a fresh tree to avoid cross-callback state.
+    // Validate here; render reparses so no state is shared across callbacks.
     drop(tree);
     freetype_sys::FT_Err_Ok
 }
@@ -159,10 +151,7 @@ unsafe extern "C" fn render_svg(
     let transform = tiny_skia::Transform::from_scale(scale_x, scale_y);
 
     if document.start_glyph_id < document.end_glyph_id {
-        // `freetype-sys` does not expose the optional `glyph_index` field on
-        // `FT_GlyphSlotRec` across all supported FreeType headers. Rendering
-        // the document is still correct for one-document-per-glyph fonts and
-        // keeps multi-glyph SVG documents usable instead of failing.
+        // Slot glyph_index is not in all freetype-sys headers; render the whole document.
         resvg::render(&tree, transform, &mut pixmap.as_mut());
     } else {
         resvg::render(&tree, transform, &mut pixmap.as_mut());
@@ -172,9 +161,7 @@ unsafe extern "C" fn render_svg(
         let bitmap = &mut (*slot).bitmap;
         let dst = slice::from_raw_parts_mut(buffer, (bitmap.pitch as usize) * (height as usize));
         for (src, dst) in pixmap.data().chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-            // tiny-skia stores premultiplied RGBA; FreeType's BGRA mode expects
-            // BGRA bytes. `normalize_buffer` converts BGRA back to r,g,b,a for
-            // rassa's internal color glyph buffer.
+            // tiny-skia premultiplied RGBA → FreeType BGRA; normalize_buffer later swaps to RGBA.
             dst[0] = src[2];
             dst[1] = src[1];
             dst[2] = src[0];

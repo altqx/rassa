@@ -42,23 +42,19 @@ fn render(text: &str) -> Vec<rassa_core::ImagePlane> {
 
 #[test]
 fn trailing_soft_newline_matches_visible_text_without_it() {
-    // Current libass treats a trailing soft \\n as trimmable whitespace in
-    // wrap modes other than 2; it must not allocate a phantom line.
+    // Trailing soft \n is trimmable whitespace except wrap mode 2; no phantom line.
     assert_eq!(render("A\\n"), render("A"));
 }
 
 #[test]
 fn all_space_line_ending_in_soft_newline_is_empty_and_safe() {
-    // This is the all-skippable fast path added for CVE-2026-61627 /
-    // GHSA-pjjp-65r7-ppgm.
+    // CVE-2026-61627: all-skippable line (spaces + soft \n) must stay empty and in-bounds.
     assert!(render("     \\n").is_empty());
 }
 
 #[test]
 fn wrap_exact_capacity_trailing_soft_break_is_safe() {
-    // libass starts with exactly 1024 GlyphInfo slots. This payload produces
-    // 1024 glyphs (A, hard newline, 1021 spaces, soft newline), leaves the
-    // final line entirely skippable, and used to step one slot out of bounds.
+    // 1024 GlyphInfo slots: A + hard \N + 1021 spaces + soft \n must not step out of bounds.
     let exact_capacity = format!("A\\N{}\\n", " ".repeat(1021));
     assert_eq!(render(&exact_capacity), render("A\\n"));
 }

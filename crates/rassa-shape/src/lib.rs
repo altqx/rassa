@@ -44,12 +44,7 @@ fn file_source(path: &Path) -> Option<FontBytesSource> {
     })
 }
 
-/// Register a virtual font file in memory.
-///
-/// This is primarily used by wasm/browser hosts that do not have a real
-/// filesystem/fontconfig database. Callers can return the same virtual `path`
-/// from their `FontProvider`; shaping and rasterization will then load bytes
-/// from this cache instead of `std::fs`.
+/// Register in-memory font bytes for wasm/hosts without a filesystem.
 pub fn register_virtual_font_bytes(path: impl Into<PathBuf>, bytes: impl Into<Vec<u8>>) {
     let bytes = Arc::new(bytes.into());
     font_bytes_cache()
@@ -65,7 +60,6 @@ pub fn register_virtual_font_bytes(path: impl Into<PathBuf>, bytes: impl Into<Ve
         );
 }
 
-/// Look up previously registered virtual font bytes.
 pub fn virtual_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     font_bytes_cache()
         .lock()
@@ -92,8 +86,7 @@ fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     let mut cache = font_bytes_cache()
         .lock()
         .expect("font bytes cache mutex poisoned");
-    // A concurrent virtual registration owns this path and must not be
-    // replaced by a filesystem read that started just before registration.
+    // Do not overwrite a concurrent virtual registration with a stale filesystem read.
     if let Some(entry) = cache
         .get(path)
         .filter(|entry| entry.source == FontBytesSource::Virtual)
@@ -111,12 +104,7 @@ fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     Some(bytes)
 }
 
-/// Return a content identity for the font currently registered or stored at
-/// `path`. The identity changes when virtual bytes are replaced and when a
-/// filesystem font's size or modification time changes.
-///
-/// Raster caches use this together with the path, provider, and face index so
-/// a bitmap can never be reused for a different font payload.
+/// Content identity for the font at `path`; raster caches must not reuse another payload.
 pub fn font_bytes_identity(path: &Path) -> Option<u64> {
     cached_font_bytes(path)?;
     font_bytes_cache()
@@ -149,26 +137,19 @@ pub struct ShapeRequest {
     pub language: Option<String>,
     pub mode: ShapingMode,
     pub font_size: Option<f32>,
-    /// Script Info `Kerning`; libass forwards this to HarfBuzz's `kern`
-    /// feature for every event.
+    /// Script Info `Kerning`; forwarded to HarfBuzz `kern` on every event.
     pub kerning: bool,
-    /// Whether this is an ASS vertical (`@font`) run. libass explicitly
-    /// enables the OpenType `vert` and `vkna` substitutions for these runs.
+    /// ASS `@font` vertical run; enables OpenType `vert` and `vkna`.
     pub vertical: bool,
-    /// Non-default horizontal ASS spacing disables standard/contextual
-    /// ligatures in libass so the added spacing remains per character.
+    /// Non-default horizontal spacing disables liga/clig so spacing stays per character.
     pub horizontal_spacing: bool,
-    /// Pre-resolved embedding levels from the complete ASS event line. This
-    /// lets whole-text layout keep one bidi paragraph across style/font runs.
+    /// Event-wide embedding levels so whole-text layout keeps one bidi paragraph.
     pub resolved_bidi_levels: Option<Vec<u8>>,
-    /// Keep runs in logical order so the layout layer can apply L2 once over
-    /// all style/font chunks of a whole-text paragraph.
+    /// Keep logical order so layout can apply UAX #9 L2 across the whole paragraph.
     pub defer_visual_reorder: bool,
-    /// Enable Unicode paired-bracket resolution. libass exposes this as the
-    /// opt-in `ASS_FEATURE_BIDI_BRACKETS` compatibility feature.
+    /// Opt-in paired-bracket resolution (`ASS_FEATURE_BIDI_BRACKETS`).
     pub bidi_brackets: bool,
-    /// Base paragraph direction; libass forces LTR unless \fe-1 requests
-    /// auto-detection (ass_resolve_base_direction).
+    /// Base paragraph direction; libass forces LTR unless `\fe-1` auto-detects.
     pub base_direction: Option<BidiDirection>,
 }
 
@@ -262,17 +243,13 @@ impl ShapeRequest {
 pub struct GlyphInfo {
     pub glyph_id: u32,
     pub cluster: usize,
-    /// Whether libass would apply `DECO_ROTATE` to this glyph in an ASS
-    /// vertical (`@font`) run. This follows the source Unicode cluster rather
-    /// than the shaped glyph ID, whose cmap relationship may no longer be
-    /// recoverable after substitutions or ligation.
+    /// `DECO_ROTATE` eligibility from the source cluster, not the shaped glyph ID.
     pub vertical_rotation_eligible: bool,
     pub x_advance: f32,
     pub y_advance: f32,
     pub x_offset: f32,
     pub y_offset: f32,
-    /// Whether advances and offsets came from a real shaping engine and must
-    /// take precedence over nominal metrics reported by the raster backend.
+    /// Shaped advances/offsets take precedence over the raster backend's nominal metrics.
     pub positioning: GlyphPositioning,
 }
 
@@ -393,11 +370,7 @@ impl ShapeEngine {
         self.shape_text_with_font(request, &font)
     }
 
-    /// Shape text with an exact font face selected by a caller.
-    ///
-    /// Layout uses this after coverage-aware fallback has selected a specific
-    /// face in a TTC/OTC. Resolving only the family again here could select an
-    /// earlier face that does not contain the run's glyphs.
+    /// Shape with a caller-selected face; do not re-resolve the family in a TTC/OTC.
     pub fn shape_text_with_font(
         &self,
         request: &ShapeRequest,
@@ -418,10 +391,7 @@ impl ShapeEngine {
         }
         let mut runs = Vec::new();
         for segment in &analysis.segments {
-            // FriBidi/libass shapes each resolved embedding-level run in its
-            // own direction, then applies UAX #9 L2 visual ordering. Shaping
-            // an entire mixed paragraph in its first-strong direction loses
-            // both RTL glyph order and the placement of nested number runs.
+            // Shape each embedding-level run in its own direction, then apply UAX #9 L2.
             let mut bidi_segments = logical_bidi_segments(segment, &analysis);
             if !request.defer_visual_reorder {
                 reorder_bidi_runs(&mut bidi_segments);
@@ -492,10 +462,7 @@ impl ShapeEngine {
         let font_path = font.path.as_ref()?;
         let bytes = cached_font_bytes(font_path)?;
         let face = ttf_parser::Face::parse(bytes.as_slice(), font.face_index.unwrap_or(0)).ok()?;
-        // HarfBuzz-compatible engines operate on Unicode cmap semantics and
-        // cannot reproduce FreeType/libass's codepage remap for a face whose
-        // only Microsoft cmap is legacy. Route this uncommon case through the
-        // glyph-ID-aware simple path; it still uses the face's real advances.
+        // Legacy Microsoft cmaps cannot go through HarfBuzz; use the glyph-ID simple path.
         if font_face_uses_legacy_charmap(&face) {
             return None;
         }
@@ -513,9 +480,7 @@ impl ShapeEngine {
 
         let features = libass_run_features(kerning, vertical, horizontal_spacing);
         let glyph_buffer = shaper.shape(buffer, &features);
-        // VSFilter/libass scale the em against the GDI font height
-        // (FT_SIZE_REQUEST_TYPE_REAL_DIM after set_font_metrics), not
-        // units_per_em, so an ASS font size means "line height".
+        // Scale by GDI font height, not units_per_em; ASS font size is line height.
         let units_per_em = shaper.units_per_em().max(1) as f32;
         let gdi_height = gdi_font_height_units(bytes.as_slice(), font.face_index.unwrap_or(0))
             .unwrap_or(units_per_em);
@@ -613,8 +578,7 @@ fn logical_bidi_segments(
     logical
 }
 
-/// UAX #9 L2 over level-tagged runs. Keeping the exact level (rather than
-/// only direction parity) handles nested LTR number runs inside RTL text.
+/// UAX #9 L2 over exact embedding levels, including nested LTR number runs.
 pub fn reorder_bidi_runs<T>(runs: &mut [(T, u8)]) {
     let Some(lowest_odd) = runs
         .iter()
@@ -641,8 +605,7 @@ pub fn reorder_bidi_runs<T>(runs: &mut [(T, u8)]) {
     }
 }
 
-/// Standard OpenType feature policy from libass `set_run_features` and
-/// `ass_shaper_set_kerning`.
+/// OpenType features from libass `set_run_features` and `ass_shaper_set_kerning`.
 fn libass_run_features(kerning: bool, vertical: bool, horizontal_spacing: bool) -> [Feature; 5] {
     let feature = |tag: &str, enabled: bool| {
         Feature::from_str(&format!("{tag}={}", u8::from(enabled)))
@@ -657,9 +620,7 @@ fn libass_run_features(kerning: bool, vertical: bool, horizontal_spacing: bool) 
     ]
 }
 
-/// Font height in design units the way GDI (and libass set_font_metrics)
-/// derives it: OS/2 usWinAscent + usWinDescent read as signed shorts,
-/// falling back to the hhea metrics, the typo metrics, and the head bbox.
+/// GDI/libass font height: signed OS/2 win metrics, then hhea, typo, then head bbox.
 fn gdi_font_height_units(bytes: &[u8], face_index: u32) -> Option<f32> {
     let face = ttf_parser::Face::parse(bytes, face_index).ok()?;
     gdi_font_height_face(&face)

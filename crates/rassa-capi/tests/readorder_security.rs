@@ -16,10 +16,7 @@ unsafe fn process_chunk(track: *mut rassa_capi::ASS_Track, packet: &[u8], start:
 
 #[test]
 fn negative_matroska_read_order_remains_prune_safe() {
-    // CVE-2026-61626 / GHSA-5gf7-wjfm-vmvm: libass accepts malformed
-    // negative ReadOrder values for compatibility, but pruning must never
-    // interpret them as bitmap indices. A negative value also disables the
-    // bitmap fast path, so later valid duplicates are checked by event scan.
+    // CVE-2026-61626: accept negative ReadOrder, never use it as a bitmap index.
     unsafe {
         let library = rassa_capi::ass_library_init();
         assert!(!library.is_null());

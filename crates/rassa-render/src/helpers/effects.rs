@@ -7,13 +7,7 @@ pub(crate) fn apply_fade_to_planes(
     now_ms: i64,
 ) -> Vec<ImagePlane> {
     let fade_alpha = compute_fad_alpha(fade, source_event, now_ms);
-    // libass (ass_render.c:2513) only sets FILTER_FILL_IN_BORDER when the base
-    // primary/secondary alpha are opaque AND `info->fade == 0`. While a fade is
-    // active it leaves the flag clear, so ass_fix_outline (ass_bitmap.c:205)
-    // carves the glyph fill out of the border bitmap. Without this carve the
-    // border interior double-blends with the fill under the semi-transparent
-    // fade alpha, leaving rassa more opaque than libass mid-fade. The base
-    // translucency case (non-fade \alpha/\1a/\2a) is carved in the main path.
+    // Mid-fade, carve fill out of the border (FILTER_FILL_IN_BORDER is clear while fade != 0).
     let mut planes = planes;
     if fade_alpha != 0 || planes_have_translucent_fill(&planes) {
         carve_fill_out_of_outline(&mut planes);
@@ -27,20 +21,14 @@ pub(crate) fn apply_fade_to_planes(
         .collect()
 }
 
-/// Mirror of libass `ass_fix_outline` (ass_bitmap.c:205): subtract the glyph
-/// fill coverage `g` from the border coverage `o` so the border becomes a
-/// hollow ring (`o = o > g ? o - g/2 : 0`). Operates per-pixel on the overlap
-/// of each Outline plane with each Character plane, addressed in shared screen
-/// space via plane `destination`.
-/// A fill is translucent when any character (fill) plane carries a non-zero
-/// colour alpha (libass `_a(c[0])`/`_a(c[1])`; 0 == opaque). Karaoke unswept
-/// syllables surface their secondary colour the same way.
+/// Non-zero Character colour alpha is translucent (0 == opaque); karaoke unswept uses secondary the same way.
 pub(crate) fn planes_have_translucent_fill(planes: &[ImagePlane]) -> bool {
     planes
         .iter()
         .any(|plane| plane.kind == ass::ImageType::Character && (plane.color.0 & 0xFF) != 0)
 }
 
+/// Subtract fill coverage from the border so translucent fills do not double-composite.
 pub(crate) fn carve_fill_out_of_outline(planes: &mut [ImagePlane]) {
     let fills: Vec<(Point, Size, i32, Vec<u8>)> = planes
         .iter()
@@ -102,8 +90,7 @@ pub(crate) fn apply_effect_to_planes(
     if planes.is_empty() || event.effect.is_empty() {
         return planes;
     }
-    // libass positions transition effects from the event's text box
-    // (device position and bbox), not from rendered ink.
+    // Transition effects are positioned from the event text box, not rendered ink.
     let Some(bounds) = line_box
         .or_else(|| planes_ink_bounds(&planes))
         .or_else(|| planes_bounds(&planes))
@@ -121,9 +108,7 @@ pub(crate) fn apply_effect_to_planes(
         let delay = scaled_effect_delay(delay, effect_delay_scale.x);
         let shift = elapsed / delay;
         let left_to_right = values.get(1).copied().unwrap_or(0) != 0;
-        // libass ass_render_event: SCROLL_RL puts the text box's left edge at
-        // x2scr_pos(PlayResX - shift); SCROLL_LR puts its right edge at
-        // x2scr_pos(shift).
+        // Banner: SCROLL_RL left = x2scr_pos(PlayResX - shift); SCROLL_LR right = x2scr_pos(shift).
         let target_left = if left_to_right {
             mapping.map_x_pos(shift).round() as i32 - (bounds.x_max - bounds.x_min)
         } else {
@@ -152,8 +137,7 @@ pub(crate) fn apply_effect_to_planes(
         let y1 = values[0].max(values[1]);
         let clip_y0 = mapping.map_y_pos(f64::from(y0)).round() as i32;
         let clip_y1 = mapping.map_y_pos(f64::from(y1)).round() as i32;
-        // libass: SCROLL_BT anchors the box top at y2scr(y1 - shift),
-        // SCROLL_TB the box bottom at y2scr(y0 + shift), clipped to y0..y1.
+        // Scroll: SCROLL_BT top = y2scr(y1 - shift); SCROLL_TB bottom = y2scr(y0 + shift), clipped to y0..y1.
         let target_offset = if scroll_up {
             let target_top = mapping.map_y_pos(f64::from(y1) - shift).round() as i32;
             target_top - bounds.y_min
@@ -244,8 +228,7 @@ pub(crate) fn resolve_run_fill_color(
         return style.primary_colour;
     };
     let elapsed = karaoke_elapsed_ms(event, now_ms);
-    // libass ass_parse.c process_karaoke_effects: for \k and \ko,
-    // tm_end = tm_start, so the fill switches to primary at syllable START.
+    // \k/\ko set tm_end = tm_start, so the fill becomes primary at syllable start.
     if elapsed >= i64::from(karaoke.start_ms) {
         style.primary_colour
     } else {
@@ -268,8 +251,7 @@ pub(crate) fn karaoke_hides_outline(
         return false;
     };
     let elapsed = karaoke_elapsed_ms(event, now_ms);
-    // libass render_text skips the outline only while effect_timing <= 0,
-    // i.e. before the syllable starts (ass_render.c).
+    // \ko skips the outline only before the syllable starts (effect_timing <= 0).
     elapsed < i64::from(karaoke.start_ms)
 }
 
@@ -295,8 +277,7 @@ pub(crate) fn apply_karaoke_to_character_planes(
     let elapsed = karaoke_elapsed_ms(event, now_ms);
     let relative = elapsed - i64::from(karaoke.start_ms);
     match karaoke.mode {
-        // \k and \ko: libass sets tm_end = tm_start, so the whole syllable
-        // is primary from its start time onward.
+        // \k/\ko: the whole syllable is primary from its start time.
         ParsedKaraokeMode::FillSwap | ParsedKaraokeMode::OutlineToggle => planes
             .into_iter()
             .map(|mut plane| {
@@ -309,8 +290,7 @@ pub(crate) fn apply_karaoke_to_character_planes(
             })
             .collect(),
         ParsedKaraokeMode::Sweep => {
-            // libass process_karaoke_effects: when fmod(frz, 360) lies in
-            // (90, 270) the fill sweeps right-to-left with swapped colors.
+            // \kf reverses when fmod(frz, 360) is in (90, 270).
             // C fmod keeps the sign of frz, so negative angles never reverse.
             let frz = style.rotation_z % 360.0;
             let reversed = frz > 90.0 && frz < 270.0;
@@ -342,12 +322,7 @@ pub(crate) fn apply_karaoke_to_character_planes(
             if reversed {
                 progress = 1.0 - progress;
             }
-            // libass anchors the sweep to the run's leftmost transformed
-            // outline, not its logical pen origin.  Its rounded outline edge
-            // includes the first antialiased bitmap column at progress zero;
-            // Rassa's raster bitmaps are already trimmed to nonzero coverage,
-            // so advance one column from the visible left edge to preserve
-            // that primary-colour sliver.
+            // Sweep from the leftmost transformed outline; +1 column keeps the progress-zero primary sliver.
             let sweep_start_x = planes
                 .iter()
                 .filter_map(plane_ink_bounds)
@@ -440,12 +415,8 @@ pub(crate) fn apply_quarter_turn_karaoke_sweep_after_transform(
         return planes;
     }
     let progress = relative as f64 / f64::from(karaoke.duration_ms.max(1));
-    // libass keeps the \kf colour boundary screen-horizontal even after a
-    // quarter-turn transform.  The boundary starts at the leftmost
-    // transformed outline and advances by the syllable's untransformed
-    // logical width; it does not turn into a vertical wipe.  Rassa's fill
-    // bitmaps are trimmed to visible coverage, so retain the same one-column
-    // primary sliver used by the upright sweep path at progress zero.
+    // After a quarter-turn, \kf still wipes horizontally from the leftmost outline by untransformed width.
+    // Advance one column so progress zero keeps the primary sliver.
     let sweep_start_x = planes
         .iter()
         .filter_map(plane_ink_bounds)

@@ -49,9 +49,7 @@ fn has_plane(planes: &[rassa_core::ImagePlane], kind: ass::ImageType, color: u32
 
 #[test]
 fn border_style_four_background_honors_fade() {
-    // libass 084333f applies the event fade to state color 4 before drawing
-    // the BorderStyle=4 background. At 500 ms, &H80998877 becomes RGBA
-    // 0x778899BF rather than retaining its pre-fade 0x80 alpha.
+    // At 500ms, BorderStyle 4 back &H80998877 fades to RGBA 0x778899BF.
     let planes = render(4, r"{\fad(1000,0)}AB");
     assert!(has_plane(&planes, ass::ImageType::Shadow, 0x7788_99BF));
     assert!(!has_plane(&planes, ass::ImageType::Shadow, 0x7788_9980));
@@ -59,9 +57,7 @@ fn border_style_four_background_honors_fade() {
 
 #[test]
 fn fade_applies_to_all_four_ass_colors() {
-    // libass c8ccdfd fixed the delayed-fade path to apply to primary,
-    // secondary, outline and back colours. Half-progress \\kf exposes both
-    // fill colours in one frame.
+    // Half-progress \kf exposes faded primary, secondary, outline, and back in one frame.
     let planes = render(1, r"{\fad(1000,0)\kf100}A");
     assert!(has_plane(&planes, ass::ImageType::Character, 0x1122_338F));
     assert!(has_plane(&planes, ass::ImageType::Character, 0x3344_559F));
@@ -71,9 +67,7 @@ fn fade_applies_to_all_four_ass_colors() {
 
 #[test]
 fn adjacent_pre_fade_alpha_changes_remain_distinct() {
-    // libass 12f3e45 delays fade application until after style-run splitting.
-    // Otherwise adjacent secondary alpha 0 and 1 both round to the same
-    // intermediate value and the runs are incorrectly coalesced.
+    // Fade after style-run split so adjacent secondary alpha 0 and 1 stay distinct.
     let planes = render(1, r"{\fad(1000,0)\2a&H00&\kf100}f{\2a&H01&\kf100}i");
     assert!(has_plane(&planes, ass::ImageType::Character, 0x3344_557F));
     assert!(has_plane(&planes, ass::ImageType::Character, 0x3344_5580));

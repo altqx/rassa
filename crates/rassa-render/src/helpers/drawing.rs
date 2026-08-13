@@ -44,8 +44,7 @@ pub(crate) struct DrawingPlaneParams {
     pub(crate) color: u32,
     pub(crate) render_scale_y: f64,
     pub(crate) baseline_offset: f64,
-    /// Fractional drawing translation in 26.6 output-pixel units.  Quantized
-    /// identity drawings use libass's bitmap-cache remainder here.
+    /// Fractional drawing translation in 26.6; quantized identity drawings store the bitmap-cache remainder.
     pub(crate) anchor_phase_d6: Point,
 }
 
@@ -76,8 +75,7 @@ pub(crate) fn image_plane_from_drawing(
         }
     }
 
-    // \pbo is a signed baseline offset: positive moves the drawing down
-    // (libass: desc = pbo, applied with the drawing's scale).
+    // \pbo is a signed baseline offset; positive moves the drawing down (desc = pbo).
     let vertical_offset =
         libass_outline_coordinate_from_f64(params.baseline_offset * params.render_scale_y)?;
 
@@ -109,10 +107,7 @@ pub(crate) struct QuantizedIdentityDrawing {
     pub(crate) restored_scale: (f64, f64),
 }
 
-/// Port the identity-transform specialization of libass
-/// `quantize_transform` + `restore_transform` for a positioned `\an7`
-/// drawing.  Layout metrics deliberately continue to use the exact-scale
-/// polygons; only raster geometry receives the bitmap-cache matrix buckets.
+/// Identity \an7 drawing: quantize/restore the raster matrix; layout metrics keep exact-scale polygons.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantized_identity_drawing(
     drawing: &ParsedDrawing,
@@ -159,8 +154,7 @@ pub(crate) fn quantized_identity_drawing(
         return None;
     }
 
-    // GlyphInfo::drawing_pbo is an int even though the parser state is a
-    // double, so the assignment truncates toward zero before the 64x scale.
+    // drawing_pbo is stored as int, so truncate toward zero before the 64× scale.
     let pbo = if drawing_pbo.is_finite() {
         drawing_pbo
             .trunc()
@@ -171,10 +165,7 @@ pub(crate) fn quantized_identity_drawing(
     let layout_height_d6 = f64::from(layout_bbox.y_max) - f64::from(layout_bbox.y_min);
     let asc_exact_d6 = (layout_height_d6 - 64.0 * pbo) * scale_y;
     let asc_d6 = checked_round_ties_even_i32(asc_exact_d6)?;
-    // measure_text initializes the line ascent at zero and takes the maximum
-    // over runs. A drawing whose positive \pbo makes its ascent negative
-    // therefore contributes zero to the top-aligned line base, while its
-    // outline offset still uses the signed exact ascent.
+    // Negative drawing ascent (positive \pbo) contributes 0 to the line base; outline offset stays signed.
     let line_asc_d6 = asc_d6.max(0);
     let exact_center_x = f64::from(anchor_d6.x) + cbox_center_x * scale_x;
     let exact_center_y =
@@ -246,11 +237,9 @@ pub(crate) fn scaled_drawing_polygons(
     }
     let fixed = parse_drawing_polygons_d6(drawing_text, drawing.scale);
     let (source, coordinate_scale) = match fixed.as_deref() {
-        // Source is already 26.6; retain that precision through the style and
-        // frame transform instead of rounding it to output pixels here.
+        // Source is already 26.6; keep that precision through the style/frame transform.
         Some(polygons) => (polygons, 1.0 / f64::from(scale_base)),
-        // Programmatically-created ParsedDrawing values only expose integer
-        // polygons, so promote their coordinates into 26.6 first.
+        // Programmatic ParsedDrawing polygons are integer; promote them to 26.6 first.
         None => (drawing.polygons.as_slice(), 64.0),
     };
     let scale_x = style_scale(scale_x) * render_scale_x * coordinate_scale;
@@ -363,9 +352,7 @@ fn drawing_sample_grid_d6(polygons: &[Vec<Point>]) -> u32 {
             });
         total.saturating_add(contour)
     });
-    // A low net area relative to the outline box identifies thin compound
-    // paths (typically an outer contour plus an opposing inner contour).  Use
-    // denser sampling only there; ordinary filled drawings keep the 4x4 path.
+    // Thin compound paths (low net area vs outline box) use denser sampling; ordinary fills stay 4×4.
     let thin_area_ceiling = ((bounds_area as u128) * 2 - 1) / 5;
     if signed_double_area.unsigned_abs() <= thin_area_ceiling {
         16
@@ -399,10 +386,7 @@ fn drawing_pixel_coverage_d6(
     sample_grid: u32,
     phase_d6: Point,
 ) -> u8 {
-    // The usual 4x4 grid cannot distinguish adjacent 1/8-pixel phases on an
-    // axis-aligned edge. Refine only pixels actually crossed by an outline;
-    // solid interior/exterior pixels keep the established 4x4 cost and thin
-    // compound paths already select the 16x16 grid above.
+    // 4×4 cannot split adjacent 1/8-pixel phases; refine only outline-crossed pixels (thin paths already use 16×16).
     let sample_grid = if sample_grid < 8
         && phase_d6 != Point::default()
         && drawing_edge_intersects_pixel_d6(x, y, polygons, phase_d6)
@@ -514,10 +498,7 @@ fn segments_intersect_d6(
         || (o4 == 0 && on_segment(right_start, right_end, left_end))
 }
 
-// libass's default bitmap-cache budget is 128 MiB.  Rassa rasterizes vector
-// drawings eagerly, so use the same value as a hard per-drawing ceiling to
-// avoid a successful multi-gigabyte overcommit followed by process abort while
-// zero-filling the allocation.
+// Cap eager drawing bitmaps at libass's 128 MiB cache budget to avoid multi-gigabyte overcommit.
 const MAX_DRAWING_BITMAP_BYTES: usize = 128 * 1024 * 1024;
 
 fn checked_drawing_bitmap_dimensions(bounds: Rect) -> Option<(i32, i32, usize)> {

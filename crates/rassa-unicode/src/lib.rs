@@ -48,9 +48,7 @@ impl UnicodePipeline {
         self.analyze_text_with_base(text, language, BidiDirection::Neutral)
     }
 
-    /// Analyze with an explicit base paragraph direction.  libass resolves
-    /// the base from the \fe encoding (ass_resolve_base_direction): -1 maps
-    /// to auto-detection, everything else forces LTR.
+    /// Analyze with a base direction; `\fe-1` auto-detects, anything else is LTR.
     pub fn analyze_text_with_base(
         &self,
         text: &str,
@@ -60,8 +58,7 @@ impl UnicodePipeline {
         self.analyze_text_with_base_and_brackets(text, language, base_direction, true)
     }
 
-    /// Analyze text while allowing ASS's optional paired-bracket extension to
-    /// be selected independently from the rest of Unicode bidi processing.
+    /// Analyze with independently selectable paired-bracket resolution.
     pub fn analyze_text_with_base_and_brackets(
         &self,
         text: &str,

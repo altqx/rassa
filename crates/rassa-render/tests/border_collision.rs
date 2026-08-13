@@ -66,10 +66,7 @@ fn marker_y(last_line_border: &str) -> i32 {
 
 #[test]
 fn multiline_collision_uses_last_line_border_for_bottom_padding() {
-    // libass-tests implicit-pos/bordercollision.ass: measure_text preserves
-    // the first line's maximum border as border_top, but border_bottom is the
-    // maximum on the final line. Raising only that final border from 0.9 to
-    // 31.2 must move the next bottom-aligned collision exactly 30 pixels up.
+    // border_bottom is the last line's max; raising 0.9 → 31.2 moves the next collision 30px up.
     let thin_last_line = marker_y("0.9");
     let thick_last_line = marker_y("31.2");
 

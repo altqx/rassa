@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Rassa's public libass headers and shared-library exports.
-
-The structural comparison uses Clang's JSON AST, so comments, formatting and
-source locations do not create false mismatches.  Function signatures, public
-record fields, enums, typedefs and integer macros are compared against a pinned
-libass checkout.  Every public ``ass_*`` declaration must also be a dynamic
-export of the supplied Rassa compatibility library.
-"""
+"""Verify Rassa's public libass headers and shared-library exports against pinned libass."""
 
 from __future__ import annotations
 
@@ -80,8 +73,7 @@ def resolve_upstream(arguments: argparse.Namespace, temporary: Path) -> Path:
 
 def clang_ast(clang: str, include_directory: Path) -> dict[str, Any]:
     source = '#include "ass.h"\n'
-    # `run` intentionally has no stdin surface. Use a temporary translation
-    # unit so invocation remains deterministic on every supported Python.
+    # Write a temp .c file; `run` has no stdin, so AST dumps stay deterministic.
     with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as file:
         file.write(source)
         translation_unit = Path(file.name)
@@ -106,8 +98,7 @@ def clang_ast(clang: str, include_directory: Path) -> dict[str, Any]:
 
 def canonical_type(type_name: str) -> str:
     canonical = " ".join(type_name.split())
-    # Clang describes anonymous enums using their source location. Preserve
-    # anonymous-enum identity without making checkout paths part of the ABI.
+    # Strip Clang source locations from anonymous enums so checkout paths are not ABI.
     return re.sub(
         r"enum \(unnamed(?: enum)? at .*?:\d+:\d+\)",
         "enum (anonymous)",

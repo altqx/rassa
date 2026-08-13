@@ -49,8 +49,7 @@ impl FontProvider for BundledFontProvider {
     }
 
     fn resolve_for_text(&self, query: &FontQuery, _text: &str) -> FontMatch {
-        // This deterministic fixture intentionally fixes every request to one
-        // face, including missing-glyph .notdef coverage.
+        // One face for every request, including missing-glyph .notdef.
         self.resolve(query)
     }
 }
@@ -1603,9 +1602,7 @@ fn identity_drawing_negative_ascender_is_clamped_only_for_line_base() {
     )
     .expect("negative-ascent drawing");
 
-    // At 8x, asc=(8-12)*8=-32px. measure_text clamps the line ascent to
-    // zero, while the drawing transform retains the signed asc and shifts
-    // the outline down by 32px.
+    // At 8×, measure_text clamps negative drawing ascent to 0 while the outline still shifts down 32px.
     assert_eq!(quantized.origin.y, 124);
     assert_eq!(quantized.phase_d6.y, 0);
 }
@@ -2040,9 +2037,7 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{\move(1072.3,57,1072.3,65)\org(
             x_max: 1102,
             y_max: 45,
         },
-        // rassa transforms rendered bitmaps while libass transforms outlines,
-        // so edge coverage spreads differently; guard placement, not exact
-        // coverage extent.
+        // Guard placement, not coverage extent: bitmap vs outline transforms spread AA differently.
         8,
         "02.ass line 577-style clipped org/move transformed glyph should retain libass-like placement",
     );
@@ -2118,8 +2113,7 @@ Dialogue: 8,0:00:00.00,0:00:00.93,ED2,,0,0,0,fx,{{\move({move_x},{move_y},{move_
 
 #[test]
 fn transformed_move_origin_single_char_keeps_libass_like_plane_padding() {
-    // Bitmap-space transforms spread AA coverage differently from libass's
-    // outline-space transforms; placement is asserted, exact extent is not.
+    // Assert placement, not exact extent (bitmap vs outline transforms).
     if !baseline_fontconfig_family_contains("Arial", "Liberation") {
         return;
     }
@@ -2264,8 +2258,7 @@ fn borderstyle3_uses_inline_box_geometry_colours_and_axis_shadow() {
 
 #[test]
 fn positioned_drawing_an_anchors_match_libass_for_all_alignments() {
-    // Expected boxes were probed from libass/ffmpeg for a 40x20 vector drawing at \pos(x,y):
-    // bottom align => y - 20, middle align => y - 10, top align => y.
+    // 40×20 drawing at \pos(x,y): bottom y-20, middle y-10, top y.
     let cases = [
         (
             1,
@@ -2554,9 +2547,7 @@ fn margin_positioned_text_uses_style_and_event_margins_like_libass() {
         let Some(actual) = render_text_bounds(&script) else {
             return;
         };
-        // Text rasterization can have a few pixels of coverage-width drift from libass even
-        // with the same Fontconfig face. This regression guards the placement bug: the
-        // effective style/event margin anchor must no longer be shifted left or sunk.
+        // Guard margin-anchor placement, not coverage-width drift vs libass.
         assert!(
             (actual.x_min - expected.x_min).abs() <= 1,
             "text style/event margins and \\an{alignment} x placement should match libass within raster rounding: actual={actual:?} expected={expected:?}"
@@ -2574,8 +2565,7 @@ fn margin_positioned_text_uses_style_and_event_margins_like_libass() {
 
 #[test]
 fn margin_positioned_drawing_uses_style_and_event_margins_like_libass() {
-    // Expected boxes were probed from libass/ffmpeg for a 40x20 vector drawing with
-    // style margins L=30/R=50/V=15. Event margins of 0 should fall back to style margins.
+    // Event margins 0 fall back to style L=30/R=50/V=15 for this 40×20 drawing.
     let cases = [
         (
             1,
@@ -2818,9 +2808,7 @@ fn high_resolution_projective_drawing_uses_storage_camera_distance() {
         .filter(|plane| plane.destination.x > 900 && plane.destination.y > 400)
         .collect::<Vec<_>>();
 
-    // Fresh libass 3087d2b renders visible ink at 1047,462..1315,486.
-    // Rassa's rasterizer may move antialiased edges by a pixel, but the
-    // projection geometry and camera distance must remain the same.
+    // Projection/camera must match libass ink 1047,462..1315,486; AA edges may drift one pixel.
     assert_rect_near(
         visible_bounds(&projected),
         Rect {
@@ -2963,10 +2951,7 @@ fn render_frame_renders_underline_and_strikeout_decorations() {
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
     let planes = engine.render_frame_with_provider(&track, &provider, 500);
-    // libass draws decorations into the glyph bitmap itself (ass_font.c), so
-    // they may share a plane with the text.  Assert coverage instead: the
-    // underline and strikeout bars span (nearly) the full advance width,
-    // producing full-width rows both through the glyph band and below it.
+    // Decorations may share the glyph plane; assert full-advance underline/strikeout coverage.
     let character_planes = planes
         .iter()
         .filter(|plane| plane.kind == ass::ImageType::Character)
@@ -3075,8 +3060,7 @@ fn render_frame_emits_outline_planes_for_border_override() {
 
 #[test]
 fn render_frame_applies_anisotropic_borders() {
-    // libass strokes borders with independent x/y radii: \xbord4\ybord0
-    // grows ink horizontally only (ass_outline stroker / get_outline_glyph).
+    // \xbord4\ybord0 grows ink horizontally only.
     let script = |bord: &str| {
         format!(
             "[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00010203,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(40,40){bord}}}Hi"
@@ -3127,12 +3111,7 @@ fn render_frame_applies_anisotropic_borders() {
 
 #[test]
 fn render_frame_distinguishes_be_from_blur() {
-    // libass \be N applies N passes of a light [1,2,1] box blur (variance
-    // N/2) while \blur is a gaussian of sigma = blur; both combine by
-    // variance addition.  The gaussian implementation quantizes small radii
-    // into shared kernel buckets, so plane padding and ink extent can tie;
-    // the alpha mass that bleeds a fixed distance OUTSIDE the sharp ink is
-    // monotone in sigma and discriminates the kernels reliably.
+    // \be is N [1,2,1] passes; \blur is gaussian. Discriminate by alpha mass outside the sharp ink.
     let script = |blur_tag: &str| {
         format!(
             "[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(60,40){blur_tag}}}Hi"
@@ -3145,8 +3124,7 @@ fn render_frame_distinguishes_be_from_blur() {
         engine.render_frame_with_provider(&track, &provider, 500)
     };
     let sharp_ink = visible_bounds(&render(&script(""))).expect("sharp ink");
-    // Sum the alpha one pixel left of the sharp ink. libass reserves exactly
-    // one pixel for \be1, while the gaussian reaches farther at \blur1.
+    // \be1 reserves one pixel; \blur1 gaussian reaches farther. Compare alpha one pixel left of ink.
     let left_bleed = |script_text: &str| {
         let planes = render(script_text);
         let probe_x = sharp_ink.x_min - 1;
@@ -3187,9 +3165,7 @@ fn render_frame_distinguishes_be_from_blur() {
 
 #[test]
 fn render_frame_emits_background_box_for_border_style_4() {
-    // libass add_background (ass_render.c): BorderStyle 4 draws one solid
-    // box in the back colour behind the whole event, expanded by positive
-    // shadow offsets, and suppresses the shadow bitmaps themselves.
+    // BorderStyle 4: one back-colour box expanded by positive shadow, and no glyph shadow bitmaps.
     let track = parse_script_text("[Script Info]\nPlayResX: 500\nPlayResY: 160\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Box,DejaVu Sans,30,&H00FFFFFF,&H0000FFFF,&H00000000,&H00111111,0,0,0,0,100,100,0,0,4,0,4,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Box,,0000,0000,0000,,{\\an5\\pos(250,80)}Background").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -3219,8 +3195,7 @@ fn render_frame_emits_background_box_for_border_style_4() {
             && bg.y_max >= text_ink.y_max,
         "the background box covers the text: bg={bg:?} ink={text_ink:?}"
     );
-    // The line box is 30 tall; \shad4 expands the box but produces no
-    // offset shadow copy of the glyphs.
+    // Line box is 30 tall; \shad4 expands the box but adds no offset glyph shadow.
     assert!(
         bg.height() >= 30 + 8,
         "the box is expanded by the shadow size: {bg:?}"
@@ -3275,9 +3250,7 @@ fn render_frame_emits_opaque_box_for_border_style_3() {
         (center_y - 80).abs() <= 1,
         "opaque box should stay vertically centered at \\pos like libass, got {bounds:?}"
     );
-    // libass get_outline_glyph OUTLINE_BOX: the box spans -asc-bord_y ..
-    // desc+bord_y, i.e. font size (asc+desc under REAL_DIM sizing) plus one
-    // border on each side: 30 + 2*2 = 34.
+    // OUTLINE_BOX height is font size plus one border on each side: 30 + 2*2 = 34.
     assert_eq!(
         bounds.height(),
         34,
@@ -3430,9 +3403,7 @@ fn render_frame_accepts_renderer_shaping_mode() {
 
 #[test]
 fn render_frame_interpolates_animated_clip_rect() {
-    // libass interpolates rectangular \clip coordinates inside \t
-    // (ass_parse.c): the visible ink window grows monotonically between the
-    // transform's start and end times.
+    // Animated \t(\clip) grows the ink window monotonically between start and end.
     let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,28,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(20,30)\\clip(20,0,40,120)\\t(0,1000,\\clip(20,0,300,120))}Clipping").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -3454,8 +3425,7 @@ fn render_frame_interpolates_animated_clip_rect() {
 
 #[test]
 fn render_frame_interpolates_animated_inverse_clip_rect() {
-    // libass parses \t(\iclip(...)) through the same animated rectangular
-    // clip path as \clip, but switches clip mode to inverse for the event.
+    // \t(\iclip) uses the same animated rect path as \clip, but inverse.
     let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,32,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{\\an7\\pos(20,30)\\t(0,1000,\\iclip(0,0,60,120))}AnimatedInverseClip").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -3717,8 +3687,7 @@ fn hostile_vector_drawings_are_rejected_before_bitmap_allocation() {
             "\\fscx1000000000000\\fscy1000000000000",
             "m 0 0 l 10 0 10 10 0 10",
         ),
-        // Coordinates are individually valid, but the eager 12k-square bitmap
-        // would exceed libass's 128 MiB default bitmap-cache budget.
+        // Valid coordinates, but a 12k-square bitmap would exceed the 128 MiB drawing budget.
         ("", "m 0 0 l 12000 0 12000 12000 0 12000"),
     ];
     for (tags, drawing) in cases {
@@ -3747,8 +3716,7 @@ fn render_frame_applies_vector_clip_scale_clamping_and_empty_masks_like_libass()
     assert!(render_with_tag("\\clip(not drawing)").is_empty());
     assert!(!render_with_tag("\\clip(0,m 0 0 l 200 0 200 100 0 100)").is_empty());
     assert!(!render_with_tag("\\iclip(not drawing)").is_empty());
-    // A fully masked inverse clip still retains its zero-coverage ASS_Image;
-    // 0.17.5 filters colour-alpha 0xFF nodes, not empty bitmap masks.
+    // Fully masked inverse clip keeps the zero-coverage image; only colour-alpha 0xFF is dropped.
     assert!(!render_with_tag("\\iclip(0,m 0 0 l 200 0 200 100 0 100)").is_empty());
 }
 
@@ -3783,12 +3751,7 @@ fn render_frame_clips_to_frame_bounds() {
 
 #[test]
 fn render_frame_remaps_events_into_full_frame_when_margins_used() {
-    // libass use_margins (ass_render.c x2scr_left/y2scr family): margins do
-    // NOT hard-clip normal subtitles; instead the content frame is
-    // aspect-fitted into the full frame, so a top-aligned subtitle anchors
-    // at the very top of the frame (inside the top margin/black bar), while
-    // a positioned event still maps onto the content area offset by the
-    // margins.
+    // use_margins letterboxes the content frame; it does not hard-clip normal events.
     let script = |text: &str| {
         format!(
             "[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{text}"
@@ -3812,9 +3775,7 @@ fn render_frame_remaps_events_into_full_frame_when_margins_used() {
     let normal =
         engine.render_frame_with_provider_and_config(&normal_track, &provider, 500, &margin_config);
     let normal_top = visible_bounds(&normal).expect("normal subtitle ink").y_min;
-    // Content is 100x100 fitted into the 100x120 frame: fit_h = 100 with no
-    // vertical offset for toptitles, so the line box top sits at y = 0, well
-    // inside the 10px top margin.
+    // 100×100 content fitted into 100×120: toptitle line top is y=0, inside the 10px top margin.
     assert!(
         normal_top < 10,
         "a top-aligned normal subtitle anchors inside the top margin under use_margins; got y_min={normal_top}"
@@ -3829,8 +3790,7 @@ fn render_frame_remaps_events_into_full_frame_when_margins_used() {
         &margin_config,
     );
     let positioned_top = visible_bounds(&positioned).expect("positioned ink").y_min;
-    // \pos maps onto the content frame offset by the top margin, and
-    // explicit events clip to the content area.
+    // \pos maps onto the content frame (plus top margin); explicit events clip to the content area.
     assert!(
         positioned_top >= 10,
         "a positioned event maps into the margin-offset content area; got y_min={positioned_top}"
@@ -4080,14 +4040,7 @@ fn non_positioned_drawing_does_not_receive_positioned_overhang_compensation() {
 
 #[test]
 fn render_frame_applies_drawing_baseline_offset() {
-    // libass (ass_render.c get_bitmap_glyph + measure_text): a drawing
-    // contributes asc = height - pbo and desc = pbo to its line, and its ink
-    // bottom sits at baseline + pbo.  For this top-anchored (\an7\pos) mixed
-    // text+drawing line the fs24 text ascent (~19, REAL_DIM win metrics)
-    // dominates while pbo <= 10 never exceeds it, so positive \pbo moves the
-    // drawing down by exactly pbo.  \pbo-12 makes the drawing ascent
-    // (10 + 12 = 22) exceed the text ascent, lowering the baseline and
-    // netting a shift of 10 - text_asc (about -9).
+    // Positive \pbo lowers the drawing by pbo; \pbo-12 can raise the line baseline via drawing ascent.
     fn pbo_track(pbo_tag: &str) -> ParsedTrack {
         parse_script_text(&format!("[Script Info]\nPlayResX: 160\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(10,40)}}X{{{pbo_tag}\\p1\\1c&H44FF44&}}m 0 0 l 10 0 10 10 0 10{{\\p0\\1c&H332211&}}X"))
                 .expect("script should parse")
@@ -4211,9 +4164,7 @@ fn render_frame_applies_scroll_effect_motion() {
         .expect("early scroll-up bounds");
     let up_late = character_bounds(&engine.render_frame_with_provider(&up, &provider, 1500))
         .expect("late scroll-up bounds");
-    // At 100ms a scroll-down box bottom sits at y0 + 4 with the glyph ink
-    // still above the y0..y1 clip window (libass shows nothing yet), so
-    // sample once the text has entered the window.
+    // At 100ms the scroll-down ink is still above the clip window; sample after it enters.
     let down_early = character_bounds(&engine.render_frame_with_provider(&down, &provider, 500))
         .expect("early scroll-down bounds");
     let down_late = character_bounds(&engine.render_frame_with_provider(&down, &provider, 1500))
@@ -4473,12 +4424,7 @@ fn render_frame_avoids_basic_bottom_collision_for_unpositioned_events() {
 
 #[test]
 fn zero_advance_combining_mark_events_do_not_participate_in_collision_layout() {
-    // libass-tests zero-area/zero-area.ass: a standalone combining mark has
-    // visible ink but a zero-width advance bbox. VSFilter's intersection-area
-    // rule cannot collide it, and libass therefore skips it in fix_collisions
-    // regardless of whether it appears before or after a normal event.
-    // Aileron contains U+0326 as a zero-advance combining mark, making this
-    // regression self-contained with the repository's bundled font.
+    // Zero-advance combining marks are skipped by fix_collisions (libass-tests zero-area).
     let track = parse_script_text("[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,96,&H000000FF,&H80FFFF00,&H00000000,&H0000FF00,0,0,0,0,100,100,0,0,1,0,0,5,0,10,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\1c&H0000FF&}\u{326}\nDialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\1c&H00FF00&}A\nDialogue: 0,0:00:06.00,0:00:10.00,Default,,0,0,0,,{\\1c&H00FF00&}A\nDialogue: 0,0:00:06.00,0:00:10.00,Default,,0,0,0,,{\\1c&H0000FF&}\u{326}")
         .expect("zero-area collision fixture parses");
     let provider = BundledFontProvider::aileron_regular();
@@ -4530,9 +4476,7 @@ fn zero_advance_combining_mark_events_do_not_participate_in_collision_layout() {
 
 #[test]
 fn collision_positions_stay_stable_across_frames_like_libass() {
-    // libass keeps a per-event render_priv rect: an event placed by
-    // fix_collisions keeps its position in later frames while its height is
-    // unchanged, even after other events end (ass_render.c get_render_priv).
+    // A placed event keeps its collision rect across frames while height is unchanged.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:00.50,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\1c&H00FF00&}Second").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -4650,8 +4594,7 @@ fn collision_fix_groups_records_by_layer_like_libass() {
 
 #[test]
 fn render_frame_allows_collision_across_layers_like_libass() {
-    // libass ass_render_frame sorts by layer, then calls fix_collisions for
-    // each same-layer group. Different layers only affect z-order.
+    // Collisions are per same-layer group; different layers only affect z-order.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H0000FF&}First\nDialogue: 1,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\1c&H00FF00&}Second").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -4848,9 +4791,7 @@ fn positioned_drawing_uses_position_y_before_compare_supersample_offset() {
         24 * 8,
         "libass keeps top-aligned positioned vector drawings anchored at \\pos y before final supersample offset; got {bounds:?}"
     );
-    // libass's outline rasterizer bleeds one subpixel-thin antialias sample
-    // past each geometric drawing edge (probed ink 159..497 for geometry
-    // 160..496); rassa's rasterizer keeps sharp edges, so allow that margin.
+    // Allow one-pixel AA bleed vs libass (probed ink 159..497 for geometry 160..496).
     assert!(
         (bounds.x_min - 19 * 8).abs() <= 8,
         "positioned vector drawing plane should start near the libass anchor; got {bounds:?}"
@@ -4939,8 +4880,7 @@ fn render_frame_applies_fad_alpha() {
     let mid_planes = engine.render_frame_with_provider(&track, &provider, 500);
     let end_planes = engine.render_frame_with_provider(&track, &provider, 999);
 
-    // Since libass 0.17.5, fully transparent images are omitted from the
-    // returned list rather than exposed with an alpha byte of 0xFF.
+    // Fully transparent images are omitted, not returned with alpha 0xFF.
     assert!(start_planes.is_empty());
     let mid_alpha = mid_planes
         .iter()
@@ -4983,10 +4923,7 @@ fn render_frame_applies_full_fade_alpha() {
 
 #[test]
 fn render_frame_switches_karaoke_fill_after_elapsed_span() {
-    // libass ass_parse.c process_karaoke_effects: \k sets tm_end = tm_start,
-    // so a syllable turns primary at its START.  At 200ms the first \k50
-    // syllable (start 0) is already primary while the second (start 500ms)
-    // is still secondary; at 700ms both are primary.
+    // \k turns primary at syllable start: 200ms first-on/second-off; 700ms both on.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k50}Ka{\\k50}ra").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -5034,10 +4971,7 @@ fn render_frame_sweeps_karaoke_fill_during_active_span() {
 
 #[test]
 fn sweep_emits_both_libass_colours_at_the_exact_start_boundary() {
-    // libass anchors a \kf split at the leftmost transformed outline.  At
-    // exact progress zero the rounded edge still leaves a visible primary
-    // antialias column; the rest of the word remains secondary.  This is the
-    // boundary exercised at 2000/6000/8000/10000 ms by libass-tests v4++/kt.ass.
+    // At \kf progress zero, one primary AA column remains; the rest stays secondary.
     let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 100\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: D,BundledAileron,35,&HFFFFFF,&H0000FF,&H000000,&H000000,0,0,0,0,100,100,0,0,1,0,0,7,20,5,4,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,D,,0,0,0,,{\\kf100}Kara{\\kt50\\kf100}oke")
         .expect("kt boundary fixture parses");
     let planes = RenderEngine::new().render_frame_with_provider(
@@ -5107,8 +5041,7 @@ fn official_karaoke_runsplit_keeps_implicit_word_secondary_until_prior_word_ends
 
 #[test]
 fn render_frame_keeps_k0_text_in_current_karaoke_word_like_libass() {
-    // libass split_style_runs ignores effect_skip_timing and a zero
-    // effect_timing does not start a new karaoke word by itself.
+    // Zero effect_timing does not start a new karaoke word by itself.
     let track = parse_script_text("[Script Info]\nPlayResX: 360\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k100}A{\\k0}BBBB{\\k50}C").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -5134,8 +5067,7 @@ fn render_frame_keeps_k0_text_in_current_karaoke_word_like_libass() {
 
 #[test]
 fn render_frame_keeps_kt_text_in_current_sweep_until_run_break_like_libass() {
-    // A \kt after text only affects the next karaoke word once a later run
-    // break occurs; it does not stop the active \K sweep for following glyphs.
+    // \kt after text does not stop the active \K sweep; it only affects the next word after a run break.
     let track = parse_script_text("[Script Info]\nPlayResX: 420\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\K100}A{\\kt50}WWWWWWWW").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -5161,9 +5093,7 @@ fn render_frame_keeps_kt_text_in_current_sweep_until_run_break_like_libass() {
 
 #[test]
 fn render_frame_fills_zero_and_negative_kf_at_syllable_start_like_libass() {
-    // libass ass_parse.c process_karaoke_effects marks \kf fully swept when
-    // tm_current >= tm_end.  For zero or negative durations, tm_end is not
-    // after tm_start, so the syllable is primary right at its start time.
+    // Zero/negative \kf duration is fully swept at start (tm_current >= tm_end).
     let script = |tag: &str| {
         format!(
             "[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{{\\an7\\pos(20,20){tag}}}K"
@@ -5192,10 +5122,7 @@ fn render_frame_fills_zero_and_negative_kf_at_syllable_start_like_libass() {
 
 #[test]
 fn render_frame_retimes_pending_karaoke_with_kt_like_libass() {
-    // libass \kt sets effect_skip_timing and clears effect_timing without
-    // clearing the active karaoke type.  When this happens before the next
-    // glyph is emitted, that glyph is a zero-duration karaoke word at the
-    // \kt timestamp.
+    // \kt before the next glyph makes that glyph a zero-duration karaoke word at the \kt time.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\k10\\kt50}K").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -5300,11 +5227,7 @@ fn karaoke_elapsed_time_keeps_libass_long_long_range() {
 
 #[test]
 fn render_frame_reverses_kf_sweep_for_flipped_rotation() {
-    // libass ass_parse.c process_karaoke_effects: when fmod(\\frz, 360) lies
-    // in (90, 270), \\kf fills right-to-left with swapped colors in glyph
-    // space, so after the 180-degree rotation the sweep still appears
-    // left-to-right on screen.  Without the reversal the flipped sweep would
-    // appear right-to-left.
+    // \frz in (90, 270) reverses \kf in glyph space so a 180° rotation still sweeps LTR on screen.
     let script = |frz: &str| {
         format!(
             "[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{{\\an5\\pos(120,50){frz}\\kf100}}Kara"
@@ -5345,10 +5268,7 @@ fn render_frame_reverses_kf_sweep_for_flipped_rotation() {
 
 #[test]
 fn render_frame_hides_outline_for_ko_until_span_ends() {
-    // libass render_text: a \ko outline is skipped only while
-    // effect_timing <= 0, i.e. before the syllable starts.  The first \ko50
-    // syllable's outline is visible from t=0; the second (start 500ms) has
-    // no outline at 200ms and gains it at 700ms.
+    // \ko hides the outline only before the syllable starts: first visible at 0; second at 700ms.
     let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H00445566,&H000A0B0C,&H00000000,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0000,0000,0000,,{\\an7\\pos(20,20)\\ko50}Ko{\\ko50}ra").expect("script should parse");
     let engine = RenderEngine::new();
     let provider = FontconfigProvider::new();
@@ -5376,11 +5296,7 @@ fn render_frame_hides_outline_for_ko_until_span_ends() {
 
 #[test]
 fn vertical_font_raster_advances_rotate_bitmap_like_libass_vertical_faces() {
-    // libass DECO_ROTATE (ass_get_glyph_outline + ass_outline_rotate_90):
-    // FreeType point (x, y) -> (offs.x + y, offs.y - x), but libass first
-    // imports the outline as (x, -y). The resulting screen bitmap is rotated
-    // counterclockwise. Without face metrics, offs=(font size, 0), so the new
-    // bearings are left'=50-9=41, top'=2-4=-2.
+    // Without face metrics, DECO_ROTATE bearings are left=41, top=-2 (counterclockwise).
     let glyph = RasterGlyph {
         width: 2,
         height: 3,
@@ -5433,12 +5349,11 @@ fn vertical_font_mixed_run_rotates_only_eligible_glyphs() {
     };
     let glyph_infos = [
         GlyphInfo {
-            // ASCII remains upright in a vertical face.
             vertical_rotation_eligible: false,
             ..GlyphInfo::default()
         },
         GlyphInfo {
-            // U+02F1 is libass's inclusive DECO_ROTATE lower bound.
+            // U+02F1 is the inclusive DECO_ROTATE lower bound.
             vertical_rotation_eligible: true,
             ..GlyphInfo::default()
         },
@@ -5469,11 +5384,7 @@ fn vertical_font_mixed_run_rotates_only_eligible_glyphs() {
 
 #[test]
 fn bundled_vertical_karaoke_runs_share_one_event_rotation_pivot() {
-    // Mirrors libass-tests karaoke/216-vertical.ass with a small bundled font:
-    // U+02F1 is libass's first DECO_ROTATE codepoint. An @font rotates each
-    // eligible glyph outline, while the style's 270-degree angle turns the
-    // line advance vertical. Every karaoke syllable is a separate style run,
-    // but libass calculates one implicit pivot from the whole event bbox.
+    // @font + 270°: one implicit pivot from the whole event bbox, not per karaoke run.
     let track = parse_script_text("[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 320\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Vertical,@BundledAileron,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,270,1,1,0,7,100,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Vertical,,0,0,0,,{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱{\\K25}˱")
         .expect("vertical karaoke fixture parses");
     let engine = RenderEngine::new();
@@ -5623,8 +5534,7 @@ fn blurred_vector_drawing_expands_fill_plane_like_libass() {
 
     assert_eq!(planes.len(), 1);
     let plane = &planes[0];
-    // \blur6 pads the plane by the blur kernel; per-point polygon scaling can
-    // round the unblurred extent by a pixel or two vs libass.
+    // \blur6 pads by the kernel; unblurred extent may drift a pixel or two vs libass.
     assert!(
         (plane.destination.y - 650).abs() <= 4,
         "y={}",
@@ -5678,9 +5588,7 @@ fn render_frame_collapses_drawing_when_scale_base_is_nonpositive_like_libass() {
 
 #[test]
 fn render_frame_renders_drawing_holes_with_nonzero_winding() {
-    // libass rasterizes drawings with its nonzero-winding rasterizer
-    // (ass_rasterizer.c): nested same-direction squares fill solid, while an
-    // opposite-direction inner square punches a hole.
+    // Nonzero winding: same-direction nested squares fill; opposite-direction inner punches a hole.
     let script = |inner: &str| {
         format!(
             "[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0000,0000,0000,,{{\\an7\\pos(10,10)\\p1}}m 0 0 l 20 0 20 20 0 20 {inner}"
@@ -5915,8 +5823,7 @@ fn decimal_thin_ring_keeps_latest_libass_geometry_and_continuity() {
 
 #[test]
 fn fixed_point_vector_clip_preserves_fractional_mask_and_inverse_complement() {
-    // These two 26.6 contours are only 20/64 px apart. Rounding each source
-    // coordinate to an integer makes them identical and erases the ring.
+    // 26.6 contours 20/64 px apart; integer rounding would collapse the ring.
     let exact_clip = ParsedVectorClip {
         scale: 1,
         polygons: vec![

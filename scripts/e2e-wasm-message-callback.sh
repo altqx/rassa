@@ -41,8 +41,7 @@ if (probe() !== 1) {
 console.log("wasm message callback lifecycle: ok");
 JS
 
-# Rebuild without the test cfg and prove the lifecycle hook did not leak into
-# the production libass-compatible export surface.
+# Rebuild without the test cfg and assert the lifecycle hook is not exported.
 cargo build \
     --manifest-path "$repo_root/Cargo.toml" \
     --target wasm32-unknown-unknown \

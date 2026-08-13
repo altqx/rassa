@@ -1,8 +1,4 @@
-//! Deterministic non-pixel ASS crash-corpus runner.
-//!
-//! The lifecycle and sampling points follow libass `fuzz/fuzz.c`: arbitrary
-//! bytes are parsed as an ASS track, then every event is rendered at Start,
-//! midpoint and End-1. Output is validated structurally, never pixel-compared.
+//! Crash-corpus runner: parse bytes, render Start/mid/End-1, check structure not pixels.
 
 use std::{
     collections::BTreeSet,

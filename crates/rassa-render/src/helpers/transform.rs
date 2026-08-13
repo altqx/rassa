@@ -7,10 +7,7 @@ pub(crate) struct EventTransform {
     pub(crate) rotation_z: f64,
     pub(crate) shear_x: f64,
     pub(crate) shear_y: f64,
-    /// libass stores `\\fax` / `\\fay` in unscaled glyph coordinates and
-    /// converts them to the already-scaled outline coordinate system before
-    /// applying the transform matrix.  Rassa transforms device-space planes,
-    /// so retain the effective run scale here to make that conversion.
+    /// Run scale for converting unscaled \fax/\fay into already-scaled outline coordinates.
     pub(crate) scale_x: f64,
     pub(crate) scale_y: f64,
     pub(crate) pixel_aspect: f64,
@@ -55,26 +52,14 @@ pub(crate) struct RunTransformContext<'a> {
     pub(crate) transform: EventTransform,
     pub(crate) event: &'a LayoutEvent,
     pub(crate) effective_position: Option<(i32, i32)>,
-    /// Untransformed advance/line-metric bounds for the whole event.
-    ///
-    /// libass calculates the implicit rotation origin once from the event's
-    /// string bbox, before rendering individual style or karaoke runs.  Using
-    /// the recent run's ink bounds here makes every run rotate around a
-    /// different point and leaves a nominally vertical event laid out along
-    /// its original horizontal baseline.
+    /// Whole-event untransformed advance box; one implicit rotation origin, not per-run ink.
     pub(crate) event_layout_bounds: Option<Rect>,
-    /// libass's `blur_scale_y`, used for the perspective camera distance.
-    /// This normally equals the script-to-frame Y scale, but differs when
-    /// storage/LayoutRes is explicitly set.
+    /// Perspective camera scale (blur_scale_y); differs from script-to-frame Y when storage/LayoutRes is set.
     pub(crate) projection_scale_y: f64,
     pub(crate) mapping: &'a EventMapping,
-    /// Screen-space x of the run's baseline start. libass resets cumulative
-    /// `\fay` baseline shear at run boundaries and measures every glyph
-    /// advance and offset from this point, including glyphs within a cluster.
+    /// Run baseline-start x; \fay shear resets here and includes every glyph/offset in a cluster.
     pub(crate) shear_pivot_x: Option<f64>,
-    /// Screen-space y of the run's ascender line (baseline - ascender).
-    /// libass calc_transform_matrix anchors the \fax/\fay shear at the
-    /// glyph cell top (outline y = -asc), not the rendered ink bbox top.
+    /// Run ascender-line y; \fax/\fay shears about outline y = -asc, not the ink bbox top.
     pub(crate) shear_pivot_y: Option<f64>,
 }
 
@@ -105,9 +90,7 @@ pub(crate) fn apply_run_transform_to_recent_planes(
     let bounds_base = planes_bounds(&recent_planes)
         .map(|bounds| (f64::from(bounds.x_min), f64::from(bounds.y_min)))
         .unwrap_or(origin);
-    // libass shears the outline about the glyph cell top (outline y = -asc),
-    // i.e. the run's ascender line in screen space; only the ink bbox top is
-    // used as a fallback when the ascender line is unavailable.
+    // Shear about the ascender line (outline y = -asc); fall back to the ink bbox top.
     let shear_base = (
         context.shear_pivot_x.unwrap_or(bounds_base.0),
         context.shear_pivot_y.unwrap_or(bounds_base.1),
@@ -127,9 +110,7 @@ pub(crate) fn apply_run_transform_to_recent_planes(
     transform_slice(character_planes, starts.character);
 }
 
-/// Rotation/shear origin per libass calculate_rotation_params: \org if
-/// given, otherwise the event position; with neither, the alignment base
-/// point of the whole event's untransformed advance bbox.
+/// Rotation/shear origin: \org, else event position, else the alignment base of the event advance box.
 pub(crate) fn event_transform_origin(
     event: &LayoutEvent,
     planes: &[ImagePlane],
@@ -152,10 +133,7 @@ pub(crate) fn event_transform_origin(
     event_layout_bounds
         .or_else(|| planes_bounds(planes))
         .map(|bounds| {
-            // libass calculate_rotation_params + get_base_point (ass_render.c):
-            // with neither \org nor an explicit position, rotation/shear pivots
-            // about the alignment base point of the bounding box, not its
-            // geometric center (only \an4/5/6 + \an2/5/8 land on the center).
+            // Without \org or \pos, pivot on the alignment base of the bbox, not its geometric center.
             let x = match event.alignment & 0x3 {
                 ass::HALIGN_LEFT => f64::from(bounds.x_min),
                 ass::HALIGN_RIGHT => f64::from(bounds.x_max),
@@ -344,22 +322,14 @@ impl ProjectiveMatrix {
         let scale_x = style_scale(transform.scale_x);
         let scale_y = style_scale(transform.scale_y);
         let pixel_aspect = style_scale(transform.pixel_aspect);
-        // libass calc_transform_matrix operates on an outline already scaled
-        // by fscx/fscy, hence converts the ASS shear parameters into that
-        // coordinate system first.  Omitting this ratio makes anisotropically
-        // scaled `\\fax`/`\\fay` geometry diverge dramatically.
+        // Convert \fax/\fay into already-scaled outline space (fscx/fscy already applied).
         let shear_x = finite_or_zero(transform.shear_x) * scale_x / scale_y * pixel_aspect;
-        // Screen coordinates grow downwards. This positive sign implements
-        // libass apply_baseline_shear + calc_transform_matrix: positive \fay
-        // lowers each glyph by its cumulative x advance (including every
-        // glyph and offset inside a multi-glyph HarfBuzz cluster).
+        // Positive \fay lowers each glyph by cumulative x advance, including every glyph/offset in a cluster.
         let shear_y = finite_or_zero(transform.shear_y) * scale_y / scale_x / pixel_aspect;
         let shear_x_const = shear_x * (origin_y - shear_base_y);
         let shear_y_const = shear_y * (origin_x - shear_base_x);
 
-        // Apply the two-axis shear first, then rotate around Z exactly like
-        // libass's x1/y1 -> x2/y2 matrix multiplication.  The cross terms
-        // deliberately use the *other* shear axis here.
+        // Shear first, then Z-rotate; cross terms use the other shear axis.
         let x2_dx = cz - shear_y * sz;
         let x2_dy = shear_x * cz - sz;
         let x2_c = shear_x_const * cz - shear_y_const * sz;
@@ -381,9 +351,7 @@ impl ProjectiveMatrix {
         let z4_dy = x2_dy * sy + z3_dy * cy;
         let z4_c = x2_c * sy + z3_c * cy;
 
-        // libass calc_transform_matrix: dist = 20000 * blur_scale_y in 26.6
-        // outline units. `projection_scale_y` is that storage/LayoutRes-based
-        // blur scale, so in output pixels dist = 20000/64 * projection_scale_y.
+        // Camera dist = 20000/64 * projection_scale_y (26.6 20000 * blur_scale_y).
         let dist = 20_000.0 / 64.0 * projection_scale_y.max(f64::EPSILON);
 
         let x_num_dx = dist * x4_dx + origin_x * z4_dx;

@@ -191,16 +191,11 @@ pub struct RendererConfig {
     pub line_position: f64,
     pub hinting: ass::Hinting,
     pub shaping: ass::ShapingLevel,
-    /// Unicode line breaking (libass ASS_FEATURE_WRAP_UNICODE).  libass
-    /// defaults to breaking at ASCII spaces only; Unicode breaking is an
-    /// opt-in feature.
+    /// Unicode line breaking; libass defaults to ASCII spaces unless WRAP_UNICODE is on.
     pub wrap_unicode: bool,
-    /// Paired-bracket resolution for the Unicode bidi algorithm
-    /// (`ASS_FEATURE_BIDI_BRACKETS`).
+    /// Unicode paired-bracket resolution (`ASS_FEATURE_BIDI_BRACKETS`).
     pub bidi_brackets: bool,
-    /// Resolve and reorder bidi paragraphs across ASS override/font runs
-    /// (`ASS_FEATURE_WHOLE_TEXT_LAYOUT`). `\fe-1` also enables this
-    /// implicitly during layout, matching libass.
+    /// Bidi across override/font runs (`ASS_FEATURE_WHOLE_TEXT_LAYOUT`); `\fe-1` enables it.
     pub whole_text_layout: bool,
 }
 

@@ -1,8 +1,4 @@
-//! Compatibility layer for different font engines.
-//!
-//! CoreText is used on macOS.
-//! DirectWrite is used on Windows.
-//! FreeType is used everywhere else.
+//! Font-engine compatibility: CoreText (macOS), DirectWrite (Windows), FreeType elsewhere.
 
 #![allow(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![allow(unknown_lints)]
@@ -32,9 +28,7 @@ pub mod darwin;
 #[cfg(target_os = "macos")]
 pub use darwin::CoreTextRasterizer as Rasterizer;
 
-/// Max font size in pt.
-///
-/// The value is picked based on `u32` max, since we use 6 digits for fract.
+/// Max pt size; u32 with 6 fractional digits.
 const MAX_FONT_PT_SIZE: f32 = 3999.;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -56,7 +50,6 @@ pub enum Weight {
     Bold,
 }
 
-/// Style of font.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Style {
     Specific(String),
@@ -100,16 +93,12 @@ impl fmt::Display for FontDesc {
     }
 }
 
-/// Identifier for a Font for use in maps/etc.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct FontKey {
     token: u32,
 }
 
 impl FontKey {
-    /// Get next font key for given size.
-    ///
-    /// The generated key will be globally unique.
     pub fn next() -> FontKey {
         static TOKEN: AtomicUsize = AtomicUsize::new(0);
 
@@ -143,43 +132,36 @@ pub struct ProportionalMetrics {
     pub bounds_height: f32,
 }
 
-/// Font size stored as base and fraction.
+/// Font size as integer + 6-digit fraction.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Size(u32);
 
 impl Size {
-    /// Create a new `Size` from a f32 size in points.
-    ///
-    /// The font size is automatically clamped to supported range of `[1.; 3999.]` pt.
+    /// Points, clamped to `[1.; 3999.]`.
     pub fn new(size: f32) -> Size {
         let size = size.clamp(1., MAX_FONT_PT_SIZE);
         Size((size * Self::factor()) as u32)
     }
 
-    /// Create a new `Size` from px.
-    ///
-    /// The value will be clamped to the pt range of [`Size::new`].
+    /// Pixels converted to pt, then clamped like [`Size::new`].
     pub fn from_px(size: f32) -> Self {
         let pt = size * 72. / 96.;
         Size::new(pt)
     }
 
-    /// Scale font size by the given amount.
     pub fn scale(self, scale: f32) -> Self {
         Self::new(self.as_pt() * scale)
     }
 
-    /// Get size in `px`.
     pub fn as_px(self) -> f32 {
         self.as_pt() * 96. / 72.
     }
 
-    /// Get the size in `pt`.
     pub fn as_pt(self) -> f32 {
         (f64::from(self.0) / Size::factor() as f64) as f32
     }
 
-    /// Scale factor between font "Size" type and point size.
+    /// Size units per point (1_000_000).
     #[inline]
     fn factor() -> f32 {
         1_000_000.
@@ -231,25 +213,13 @@ pub struct Metrics {
     pub strikeout_thickness: f32,
 }
 
-/// Errors occuring when using the rasterizer.
 #[derive(Debug)]
 pub enum Error {
-    /// Unable to find a font matching the description.
     FontNotFound(FontDesc),
-
-    /// Unable to find metrics for a font face.
     MetricsNotFound,
-
-    /// The glyph could not be found in any font.
     MissingGlyph(RasterizedGlyph),
-
-    /// Requested an operation with a FontKey that isn't known to the rasterizer.
     UnknownFontKey,
-
-    /// Error from platfrom's font system.
     PlatformError(String),
-
-    /// Requested operation is not available on this backend.
     Unsupported(&'static str),
 }
 
@@ -275,15 +245,12 @@ impl Display for Error {
 }
 
 pub trait Rasterize {
-    /// Create a new Rasterizer.
     fn new() -> Result<Self, Error>
     where
         Self: Sized;
 
-    /// Get `Metrics` for the given `FontKey`.
     fn metrics(&self, _: FontKey, _: Size) -> Result<Metrics, Error>;
 
-    /// Get proportional metrics for a pre-shaped glyph id.
     fn glyph_id_metrics(&mut self, glyph: GlyphIdKey) -> Result<ProportionalMetrics, Error> {
         let glyph = self.get_glyph_id(glyph)?;
         Ok(ProportionalMetrics {
@@ -296,23 +263,18 @@ pub trait Rasterize {
         })
     }
 
-    /// Load the font described by `FontDesc` and `Size`.
     fn load_font(&mut self, _: &FontDesc, _: Size) -> Result<FontKey, Error>;
 
-    /// Load a concrete font file from disk.
     fn load_font_path(&mut self, _: &Path, _: Size) -> Result<FontKey, Error> {
         Err(Error::Unsupported("load_font_path"))
     }
 
-    /// Load a concrete font from in-memory bytes.
     fn load_font_bytes(&mut self, _: &[u8], _: Size) -> Result<FontKey, Error> {
         Err(Error::Unsupported("load_font_bytes"))
     }
 
-    /// Rasterize the glyph described by `GlyphKey`..
     fn get_glyph(&mut self, _: GlyphKey) -> Result<RasterizedGlyph, Error>;
 
-    /// Rasterize a pre-shaped glyph id from a loaded face.
     fn get_glyph_id(&mut self, glyph: GlyphIdKey) -> Result<RasterizedGlyph, Error> {
         let character = char::from_u32(glyph.glyph_id).ok_or_else(|| {
             Error::PlatformError(format!(
@@ -327,14 +289,11 @@ pub trait Rasterize {
         })
     }
 
-    /// Drop one loaded face and backend-owned cached data for it.
     fn drop_font(&mut self, _: FontKey) -> Result<(), Error> {
         Err(Error::Unsupported("drop_font"))
     }
 
-    /// Evict all backend-owned caches.
     fn evict_cache(&mut self) {}
 
-    /// Kerning between two characters.
     fn kerning(&mut self, left: GlyphKey, right: GlyphKey) -> (f32, f32);
 }

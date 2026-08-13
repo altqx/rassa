@@ -729,12 +729,7 @@ mod tests {
         render_track_planes_with_config(&track, &provider, now_ms, &config)
     }
 
-    /// Compare against a reference frame rendered by the real libass
-    /// `compare` tool at `-s 8`. Exact equality is impossible because rassa
-    /// transforms bitmaps where libass transforms outlines, so rotated and
-    /// sheared edges carry slightly different coverage; `max_channel_diff`
-    /// bounds the largest per-channel deviation and `max_bad_pixels` bounds
-    /// how many pixels may exceed the sub-LSB noise floor.
+    /// Compare to libass `compare -s 8`; allow `max_channel_diff`/`max_bad_pixels` for raster vs outline.
     fn assert_compare_fixture_close(
         script: &str,
         now_ms: i64,
