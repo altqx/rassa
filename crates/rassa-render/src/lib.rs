@@ -197,8 +197,48 @@ impl RenderEngine {
             let mapping = event_mapping(track, config, event_is_explicit);
             let projection_scale_y =
                 renderer_projection_scale_y(track, config, event_font_scale, &mapping);
+            let resolved_position_exact = resolve_event_position_exact(track, event, now_ms);
+            let mapped_position_exact = scale_position_exact(resolved_position_exact, &mapping);
+            let effective_position_exact =
+                mapped_position_exact.map(quantize_libass_subpixel_point);
+            // Keep the established integer layout/collision path: it rounded
+            // in script space before x2scr/y2scr. The drawing residual then
+            // corrects that compatibility anchor to libass's mapped 1/8 grid.
             let effective_position =
-                scale_position(resolve_event_position(track, event, now_ms), &mapping);
+                resolved_position_exact
+                    .map(round_exact_point)
+                    .map(|(x, y)| {
+                        (
+                            mapping.map_x_pos(f64::from(x)).round() as i32,
+                            mapping.map_y_pos(f64::from(y)).round() as i32,
+                        )
+                    });
+            let drawing_anchor_phase_d6 =
+                event_anchor_phase_d6(effective_position_exact, effective_position);
+            // Parsing and scaling a vector outline dominates small drawing
+            // events. Share the exact D6 geometry between line metrics and
+            // rasterization instead of constructing it twice.
+            let scaled_event_drawings = event
+                .lines
+                .iter()
+                .map(|line| {
+                    line.runs
+                        .iter()
+                        .map(|run| {
+                            let drawing = run.drawing.as_ref()?;
+                            let effective_style = resolve_run_style(run, source_event, now_ms);
+                            scaled_drawing_polygons(
+                                drawing,
+                                &run.text,
+                                effective_style.scale_x,
+                                effective_style.scale_y,
+                                render_scale_all.x,
+                                render_scale_all.y,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
             let metrics_context = LineMetricsContext {
                 track,
                 config,
@@ -206,6 +246,7 @@ impl RenderEngine {
                 now_ms,
                 render_scale: render_scale_all,
                 font_scale: event_font_scale,
+                scaled_drawings: &scaled_event_drawings,
             };
             let line_metrics = event_line_metrics(&event.lines, &metrics_context);
             let vertical_layout = compute_vertical_layout(
@@ -308,7 +349,7 @@ impl RenderEngine {
                     .runs
                     .iter()
                     .all(|run| run.drawing.is_none() && run.glyphs.is_empty());
-                for run in &line.runs {
+                for (run_index, run) in line.runs.iter().enumerate() {
                     let effective_style = apply_renderer_style_scale(
                         resolve_run_style(run, source_event, now_ms),
                         track,
@@ -333,6 +374,24 @@ impl RenderEngine {
                     let run_character_start = character_planes.len();
                     let run_transform =
                         style_transform(&effective_style, effective_pixel_aspect(track, config));
+                    // libass quantizes the fully transformed outline cbox
+                    // centre, not the event anchor. Rassa's geometric
+                    // transforms currently operate on raster planes, so only
+                    // bake anchor phase for the untransformed top-left case,
+                    // where the exact event anchor is the outline translation.
+                    // This fixes the frame-baked sign without claiming cbox
+                    // quantization parity for transforms or other alignments.
+                    let run_drawing_anchor_phase_d6 = if run_transform.is_identity() {
+                        let horizontal = event.alignment & 0x3;
+                        let vertical = event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER);
+                        if horizontal == ass::HALIGN_LEFT && vertical == ass::VALIGN_TOP {
+                            drawing_anchor_phase_d6
+                        } else {
+                            Point::default()
+                        }
+                    } else {
+                        Point::default()
+                    };
                     if style.border_style == 3 && (run.drawing.is_some() || !run.glyphs.is_empty())
                     {
                         // OUTLINE_BOX is produced per style run in libass. In
@@ -388,42 +447,70 @@ impl RenderEngine {
                         }
                     }
                     if let Some(drawing) = &run.drawing {
-                        let drawing_polygons = scaled_drawing_polygons(
-                            drawing,
-                            &run.text,
-                            effective_style.scale_x,
-                            effective_style.scale_y,
-                            render_scale_all.x,
-                            render_scale_all.y,
+                        // BorderStyle3 boxes were emitted before the drawing
+                        // and do not carry its baked coverage phase. Transform
+                        // them with the legacy integer pivot, then isolate the
+                        // phased drawing-derived fill/outline/shadow planes.
+                        apply_run_transform_to_recent_planes(
+                            &mut shadow_planes,
+                            &mut outline_planes,
+                            &mut character_planes,
+                            PlaneStarts {
+                                shadow: run_shadow_start,
+                                outline: run_outline_start,
+                                character: run_character_start,
+                            },
+                            RunTransformContext {
+                                transform: run_transform,
+                                event,
+                                effective_position,
+                                event_layout_bounds,
+                                projection_scale_y,
+                                mapping: &mapping,
+                                shear_pivot_x: Some(f64::from(run_origin_x_26_6) / 64.0),
+                                shear_pivot_y: Some(f64::from(line_top)),
+                            },
                         );
+                        let drawing_plane_starts = PlaneStarts {
+                            shadow: shadow_planes.len(),
+                            outline: outline_planes.len(),
+                            character: character_planes.len(),
+                        };
+                        let drawing_polygons = scaled_event_drawings
+                            .get(line_index)
+                            .and_then(|line| line.get(run_index))
+                            .and_then(Option::as_ref);
                         // libass places a drawing's ink box so its bottom sits
                         // at baseline + pbo (drawing asc = height - pbo,
                         // desc = pbo); the plane top is baseline - height + pbo.
                         let drawing_height = drawing_polygons
-                            .as_deref()
+                            .map(Vec::as_slice)
                             .and_then(drawing_height_from_d6)
                             .unwrap_or_default();
                         let baseline = line_top.saturating_add(line_ascender);
                         let drawing_top = baseline.saturating_sub(drawing_height);
                         let pbo_script = drawing_pbo_script_pixels(&effective_style, drawing)
                             * style_scale(effective_style.scale_y);
-                        if let Some(mut plane) = drawing_polygons.as_deref().and_then(|polygons| {
-                            image_plane_from_drawing(
-                                polygons,
-                                DrawingPlaneParams {
-                                    origin_x: run_origin_x,
-                                    line_top: drawing_top,
-                                    color: resolve_run_fill_color(
-                                        run,
-                                        &effective_style,
-                                        source_event,
-                                        now_ms,
-                                    ),
-                                    render_scale_y: render_scale_all.y,
-                                    baseline_offset: pbo_script,
-                                },
-                            )
-                        }) {
+                        if let Some(mut plane) =
+                            drawing_polygons.map(Vec::as_slice).and_then(|polygons| {
+                                image_plane_from_drawing(
+                                    polygons,
+                                    DrawingPlaneParams {
+                                        origin_x: run_origin_x,
+                                        line_top: drawing_top,
+                                        color: resolve_run_fill_color(
+                                            run,
+                                            &effective_style,
+                                            source_event,
+                                            now_ms,
+                                        ),
+                                        render_scale_y: render_scale_all.y,
+                                        baseline_offset: pbo_script,
+                                        anchor_phase_d6: run_drawing_anchor_phase_d6,
+                                    },
+                                )
+                            })
+                        {
                             let drawing_fill_blur = if effective_style.border_x > 0.0
                                 || effective_style.border_y > 0.0
                                 || effective_style.shadow_x.abs() > f64::EPSILON
@@ -501,11 +588,7 @@ impl RenderEngine {
                             &mut shadow_planes,
                             &mut outline_planes,
                             &mut character_planes,
-                            PlaneStarts {
-                                shadow: run_shadow_start,
-                                outline: run_outline_start,
-                                character: run_character_start,
-                            },
+                            drawing_plane_starts,
                             RunTransformContext {
                                 transform: run_transform,
                                 event,

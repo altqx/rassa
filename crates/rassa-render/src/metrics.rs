@@ -39,6 +39,7 @@ pub(crate) struct LineMetricsContext<'a> {
     pub(crate) now_ms: i64,
     pub(crate) render_scale: RenderScale,
     pub(crate) font_scale: f64,
+    pub(crate) scaled_drawings: &'a [Vec<Option<Vec<Vec<Point>>>>],
 }
 
 fn run_is_whitespace_text(run: &LayoutGlyphRun) -> bool {
@@ -92,20 +93,29 @@ fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> L
     }
 }
 
-fn drawing_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> LineMetrics {
+fn drawing_run_metrics(
+    run: &LayoutGlyphRun,
+    scaled_polygons: Option<&[Vec<Point>]>,
+    context: &LineMetricsContext<'_>,
+) -> LineMetrics {
     let Some(drawing) = run.drawing.as_ref() else {
         return LineMetrics::default();
     };
-    let Some(bounds) = drawing.bounds() else {
+    // Use the same exact 26.6 outline and endpoint rounding as the drawing
+    // raster path.  Deriving metrics from ParsedDrawing's integer compatibility
+    // polygons makes the line ascender cross whole-pixel thresholds at a
+    // different fscy value than the rendered height, which shows up as a
+    // one-pixel vertical bounce during slow frame-baked scaling.
+    let effective_style = resolve_run_style(run, context.source_event, context.now_ms);
+    let Some(height) = scaled_polygons.and_then(drawing_height_exact_from_d6) else {
         return LineMetrics::default();
     };
-    let effective_style = resolve_run_style(run, context.source_event, context.now_ms);
     let scale_y = style_scale(effective_style.scale_y) * style_scale(context.render_scale.y);
     // libass (ass_render.c get_bitmap_glyph): drawing desc = pbo, asc =
     // bbox height - pbo, both scaled by scale.y which already includes the
     // 1/2^(\p - 1) drawing-scale division (rassa pre-divides the polygon
     // coordinates at parse time, so only pbo needs the division here).
-    let height = f64::from((bounds.height() - 1).max(0)) * scale_y;
+    let height = height.max(0.0);
     let pbo = drawing_pbo_script_pixels(&effective_style, drawing) * scale_y;
     if libass_outline_coordinate_from_f64(height).is_none()
         || libass_outline_coordinate_from_f64(pbo).is_none()
@@ -131,9 +141,13 @@ pub(crate) fn drawing_pbo_script_pixels(style: &ParsedSpanStyle, drawing: &Parse
     style.pbo / f64::from(scale_base)
 }
 
-fn run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> LineMetrics {
+fn run_metrics(
+    run: &LayoutGlyphRun,
+    scaled_polygons: Option<&[Vec<Point>]>,
+    context: &LineMetricsContext<'_>,
+) -> LineMetrics {
     if run.drawing.is_some() {
-        drawing_run_metrics(run, context)
+        drawing_run_metrics(run, scaled_polygons, context)
     } else {
         text_run_metrics(run, context)
     }
@@ -141,6 +155,7 @@ fn run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> LineMe
 
 pub(crate) fn line_metrics_for_line(
     line: &rassa_layout::LayoutLine,
+    line_index: usize,
     context: &LineMetricsContext<'_>,
 ) -> LineMetrics {
     // libass measure_text ignores the metrics of line-leading/trailing
@@ -149,16 +164,22 @@ pub(crate) fn line_metrics_for_line(
     let content_runs = line
         .runs
         .iter()
-        .filter(|run| !run_is_whitespace_text(run))
+        .enumerate()
+        .filter(|(_, run)| !run_is_whitespace_text(run))
         .collect::<Vec<_>>();
-    let (runs, factor): (Vec<&LayoutGlyphRun>, f64) = if content_runs.is_empty() {
-        (line.runs.iter().collect(), 0.5)
+    let (runs, factor): (Vec<(usize, &LayoutGlyphRun)>, f64) = if content_runs.is_empty() {
+        (line.runs.iter().enumerate().collect(), 0.5)
     } else {
         (content_runs, 1.0)
     };
     let mut metrics = LineMetrics::default();
-    for run in runs {
-        let run_metrics = run_metrics(run, context);
+    for (run_index, run) in runs {
+        let scaled_polygons = context
+            .scaled_drawings
+            .get(line_index)
+            .and_then(|line| line.get(run_index))
+            .and_then(Option::as_deref);
+        let run_metrics = run_metrics(run, scaled_polygons, context);
         metrics.asc = metrics.asc.max(run_metrics.asc * factor);
         metrics.desc = metrics.desc.max(run_metrics.desc * factor);
     }
@@ -171,7 +192,8 @@ pub(crate) fn event_line_metrics(
 ) -> Vec<LineMetrics> {
     lines
         .iter()
-        .map(|line| line_metrics_for_line(line, context))
+        .enumerate()
+        .map(|(line_index, line)| line_metrics_for_line(line, line_index, context))
         .collect()
 }
 

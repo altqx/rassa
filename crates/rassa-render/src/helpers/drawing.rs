@@ -44,13 +44,16 @@ pub(crate) struct DrawingPlaneParams {
     pub(crate) color: u32,
     pub(crate) render_scale_y: f64,
     pub(crate) baseline_offset: f64,
+    /// Fractional event-anchor translation in 26.6 output-pixel units.
+    /// This is applied to coverage before outline, blur, and shadow filters.
+    pub(crate) anchor_phase_d6: Point,
 }
 
 pub(crate) fn image_plane_from_drawing(
     polygons: &[Vec<Point>],
     params: DrawingPlaneParams,
 ) -> Option<ImagePlane> {
-    let bounds = drawing_pixel_bounds_from_d6(polygons)?;
+    let bounds = drawing_pixel_bounds_with_phase_d6(polygons, params.anchor_phase_d6)?;
     let (width, height, bitmap_len) = checked_drawing_bitmap_dimensions(bounds)?;
     let sample_grid = drawing_sample_grid_d6(polygons);
 
@@ -64,7 +67,8 @@ pub(crate) fn image_plane_from_drawing(
         for column in 0..stride {
             let x = bounds.x_min.checked_add(i32::try_from(column).ok()?)?;
             let y = bounds.y_min.checked_add(i32::try_from(row).ok()?)?;
-            let coverage = drawing_pixel_coverage_d6(x, y, polygons, sample_grid);
+            let coverage =
+                drawing_pixel_coverage_d6(x, y, polygons, sample_grid, params.anchor_phase_d6);
             if coverage > 0 {
                 bitmap[row * stride + column] = coverage;
                 any_visible = true;
@@ -143,24 +147,26 @@ pub(crate) fn scaled_drawing_polygons(
     Some(polygons)
 }
 
-pub(crate) fn drawing_pixel_bounds_from_d6(polygons: &[Vec<Point>]) -> Option<Rect> {
+fn drawing_pixel_bounds_with_phase_d6(polygons: &[Vec<Point>], phase_d6: Point) -> Option<Rect> {
     let mut points = polygons.iter().flat_map(|polygon| polygon.iter().copied());
     let first = points.next()?;
     if !fixed_d6_point_is_valid(first) {
         return None;
     }
-    let mut x_min = first.x;
-    let mut y_min = first.y;
-    let mut x_max = first.x;
-    let mut y_max = first.y;
+    let mut x_min = first.x.checked_add(phase_d6.x)?;
+    let mut y_min = first.y.checked_add(phase_d6.y)?;
+    let mut x_max = x_min;
+    let mut y_max = y_min;
     for point in points {
         if !fixed_d6_point_is_valid(point) {
             return None;
         }
-        x_min = x_min.min(point.x);
-        y_min = y_min.min(point.y);
-        x_max = x_max.max(point.x);
-        y_max = y_max.max(point.y);
+        let x = point.x.checked_add(phase_d6.x)?;
+        let y = point.y.checked_add(phase_d6.y)?;
+        x_min = x_min.min(x);
+        y_min = y_min.min(y);
+        x_max = x_max.max(x);
+        y_max = y_max.max(y);
     }
     let floor_d6 = |value: i32| value.div_euclid(64);
     Some(Rect {
@@ -172,6 +178,10 @@ pub(crate) fn drawing_pixel_bounds_from_d6(polygons: &[Vec<Point>]) -> Option<Re
 }
 
 pub(crate) fn drawing_height_from_d6(polygons: &[Vec<Point>]) -> Option<i32> {
+    fixed_d6_coordinate_from_f64(drawing_height_exact_from_d6(polygons)?)
+}
+
+pub(crate) fn drawing_height_exact_from_d6(polygons: &[Vec<Point>]) -> Option<f64> {
     let mut ys = polygons.iter().flatten().map(|point| point.y);
     let first = ys.next()?;
     let (mut y_min, mut y_max) = (first, first);
@@ -179,7 +189,7 @@ pub(crate) fn drawing_height_from_d6(polygons: &[Vec<Point>]) -> Option<i32> {
         y_min = y_min.min(y);
         y_max = y_max.max(y);
     }
-    fixed_d6_coordinate_from_f64(f64::from(y_max.checked_sub(y_min)?) / 64.0)
+    Some(f64::from(y_max.checked_sub(y_min)?) / 64.0)
 }
 
 fn fixed_d6_coordinate_from_f64(value: f64) -> Option<i32> {
@@ -251,13 +261,33 @@ fn drawing_d6_bounds(polygons: &[Vec<Point>]) -> Option<Rect> {
     Some(bounds)
 }
 
-fn drawing_pixel_coverage_d6(x: i32, y: i32, polygons: &[Vec<Point>], sample_grid: u32) -> u8 {
+fn drawing_pixel_coverage_d6(
+    x: i32,
+    y: i32,
+    polygons: &[Vec<Point>],
+    sample_grid: u32,
+    phase_d6: Point,
+) -> u8 {
+    // The usual 4x4 grid cannot distinguish adjacent 1/8-pixel phases on an
+    // axis-aligned edge. Refine only pixels actually crossed by an outline;
+    // solid interior/exterior pixels keep the established 4x4 cost and thin
+    // compound paths already select the 16x16 grid above.
+    let sample_grid = if sample_grid < 8
+        && phase_d6 != Point::default()
+        && drawing_edge_intersects_pixel_d6(x, y, polygons, phase_d6)
+    {
+        8
+    } else {
+        sample_grid
+    };
     let mut inside = 0_u32;
     for row in 0..sample_grid {
-        let sample_y = (f64::from(y) + (f64::from(row) + 0.5) / f64::from(sample_grid)) * 64.0;
+        let sample_y = (f64::from(y) + (f64::from(row) + 0.5) / f64::from(sample_grid)) * 64.0
+            - f64::from(phase_d6.y);
         for column in 0..sample_grid {
-            let sample_x =
-                (f64::from(x) + (f64::from(column) + 0.5) / f64::from(sample_grid)) * 64.0;
+            let sample_x = (f64::from(x) + (f64::from(column) + 0.5) / f64::from(sample_grid))
+                * 64.0
+                - f64::from(phase_d6.x);
             if point_in_drawing_polygons_at(sample_x, sample_y, polygons) {
                 inside += 1;
             }
@@ -268,6 +298,89 @@ fn drawing_pixel_coverage_d6(x: i32, y: i32, polygons: &[Vec<Point>], sample_gri
     } else {
         ((inside * 255 + sample_grid * sample_grid / 2) / (sample_grid * sample_grid)) as u8
     }
+}
+
+fn drawing_edge_intersects_pixel_d6(
+    x: i32,
+    y: i32,
+    polygons: &[Vec<Point>],
+    phase_d6: Point,
+) -> bool {
+    let left = i64::from(x) * 64;
+    let top = i64::from(y) * 64;
+    let right = left + 64;
+    let bottom = top + 64;
+    polygons.iter().any(|polygon| {
+        polygon
+            .iter()
+            .copied()
+            .zip(polygon.iter().copied().cycle().skip(1))
+            .take(polygon.len())
+            .any(|(start, end)| {
+                segment_intersects_rect_d6(
+                    (
+                        i64::from(start.x) + i64::from(phase_d6.x),
+                        i64::from(start.y) + i64::from(phase_d6.y),
+                    ),
+                    (
+                        i64::from(end.x) + i64::from(phase_d6.x),
+                        i64::from(end.y) + i64::from(phase_d6.y),
+                    ),
+                    (left, top, right, bottom),
+                )
+            })
+    })
+}
+
+fn segment_intersects_rect_d6(
+    start: (i64, i64),
+    end: (i64, i64),
+    rect: (i64, i64, i64, i64),
+) -> bool {
+    let (left, top, right, bottom) = rect;
+    let in_rect = |(x, y): (i64, i64)| (left..=right).contains(&x) && (top..=bottom).contains(&y);
+    if in_rect(start) || in_rect(end) {
+        return true;
+    }
+    let min_x = start.0.min(end.0);
+    let max_x = start.0.max(end.0);
+    let min_y = start.1.min(end.1);
+    let max_y = start.1.max(end.1);
+    if max_x < left || min_x > right || max_y < top || min_y > bottom {
+        return false;
+    }
+    let corners = [(left, top), (right, top), (right, bottom), (left, bottom)];
+    corners
+        .iter()
+        .copied()
+        .zip(corners.iter().copied().cycle().skip(1))
+        .take(corners.len())
+        .any(|(rect_start, rect_end)| segments_intersect_d6(start, end, rect_start, rect_end))
+}
+
+fn segments_intersect_d6(
+    left_start: (i64, i64),
+    left_end: (i64, i64),
+    right_start: (i64, i64),
+    right_end: (i64, i64),
+) -> bool {
+    let orientation = |a: (i64, i64), b: (i64, i64), c: (i64, i64)| {
+        i128::from(b.0 - a.0) * i128::from(c.1 - a.1)
+            - i128::from(b.1 - a.1) * i128::from(c.0 - a.0)
+    };
+    let on_segment = |a: (i64, i64), b: (i64, i64), point: (i64, i64)| {
+        (a.0.min(b.0)..=a.0.max(b.0)).contains(&point.0)
+            && (a.1.min(b.1)..=a.1.max(b.1)).contains(&point.1)
+    };
+    let o1 = orientation(left_start, left_end, right_start);
+    let o2 = orientation(left_start, left_end, right_end);
+    let o3 = orientation(right_start, right_end, left_start);
+    let o4 = orientation(right_start, right_end, left_end);
+    ((o1 > 0) != (o2 > 0) && (o3 > 0) != (o4 > 0))
+        || (o1 == 0 && on_segment(left_start, left_end, right_start))
+        || (o2 == 0 && on_segment(left_start, left_end, right_end))
+        || (o3 == 0 && on_segment(right_start, right_end, left_start))
+        || (o4 == 0 && on_segment(right_start, right_end, left_end))
 }
 
 // libass's default bitmap-cache budget is 128 MiB.  Rassa rasterizes vector

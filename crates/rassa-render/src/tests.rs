@@ -1367,6 +1367,32 @@ fn render_drawing_bounds(script: &str) -> Rect {
     visible_bounds(&planes).expect("drawing probe should produce visible pixels")
 }
 
+fn render_drawing_coverage_centroid(script: &str) -> (f64, f64) {
+    let track = parse_script_text(script).expect("drawing centroid script should parse");
+    let engine = RenderEngine::new();
+    let provider = NullFontProvider;
+    let planes = engine.render_frame_with_provider(&track, &provider, 500);
+    let mut mass = 0_u64;
+    let mut weighted_x = 0.0;
+    let mut weighted_y = 0.0;
+    for plane in planes
+        .iter()
+        .filter(|plane| plane.kind == ass::ImageType::Character)
+    {
+        let stride = plane.stride.max(0) as usize;
+        for y in 0..plane.size.height.max(0) as usize {
+            for x in 0..plane.size.width.max(0) as usize {
+                let coverage = u64::from(plane.bitmap[y * stride + x]);
+                mass += coverage;
+                weighted_x += (f64::from(plane.destination.x) + x as f64 + 0.5) * coverage as f64;
+                weighted_y += (f64::from(plane.destination.y) + y as f64 + 0.5) * coverage as f64;
+            }
+        }
+    }
+    assert!(mass > 0, "drawing centroid probe should have coverage");
+    (weighted_x / mass as f64, weighted_y / mass as f64)
+}
+
 fn text_alignment_script(alignment: i32, event_margins: &str) -> String {
     format!(
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,32,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,{alignment},30,50,15,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,{event_margins},,Margin\n"
@@ -1431,22 +1457,68 @@ fn assert_rect_near(actual: Option<Rect>, expected: Rect, tolerance: i32, contex
 #[test]
 fn decimal_positioned_drawing_uses_exact_coordinates() {
     let decimal = drawing_alignment_script(7, "\\pos(100.6,50.6)", "0,0,0");
+    let lower = drawing_alignment_script(7, "\\pos(100,50)", "0,0,0");
     let integer = drawing_alignment_script(7, "\\pos(101,51)", "0,0,0");
 
-    assert_eq!(
-        render_drawing_bounds(&decimal),
-        render_drawing_bounds(&integer)
+    let decimal = render_drawing_coverage_centroid(&decimal);
+    let lower = render_drawing_coverage_centroid(&lower);
+    let integer = render_drawing_coverage_centroid(&integer);
+    assert!(
+        lower.0 < decimal.0 && decimal.0 < integer.0,
+        "fractional x anchor should retain coverage phase: {lower:?} < {decimal:?} < {integer:?}"
     );
+    assert!(
+        lower.1 < decimal.1 && decimal.1 < integer.1,
+        "fractional y anchor should retain coverage phase: {lower:?} < {decimal:?} < {integer:?}"
+    );
+}
+
+#[test]
+fn libass_subpixel_quantization_uses_nearest_even_for_positive_and_negative_ties() {
+    let cases = [
+        ((1.0 / 16.0, -1.0 / 16.0), (0.0, -0.0)),
+        ((3.0 / 16.0, -3.0 / 16.0), (0.25, -0.25)),
+        ((5.0 / 16.0, -5.0 / 16.0), (0.25, -0.25)),
+        ((17.0 / 16.0, -17.0 / 16.0), (1.0, -1.0)),
+        ((19.0 / 16.0, -19.0 / 16.0), (1.25, -1.25)),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(quantize_libass_subpixel_point(input), expected);
+    }
 }
 
 #[test]
 fn decimal_move_interpolates_from_exact_coordinates() {
     let decimal = drawing_alignment_script(7, "\\move(10.5,20.5,110.5,120.5,0,1000)", "0,0,0");
-    let integer = drawing_alignment_script(7, "\\move(61,71,61,71)", "0,0,0");
+    let fixed = drawing_alignment_script(7, "\\pos(60.5,70.5)", "0,0,0");
 
-    assert_eq!(
-        render_drawing_bounds(&decimal),
-        render_drawing_bounds(&integer)
+    let moved = render_drawing_coverage_centroid(&decimal);
+    let fixed = render_drawing_coverage_centroid(&fixed);
+    assert!((moved.0 - fixed.0).abs() < 1.0e-9, "{moved:?} != {fixed:?}");
+    assert!((moved.1 - fixed.1).abs() < 1.0e-9, "{moved:?} != {fixed:?}");
+}
+
+#[test]
+fn positioned_drawing_coverage_moves_monotonically_on_libass_subpixel_grid() {
+    let centroids = (0..=8)
+        .map(|step| {
+            let offset = f64::from(step) / 8.0;
+            let tags = format!("\\pos({},{})", 100.0 + offset, 50.0 + offset);
+            render_drawing_coverage_centroid(&drawing_alignment_script(7, &tags, "0,0,0"))
+        })
+        .collect::<Vec<_>>();
+
+    for pair in centroids.windows(2) {
+        assert!(
+            pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1,
+            "every 1/8-pixel anchor step must advance drawing coverage: {pair:?}"
+        );
+    }
+    let first = centroids[0];
+    let last = centroids[8];
+    assert!(
+        ((last.0 - first.0) - 1.0).abs() < 0.02 && ((last.1 - first.1) - 1.0).abs() < 0.02,
+        "eight subpixel steps should make one output-pixel move: {first:?} -> {last:?}"
     );
 }
 

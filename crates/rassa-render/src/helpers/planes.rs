@@ -109,46 +109,107 @@ pub(crate) fn compute_horizontal_origin(
     block_origin + line_offset
 }
 
-pub(crate) fn scale_position(
-    position: Option<(i32, i32)>,
+/// Map a positioned event without discarding its script-space fraction.
+///
+/// libass keeps `\\pos` / `\\move` coordinates as doubles through x2scr/y2scr
+/// and only quantizes the finished outline translation.  Mapping an already
+/// rounded script coordinate makes slow frame-baked motion pause for several
+/// frames and then jump by a whole output pixel.
+pub(crate) fn scale_position_exact(
+    position: Option<(f64, f64)>,
     mapping: &EventMapping,
-) -> Option<(i32, i32)> {
-    position.map(|(x, y)| {
-        (
-            mapping.map_x_pos(f64::from(x)).round() as i32,
-            mapping.map_y_pos(f64::from(y)).round() as i32,
-        )
-    })
+) -> Option<(f64, f64)> {
+    position.map(|(x, y)| (mapping.map_x_pos(x), mapping.map_y_pos(y)))
 }
 
-pub(crate) fn resolve_event_position(
+/// Quantize an output-space anchor to libass's bitmap-cache phase grid.
+///
+/// `quantize_transform` uses `SUBPIXEL_ORDER == 3`, retaining one eighth of
+/// an output pixel in the rasterized bitmap while exposing an integer image
+/// destination through the public API.
+pub(crate) fn quantize_libass_subpixel_point((x, y): (f64, f64)) -> (f64, f64) {
+    let quantize = |value: f64| {
+        if value.is_finite() {
+            // ass_lrint follows the default FE_TONEAREST mode: halfway
+            // values go to the even phase bucket, including negative ties.
+            (value * 8.0).round_ties_even() / 8.0
+        } else {
+            value
+        }
+    };
+    (quantize(x), quantize(y))
+}
+
+/// Return the retained anchor phase in 26.6 output-pixel units relative to
+/// the integer coordinates used by Rassa's existing layout/collision path.
+pub(crate) fn event_anchor_phase_d6(
+    exact: Option<(f64, f64)>,
+    integer: Option<(i32, i32)>,
+) -> Point {
+    let Some(((x, y), (ix, iy))) = exact.zip(integer) else {
+        return Point::default();
+    };
+    let phase = |value: f64, integer: i32| {
+        let value = ((value - f64::from(integer)) * 64.0).round();
+        if value.is_finite() {
+            value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        } else {
+            0
+        }
+    };
+    Point {
+        x: phase(x, ix),
+        y: phase(y, iy),
+    }
+}
+
+/// Resolve `\\pos` / `\\move` in script coordinates while retaining the
+/// fractional position used by libass until its final outline quantization.
+pub(crate) fn resolve_event_position_exact(
     track: &ParsedTrack,
     event: &LayoutEvent,
     now_ms: i64,
-) -> Option<(i32, i32)> {
+) -> Option<(f64, f64)> {
     event
         .position_exact
-        .map(round_exact_point)
-        .or(event.position)
+        .or_else(|| event.position.map(|(x, y)| (f64::from(x), f64::from(y))))
         .or_else(|| {
             event
                 .movement_exact
                 .map(|movement| {
-                    interpolate_move_exact(movement, track.events.get(event.event_index), now_ms)
+                    interpolate_move_exact_f64(
+                        movement,
+                        track.events.get(event.event_index),
+                        now_ms,
+                    )
                 })
                 .or_else(|| {
                     event.movement.map(|movement| {
-                        interpolate_move(movement, track.events.get(event.event_index), now_ms)
+                        let (x, y) = interpolate_move_f64(
+                            movement,
+                            track.events.get(event.event_index),
+                            now_ms,
+                        );
+                        (x, y)
                     })
                 })
         })
 }
 
+#[cfg(test)]
 pub(crate) fn interpolate_move(
     movement: ParsedMovement,
     source_event: Option<&ParsedEvent>,
     now_ms: i64,
 ) -> (i32, i32) {
+    round_exact_point(interpolate_move_f64(movement, source_event, now_ms))
+}
+
+fn interpolate_move_f64(
+    movement: ParsedMovement,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> (f64, f64) {
     let event_duration = source_event
         .map(|event| event.duration)
         .unwrap_or_default()
@@ -169,18 +230,27 @@ pub(crate) fn interpolate_move(
 
     let x = f64::from(movement.end.0 - movement.start.0) * k + f64::from(movement.start.0);
     let y = f64::from(movement.end.1 - movement.start.1) * k + f64::from(movement.start.1);
-    (x.round() as i32, y.round() as i32)
+    (x, y)
 }
 
 pub(crate) fn round_exact_point((x, y): (f64, f64)) -> (i32, i32) {
     (x.round() as i32, y.round() as i32)
 }
 
+#[cfg(test)]
 pub(crate) fn interpolate_move_exact(
     movement: ParsedMovementExact,
     source_event: Option<&ParsedEvent>,
     now_ms: i64,
 ) -> (i32, i32) {
+    round_exact_point(interpolate_move_exact_f64(movement, source_event, now_ms))
+}
+
+fn interpolate_move_exact_f64(
+    movement: ParsedMovementExact,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+) -> (f64, f64) {
     let event_duration = source_event
         .map(|event| event.duration)
         .unwrap_or_default()
@@ -201,7 +271,7 @@ pub(crate) fn interpolate_move_exact(
 
     let x = (movement.end.0 - movement.start.0) * k + movement.start.0;
     let y = (movement.end.1 - movement.start.1) * k + movement.start.1;
-    round_exact_point((x, y))
+    (x, y)
 }
 
 fn move_timing_window(t1_ms: i32, t2_ms: i32, event_duration: i32) -> (i32, i32) {
