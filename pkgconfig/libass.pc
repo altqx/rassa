@@ -5,6 +5,6 @@ includedir=${prefix}/include
 
 Name: libass
 Description: rassa Rust rewrite libass-compatible C ABI library
-Version: 0.17.4
+Version: 0.17.5
 Libs: -L${libdir} -lass
 Cflags: -I${includedir}

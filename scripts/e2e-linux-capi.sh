@@ -17,5 +17,7 @@ target/release/rassa-capi-smoke
 
 test -f target/release/librassa.so
 test -f target/release/libass.so
+test -f target/release/libass.so.9
+readelf -d target/release/libass.so | grep -F 'Library soname: [libass.so.9]'
 nm -D --defined-only target/release/librassa.so | grep -E ' ass_library_init$| ass_library_version$| ass_render_frame$'
 nm -D --defined-only target/release/libass.so | grep -E ' ass_library_init$| ass_library_version$| ass_render_frame$'

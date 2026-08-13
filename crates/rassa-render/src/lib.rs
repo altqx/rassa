@@ -4,12 +4,17 @@ use std::collections::HashMap;
 use freetype::{Library, ffi};
 use rassa_core::{ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size, ass};
 use rassa_fonts::{FontMatch, FontProvider, FontconfigProvider};
-use rassa_layout::{LayoutEngine, LayoutEvent, LayoutGlyphRun};
+use rassa_layout::{LayoutEngine, LayoutEvent, LayoutFeatures, LayoutGlyphRun, LayoutWrapScales};
 use rassa_parse::{
-    ParsedDrawing, ParsedEvent, ParsedFade, ParsedKaraokeMode, ParsedMovement, ParsedMovementExact,
-    ParsedSpanStyle, ParsedTrack, ParsedVectorClip,
+    LIBASS_OUTLINE_MAX_D6, ParsedAxisTransform, ParsedColourTransform, ParsedDrawing, ParsedEvent,
+    ParsedFade, ParsedFontSizeTransform, ParsedKaraokeMode, ParsedLinearTransform, ParsedMovement,
+    ParsedMovementExact, ParsedRectF64, ParsedScaleTransform, ParsedSpanStyle, ParsedTrack,
+    ParsedVectorClip, dialogue_has_libass_hard_override, libass_drawing_scale_base,
+    libass_outline_coordinate_from_f64, libass_outline_point_is_valid,
+    parse_dialogue_vector_clip_d6, parse_drawing_bbox_d6, parse_drawing_outline_cbox_d6,
+    parse_drawing_polygons_d6,
 };
-use rassa_raster::{RasterGlyph, RasterOptions, Rasterizer};
+use rassa_raster::{PositionedRasterGlyph, RasterGlyph, RasterOptions, Rasterizer};
 use rassa_shape::{GlyphInfo, ShapingMode};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -26,9 +31,10 @@ pub struct PreparedFrame {
 #[derive(Default)]
 pub struct RenderEngine {
     layout: LayoutEngine,
+    // Per-event collision rect stays while height is unchanged; invalidated when renderer settings change.
+    collision_cache: std::sync::Mutex<HashMap<usize, Rect>>,
+    collision_render_id: std::sync::Mutex<u64>,
 }
-
-const LINE_HEIGHT: i32 = 40;
 
 mod metrics;
 pub(crate) use metrics::*;
@@ -87,8 +93,23 @@ impl RenderEngine {
             .active_event_indices
             .into_iter()
             .filter_map(|index| {
+                let event = track.events.get(index)?;
+                let event_is_explicit = transition_effect_disables_collision(event)
+                    || dialogue_has_libass_hard_override(&event.text);
+                let wrap_scales = renderer_wrap_scales(track, config, event_is_explicit);
                 self.layout
-                    .layout_track_event_with_mode(track, index, provider, shaping_mode)
+                    .layout_track_event_with_features_and_wrap_scales(
+                        track,
+                        index,
+                        provider,
+                        shaping_mode,
+                        LayoutFeatures {
+                            wrap_unicode: config.wrap_unicode,
+                            bidi_brackets: config.bidi_brackets,
+                            whole_text_layout: config.whole_text_layout,
+                        },
+                        wrap_scales,
+                    )
                     .ok()
             })
             .collect();
@@ -121,12 +142,35 @@ impl RenderEngine {
         config: &RendererConfig,
     ) -> Vec<ImagePlane> {
         let prepared = self.prepare_frame_with_config(track, provider, now_ms, config);
-        let mut planes = Vec::new();
-        let mut occupied_bounds_by_layer = HashMap::<i32, Vec<Rect>>::new();
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{config:?}").hash(&mut hasher);
+            track.play_res_x.hash(&mut hasher);
+            track.play_res_y.hash(&mut hasher);
+            // Hash every render-observable field: event-count alone leaves stale collision rects after in-place C API edits.
+            format!("{track:?}").hash(&mut hasher);
+            let render_id = hasher.finish();
+            let mut current = self
+                .collision_render_id
+                .lock()
+                .expect("collision render id mutex poisoned");
+            if *current != render_id {
+                *current = render_id;
+                self.collision_cache
+                    .lock()
+                    .expect("collision cache mutex poisoned")
+                    .clear();
+            }
+        }
+        let mut rendered_events = Vec::new();
 
         let render_scale_x = output_scale_x(track, config);
         let render_scale_y = output_scale_y(track, config);
-        let render_scale = (style_scale(render_scale_x) + style_scale(render_scale_y)) / 2.0;
+        let render_scale_all = RenderScale {
+            x: render_scale_x,
+            y: render_scale_y,
+        };
 
         for event in &prepared.active_events {
             let source_event = track.events.get(event.event_index);
@@ -136,53 +180,198 @@ impl RenderEngine {
             let mut shadow_planes = Vec::new();
             let mut outline_planes = Vec::new();
             let mut character_planes = Vec::new();
-            let mut opaque_box_rects = Vec::new();
-            let mut clip_mask_bleed = 0;
-            let effective_position = scale_position(
-                resolve_event_position(track, event, now_ms),
-                render_scale_x,
-                render_scale_y,
-            );
-            let layer = event_layer(track, event);
-            let occupied_bounds = occupied_bounds_by_layer.entry(layer).or_default();
             let effect_disables_collision = source_event
                 .map(transition_effect_disables_collision)
                 .unwrap_or(false);
-            let layout_occupied_bounds = if effect_disables_collision {
-                &[][..]
-            } else {
-                occupied_bounds.as_slice()
-            };
-            let vertical_layout = resolve_vertical_layout(
-                track,
-                event,
-                effective_position,
-                layout_occupied_bounds,
-                source_event,
-                now_ms,
-                config,
-                RenderScale {
-                    x: render_scale_x,
-                    y: render_scale_y,
-                    uniform: render_scale,
-                },
-            );
-            let occupied_bound =
-                (!effect_disables_collision && effective_position.is_none()).then(|| {
-                    event_bounds(
-                        track,
-                        event,
-                        &vertical_layout,
-                        effective_position,
-                        config,
-                        render_scale_x,
-                        render_scale_y,
-                    )
-                });
-            for (line_index, (line, line_top)) in event
+            // Explicit is decided before override-tag parse: transition effects plus the raw hard-override scan.
+            let event_is_explicit = event.hard_override || effect_disables_collision;
+            let event_font_scale = renderer_font_scale_for_event(config, event_is_explicit);
+            let mapping = event_mapping(track, config, event_is_explicit);
+            let projection_scale_y =
+                renderer_projection_scale_y(track, config, event_font_scale, &mapping);
+            let resolved_position_exact = resolve_event_position_exact(track, event, now_ms);
+            let mapped_position_exact = scale_position_exact(resolved_position_exact, &mapping);
+            // Integer layout/collision still rounds in script space; the drawing residual maps that to the 1/8 grid.
+            let effective_position =
+                resolved_position_exact
+                    .map(round_exact_point)
+                    .map(|(x, y)| {
+                        (
+                            mapping.map_x_pos(f64::from(x)).round() as i32,
+                            mapping.map_y_pos(f64::from(y)).round() as i32,
+                        )
+                    });
+            // Share exact D6 drawing geometry between line metrics and rasterization.
+            let scaled_event_drawings = event
                 .lines
                 .iter()
+                .map(|line| {
+                    line.runs
+                        .iter()
+                        .map(|run| {
+                            let drawing = run.drawing.as_ref()?;
+                            let effective_style = resolve_run_style(run, source_event, now_ms);
+                            scaled_drawing_polygons(
+                                drawing,
+                                &run.text,
+                                effective_style.scale_x,
+                                effective_style.scale_y,
+                                render_scale_all.x,
+                                render_scale_all.y,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let metrics_context = LineMetricsContext {
+                track,
+                config,
+                source_event,
+                now_ms,
+                render_scale: render_scale_all,
+                font_scale: event_font_scale,
+                scaled_drawings: &scaled_event_drawings,
+            };
+            let line_metrics = event_line_metrics(&event.lines, &metrics_context);
+            let vertical_layout = compute_vertical_layout(
+                track,
+                &line_metrics,
+                event.alignment,
+                event.margin_v,
+                effective_position,
+                config,
+                &mapping,
+            );
+            // One untransformed string bbox supplies the implicit \frx/\fry/\frz origin for every glyph.
+            let line_widths = event
+                .lines
+                .iter()
+                .map(|line| {
+                    rendered_text_alignment_width(
+                        line,
+                        source_event,
+                        now_ms,
+                        track,
+                        config,
+                        render_scale_all,
+                        event_font_scale,
+                    )
+                })
+                .collect::<Vec<_>>();
+            // align_lines starts max_width at zero so negative line advances cannot shrink the block.
+            let block_width = line_widths.iter().copied().max().unwrap_or(0).max(0);
+            // Exact outline path is only for positioned identity text; collision and other features stay integer.
+            let exact_positioned_text_layout = mapped_position_exact.and_then(|(x, y)| {
+                let [line] = event.lines.as_slice() else {
+                    return None;
+                };
+                let eligible = !line.runs.is_empty()
+                    && config.hinting == ass::Hinting::None
+                    && source_event.is_some_and(|source| {
+                        source.text.contains("\\fscx") || source.text.contains("\\fscy")
+                    })
+                    // Positioned raster owns one Q8 residual per call; same-style partitions stay on the integer path.
+                    && line
+                        .runs
+                        .windows(2)
+                        .all(|pair| pair[0].style != pair[1].style)
+                    && line.runs.iter().all(|run| {
+                        if run.drawing.is_some() || run.glyphs.is_empty() || run.karaoke.is_some() {
+                            return false;
+                        }
+                        let effective_style = apply_renderer_style_scale(
+                            resolve_run_style(run, source_event, now_ms),
+                            track,
+                            config,
+                            event_font_scale,
+                            render_scale_all,
+                        );
+                        style_transform(&effective_style, effective_pixel_aspect(track, config))
+                            .is_identity()
+                            && style.border_style == 1
+                            && effective_style.border_x.abs() < f64::EPSILON
+                            && effective_style.border_y.abs() < f64::EPSILON
+                            && effective_style.shadow_x.abs() < f64::EPSILON
+                            && effective_style.shadow_y.abs() < f64::EPSILON
+                            && !effective_style.underline
+                            && !effective_style.strike_out
+                            && !effective_style.font_name.starts_with('@')
+                    });
+                if !eligible {
+                    return None;
+                }
+                let line_width = rendered_text_alignment_width_exact(
+                    line,
+                    source_event,
+                    now_ms,
+                    track,
+                    config,
+                    render_scale_all,
+                    event_font_scale,
+                )
+                .max(0.0);
+                let metric = *line_metrics.first()?;
+                let origin_x = match event.alignment & 0x3 {
+                    ass::HALIGN_LEFT => x,
+                    ass::HALIGN_RIGHT => x - line_width,
+                    _ => x - line_width * 0.5,
+                };
+                let baseline_y = match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+                    ass::VALIGN_TOP => y + metric.asc,
+                    ass::VALIGN_CENTER => y + (metric.asc - metric.desc) * 0.5,
+                    _ => y - metric.desc,
+                };
+                (origin_x.is_finite() && baseline_y.is_finite()).then_some((origin_x, baseline_y))
+            });
+            let horizontal_scroll = source_event.is_some_and(|event| {
+                event.effect.starts_with("Banner;") && transition_effect_disables_collision(event)
+            });
+            let line_layout = event
+                .lines
+                .iter()
+                .zip(line_widths)
                 .zip(vertical_layout.iter().copied())
+                .zip(line_metrics.iter().copied())
+                .map(|(((_, scaled_line_width), line_top), line_metric)| {
+                    let origin_x = compute_horizontal_origin(
+                        track,
+                        event,
+                        scaled_line_width,
+                        block_width,
+                        horizontal_scroll,
+                        effective_position,
+                        &mapping,
+                    );
+                    (line_top, line_metric, scaled_line_width, origin_x)
+                })
+                .collect::<Vec<_>>();
+            let event_layout_bounds = line_layout.first().map(|first| {
+                let mut x_min = first.3;
+                let mut x_max = first.3.saturating_add(first.2);
+                for (_, _, width, origin_x) in line_layout.iter().skip(1) {
+                    x_min = x_min.min(*origin_x);
+                    x_max = x_max.max(origin_x.saturating_add(*width));
+                }
+                let y_min = first.0;
+                Rect {
+                    x_min,
+                    y_min,
+                    x_max,
+                    y_max: y_min
+                        .saturating_add(total_text_height(&line_metrics, config).round() as i32),
+                }
+            });
+            let mut event_left = i32::MAX;
+            let mut event_right = i32::MIN;
+            let mut event_border_x = 0_i32;
+            let mut event_border_top = 0_i32;
+            let mut event_border_bottom = 0_i32;
+            let mut event_back_colour = style.back_colour;
+            let mut event_shadow = (0.0_f64, 0.0_f64);
+            for (line_index, (line, (line_top, line_metric, scaled_line_width, origin_x))) in event
+                .lines
+                .iter()
+                .zip(line_layout.iter().copied())
                 .enumerate()
             {
                 let line_plane_starts = PlaneStarts {
@@ -190,165 +379,99 @@ impl RenderEngine {
                     outline: outline_planes.len(),
                     character: character_planes.len(),
                 };
-                let has_scaled_run = line.runs.iter().any(|run| {
-                    (run.style.scale_x - 1.0).abs() > f64::EPSILON
-                        || (run.style.scale_y - 1.0).abs() > f64::EPSILON
-                });
-                let has_karaoke_run = line.runs.iter().any(|run| run.karaoke.is_some());
-                let center_transformed_position = effective_position.is_some()
-                    && positioned_center_line_has_active_projective_transform(
-                        line,
-                        source_event,
-                        now_ms,
-                    );
-                let text_line_top = if effective_position.is_some() {
-                    let border_style_3_y_adjust = if style.border_style == 3 { 1 } else { 0 };
-                    line_top
-                        + positioned_text_y_correction(
-                            line,
-                            config,
-                            render_scale_y,
-                            event.alignment,
-                            center_transformed_position,
-                        )
-                        - border_style_3_y_adjust
-                        + if has_karaoke_run { 2 } else { 0 }
-                        + if has_scaled_run { 2 } else { 0 }
-                } else {
-                    line_top
-                        + unpositioned_text_y_correction(line, config, render_scale_y)
-                        + if has_scaled_run { 2 } else { 0 }
-                };
-                let scaled_line_width = rendered_text_alignment_width(
-                    line,
-                    source_event,
-                    now_ms,
-                    track,
-                    config,
-                    RenderScale {
-                        x: render_scale_x,
-                        y: render_scale_y,
-                        uniform: render_scale,
-                    },
-                    effective_position.is_some(),
-                    event.alignment,
-                );
-                let horizontal_anchor_width = if effective_position.is_none()
-                    && line_contains_only_ascii_text(line)
-                    && !line_has_outline_or_shadow(line)
-                    && (event.alignment & 0x3) != ass::HALIGN_LEFT
-                {
-                    scaled_line_width + 3
-                } else {
-                    scaled_line_width
-                };
-                let origin_x = compute_horizontal_origin(
-                    track,
-                    event,
-                    horizontal_anchor_width,
-                    effective_position,
-                    render_scale_x,
-                );
-                let text_origin_x = origin_x;
-                let positioned_center_metric_anchor = effective_position.is_some()
-                    && !center_transformed_position
-                    && (event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER))
-                        == ass::VALIGN_CENTER
-                    && line_contains_only_ascii_text(line);
-                let positioned_center_metric_plane_adjust = positioned_center_metric_anchor
-                    && style.border_style != 3
-                    && line_has_blur(line)
-                    && !line_has_outline_or_shadow(line);
-                let line_ascender = line_raster_ascender(
-                    line,
-                    source_event,
-                    now_ms,
-                    track,
-                    config,
-                    RenderScale {
-                        x: render_scale_x,
-                        y: render_scale_y,
-                        uniform: render_scale,
-                    },
-                    positioned_center_metric_anchor,
-                );
-                let positioned_center_non_blur_metric_y_adjust = if positioned_center_metric_anchor
-                    && !line_has_blur(line)
-                    && render_scale_y >= 1.0
-                {
-                    if style.border_style == 3 {
-                        -4
-                    } else if has_karaoke_run {
-                        -9
-                    } else {
-                        -6
-                    }
-                } else {
-                    0
-                };
-                let positioned_center_downscale_metric_y_adjust = if positioned_center_metric_anchor
-                    && !line_has_blur(line)
-                    && render_scale_y < 1.0
-                {
-                    1
-                } else {
-                    0
-                };
-                let line_ascender = line_ascender
-                    + if has_karaoke_run { 1 } else { 0 }
-                    + positioned_center_non_blur_metric_y_adjust
-                    + positioned_center_downscale_metric_y_adjust;
-                let line_metric_height = font_metric_height_for_line(line, render_scale_y).max(1);
-                let mut line_pen_x = 0;
-                let mut line_has_transformed_borderstyle3_box = false;
-                for run in &line.runs {
+                let _ = line_plane_starts;
+                let line_ascender = line_metric.asc.round() as i32;
+                let line_height = line_metric.height().round() as i32;
+                event_left = event_left.min(origin_x);
+                event_right = event_right.max(origin_x + scaled_line_width);
+                let origin_x_26_6 = origin_x * 64;
+                let mut line_pen_x_26_6 = 0;
+                let mut exact_line_pen_x = 0.0_f64;
+                let mut line_border_y = 0_i32;
+                let line_is_trimmed_empty = line
+                    .runs
+                    .iter()
+                    .all(|run| run.drawing.is_none() && run.glyphs.is_empty());
+                for (run_index, run) in line.runs.iter().enumerate() {
                     let effective_style = apply_renderer_style_scale(
                         resolve_run_style(run, source_event, now_ms),
                         track,
                         config,
-                        render_scale,
+                        event_font_scale,
+                        render_scale_all,
                     );
-                    clip_mask_bleed = clip_mask_bleed.max(style_clip_bleed(&effective_style));
-                    let run_origin_x = text_origin_x + line_pen_x;
+                    let bitmap_blur = effective_bitmap_blur(
+                        &effective_style,
+                        track,
+                        config,
+                        event_font_scale,
+                        &mapping,
+                    );
+                    if run.drawing.is_none() && (line_is_trimmed_empty || !run.glyphs.is_empty()) {
+                        event_border_x =
+                            event_border_x.max(effective_style.border_x.round().max(0.0) as i32);
+                        line_border_y =
+                            line_border_y.max(effective_style.border_y.round().max(0.0) as i32);
+                    }
+                    event_back_colour = effective_style.back_colour;
+                    event_shadow = (effective_style.shadow_x, effective_style.shadow_y);
+                    let run_origin_x_26_6 = origin_x_26_6 + line_pen_x_26_6;
+                    let run_origin_x = run_origin_x_26_6 >> 6;
                     let run_shadow_start = shadow_planes.len();
                     let run_outline_start = outline_planes.len();
                     let run_character_start = character_planes.len();
-                    let run_transform = style_transform(&effective_style);
-                    let transformed_borderstyle3_box =
-                        style.border_style == 3 && !run_transform.is_identity();
-                    if transformed_borderstyle3_box {
-                        line_has_transformed_borderstyle3_box = true;
-                        let box_scale = renderer_font_scale(config) * style_scale(render_scale);
-                        let compensation = if track.scaled_border_and_shadow {
-                            1.0
-                        } else {
-                            border_shadow_compensation_scale(track, config)
-                        };
-                        let box_padding = (effective_style.border * box_scale / compensation)
-                            .round()
-                            .max(0.0) as i32;
-                        let box_visible_height = (effective_style.font_size
-                            * style_scale(render_scale_y))
-                        .round()
-                        .max(1.0) as i32
-                            + box_padding * 2;
-                        let box_visible_top = if let Some((_, y)) = effective_position {
-                            match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
-                                ass::VALIGN_TOP => y,
-                                ass::VALIGN_CENTER => y - box_visible_height / 2,
-                                _ => y - box_visible_height,
+                    let run_transform =
+                        style_transform(&effective_style, effective_pixel_aspect(track, config));
+                    // Bake 1/8-pixel anchor phase only for untransformed top-left drawings.
+                    let run_drawing_exact_anchor_d6 =
+                        if line_index == 0 && line.runs.len() == 1 && run_transform.is_identity() {
+                            let horizontal = event.alignment & 0x3;
+                            let vertical = event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER);
+                            if horizontal == ass::HALIGN_LEFT && vertical == ass::VALIGN_TOP {
+                                mapped_position_exact.and_then(|(x, y)| {
+                                    let fractional_advance =
+                                        f64::from(run_origin_x_26_6 - origin_x_26_6) / 64.0;
+                                    let x = ((x + fractional_advance) * 64.0).round_ties_even();
+                                    let y = (y * 64.0).round_ties_even();
+                                    (x.is_finite()
+                                        && y.is_finite()
+                                        && x >= f64::from(i32::MIN)
+                                        && x <= f64::from(i32::MAX)
+                                        && y >= f64::from(i32::MIN)
+                                        && y <= f64::from(i32::MAX))
+                                    .then_some(Point {
+                                        x: x as i32,
+                                        y: y as i32,
+                                    })
+                                })
+                            } else {
+                                None
                             }
                         } else {
-                            line_top
+                            None
                         };
-                        let run_box_width = (f64::from(run.width) * render_scale_x).round() as i32;
-                        let box_vertical_pixel =
-                            style_scale(render_scale_y).round().max(1.0) as i32;
+                    if style.border_style == 3 && (run.drawing.is_some() || !run.glyphs.is_empty())
+                    {
+                        // OUTLINE_BOX is per style run; merge compatible adjacent boxes later.
+                        let box_padding_x = (effective_style.border_x
+                            * style_scale(effective_style.scale_x))
+                        .round()
+                        .max(0.0) as i32;
+                        let box_padding_y = (effective_style.border_y
+                            * style_scale(effective_style.scale_y))
+                        .round()
+                        .max(0.0) as i32;
+                        let source_size = run.style.font_size.max(1.0);
+                        let run_box_width = (f64::from(run.width)
+                            * (effective_style.font_size / source_size)
+                            * effective_pixel_aspect(track, config))
+                        .round() as i32;
+                        // Opaque box is run advance by -asc..desc, expanded by the border on each side.
                         let rect = Rect {
-                            x_min: run_origin_x - box_padding,
-                            y_min: box_visible_top - 1 - box_vertical_pixel,
-                            x_max: run_origin_x + run_box_width + box_padding,
-                            y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
+                            x_min: run_origin_x - box_padding_x,
+                            y_min: line_top - box_padding_y,
+                            x_max: run_origin_x + run_box_width + box_padding_x,
+                            y_max: line_top + line_height + box_padding_y,
                         };
                         if let Some(box_plane) = opaque_box_plane_from_rects(
                             &[rect],
@@ -358,16 +481,16 @@ impl RenderEngine {
                         ) {
                             outline_planes.push(box_plane);
                         }
-                        let box_shadow =
-                            (effective_style.shadow * box_scale / compensation).round() as i32;
-                        if box_shadow > 0 {
+                        let box_shadow_x = effective_style.shadow_x.round() as i32;
+                        let box_shadow_y = effective_style.shadow_y.round() as i32;
+                        if box_shadow_x != 0 || box_shadow_y != 0 {
                             if let Some(shadow_plane) = opaque_box_plane_from_rects(
                                 &[rect],
                                 effective_style.back_colour,
                                 ass::ImageType::Shadow,
                                 Point {
-                                    x: box_shadow,
-                                    y: box_shadow,
+                                    x: box_shadow_x,
+                                    y: box_shadow_y,
                                 },
                             ) {
                                 shadow_planes.push(shadow_plane);
@@ -375,222 +498,315 @@ impl RenderEngine {
                         }
                     }
                     if let Some(drawing) = &run.drawing {
-                        let positioned_drawing = effective_position.is_some();
-                        let drawing_baseline_y =
-                            if line.runs.iter().all(|run| run.drawing.is_some()) {
-                                line_top
-                            } else if positioned_drawing {
-                                line_top - style_scale(render_scale_y).round() as i32
-                            } else {
-                                line_top
-                                    + drawing_baseline_ascender(&effective_style, render_scale_y)
-                                    - style_scale(render_scale_y).round() as i32
-                            };
-                        if let Some(mut plane) = image_plane_from_drawing(
-                            drawing,
-                            DrawingPlaneParams {
-                                origin_x: run_origin_x,
-                                line_top: drawing_baseline_y,
-                                color: resolve_run_fill_color(
-                                    run,
-                                    &effective_style,
-                                    source_event,
-                                    now_ms,
-                                ),
-                                scale_x: effective_style.scale_x,
-                                scale_y: effective_style.scale_y,
-                                render_scale: RenderScale {
-                                    x: render_scale_x,
-                                    y: render_scale_y,
-                                    uniform: render_scale,
-                                },
-                                baseline_offset: effective_style.pbo,
-                                pad_to_libass_geometry: effective_style
-                                    .blur
-                                    .max(effective_style.be)
-                                    > 0.0
-                                    || track
-                                        .events
-                                        .get(event.event_index)
-                                        .map(|source| {
-                                            source.text.contains("\\clip")
-                                                || source.text.contains("\\iclip")
-                                        })
-                                        .unwrap_or(false),
-                            },
-                        ) {
-                            let drawing_fill_blur = if effective_style.border > 0.0
-                                || effective_style.shadow > 0.0
-                            {
-                                0
-                            } else {
-                                renderer_blur_radius(effective_style.blur.max(effective_style.be))
-                            };
-                            if drawing_fill_blur > 0 {
-                                plane = blur_image_plane(plane, drawing_fill_blur);
-                            }
-                            if effective_style.border > 0.0 {
-                                let mut outline_glyph = plane_to_raster_glyph(&plane);
-                                let rasterizer = Rasterizer::with_options(RasterOptions {
-                                    size_26_6: 64,
-                                    hinting: config.hinting,
-                                });
-                                let mut outline_glyphs = rasterizer.outline_glyphs(
-                                    &[outline_glyph.clone()],
-                                    effective_style.border.round().max(1.0) as i32,
-                                );
-                                if effective_style.blur > 0.0 {
-                                    outline_glyphs = rasterizer.blur_glyphs(
-                                        &outline_glyphs,
-                                        renderer_blur_radius(effective_style.blur),
-                                    );
-                                }
-                                outline_planes.extend(image_planes_from_absolute_glyphs(
-                                    &outline_glyphs,
-                                    effective_style.outline_colour,
-                                    ass::ImageType::Outline,
-                                ));
-                                outline_glyph = plane_to_raster_glyph(&plane);
-                                let _ = outline_glyph;
-                            }
-                            character_planes.push(plane);
-                            if effective_style.shadow > 0.0 {
-                                let rasterizer = Rasterizer::with_options(RasterOptions {
-                                    size_26_6: 64,
-                                    hinting: config.hinting,
-                                });
-                                let mut shadow_glyph = plane_to_raster_glyph(
-                                    character_planes.last().expect("drawing plane"),
-                                );
-                                if effective_style.blur > 0.0 {
-                                    shadow_glyph = rasterizer
-                                        .blur_glyphs(
-                                            &[shadow_glyph],
-                                            renderer_blur_radius(effective_style.blur),
-                                        )
-                                        .into_iter()
-                                        .next()
-                                        .expect("shadow glyph");
-                                }
-                                shadow_planes.extend(image_planes_from_absolute_glyphs(
-                                    &[RasterGlyph {
-                                        left: shadow_glyph.left
-                                            + effective_style.shadow.round() as i32,
-                                        top: shadow_glyph.top
-                                            - effective_style.shadow.round() as i32,
-                                        ..shadow_glyph
-                                    }],
-                                    effective_style.back_colour,
-                                    ass::ImageType::Shadow,
-                                ));
-                            }
-                        }
-                        let run_plane_starts = PlaneStarts {
-                            shadow: run_shadow_start,
-                            outline: run_outline_start,
-                            character: run_character_start,
-                        };
+                        // BorderStyle 3 boxes lack the drawing's baked phase; transform them with the integer pivot first.
                         apply_run_transform_to_recent_planes(
                             &mut shadow_planes,
                             &mut outline_planes,
                             &mut character_planes,
-                            run_plane_starts,
+                            PlaneStarts {
+                                shadow: run_shadow_start,
+                                outline: run_outline_start,
+                                character: run_character_start,
+                            },
                             RunTransformContext {
                                 transform: run_transform,
                                 event,
                                 effective_position,
-                                render_scale: RenderScale {
-                                    x: render_scale_x,
-                                    y: render_scale_y,
-                                    uniform: render_scale,
-                                },
-                                drawing_run: true,
-                                blur: effective_style.blur.max(effective_style.be),
+                                event_layout_bounds,
+                                projection_scale_y,
+                                mapping: &mapping,
+                                shear_pivot_x: Some(f64::from(run_origin_x_26_6) / 64.0),
+                                shear_pivot_y: Some(f64::from(line_top)),
                             },
                         );
-                        let drawing_advance = (f64::from(run.width)
-                            * style_scale(effective_style.scale_x)
-                            * render_scale_x)
+                        let drawing_plane_starts = PlaneStarts {
+                            shadow: shadow_planes.len(),
+                            outline: outline_planes.len(),
+                            character: character_planes.len(),
+                        };
+                        let drawing_polygons = scaled_event_drawings
+                            .get(line_index)
+                            .and_then(|line| line.get(run_index))
+                            .and_then(Option::as_ref);
+                        // Drawing ink bottom is baseline + pbo (asc = height - pbo); plane top is baseline - height + pbo.
+                        let drawing_height = drawing_polygons
+                            .map(Vec::as_slice)
+                            .and_then(drawing_height_from_d6)
+                            .unwrap_or_default();
+                        let baseline = line_top.saturating_add(line_ascender);
+                        let drawing_top = baseline.saturating_sub(drawing_height);
+                        let pbo_script = drawing_pbo_script_pixels(&effective_style, drawing)
+                            * style_scale(effective_style.scale_y);
+                        let quantized_drawing = run_drawing_exact_anchor_d6.and_then(|anchor_d6| {
+                            quantized_identity_drawing(
+                                drawing,
+                                &run.text,
+                                effective_style.scale_x,
+                                effective_style.scale_y,
+                                render_scale_all.x,
+                                render_scale_all.y,
+                                anchor_d6,
+                                effective_style.pbo,
+                            )
+                        });
+                        let raster_polygons = quantized_drawing
+                            .as_ref()
+                            .map(|drawing| drawing.polygons.as_slice())
+                            .or_else(|| drawing_polygons.map(Vec::as_slice));
+                        if let Some(mut plane) = raster_polygons.and_then(|polygons| {
+                            let (origin_x, line_top, baseline_offset, anchor_phase_d6) =
+                                quantized_drawing.as_ref().map_or(
+                                    (run_origin_x, drawing_top, pbo_script, Point::default()),
+                                    |drawing| {
+                                        (drawing.origin.x, drawing.origin.y, 0.0, drawing.phase_d6)
+                                    },
+                                );
+                            image_plane_from_drawing(
+                                polygons,
+                                DrawingPlaneParams {
+                                    origin_x,
+                                    line_top,
+                                    color: resolve_run_fill_color(
+                                        run,
+                                        &effective_style,
+                                        source_event,
+                                        now_ms,
+                                    ),
+                                    render_scale_y: render_scale_all.y,
+                                    baseline_offset,
+                                    anchor_phase_d6,
+                                },
+                            )
+                        }) {
+                            let drawing_fill_blur = if effective_style.border_x > 0.0
+                                || effective_style.border_y > 0.0
+                                || effective_style.shadow_x.abs() > f64::EPSILON
+                                || effective_style.shadow_y.abs() > f64::EPSILON
+                            {
+                                BitmapBlur::default()
+                            } else {
+                                bitmap_blur
+                            };
+                            if !drawing_fill_blur.is_zero() {
+                                plane = blur_image_plane_xy(plane, drawing_fill_blur);
+                            }
+                            if effective_style.border_x > 0.0 || effective_style.border_y > 0.0 {
+                                if let Some(outline_glyph) = plane_to_raster_glyph(&plane) {
+                                    let rasterizer = Rasterizer::with_options(RasterOptions {
+                                        size_26_6: 64,
+                                        hinting: config.hinting,
+                                    });
+                                    let radius_for = |border: f64| {
+                                        if border > 0.0 {
+                                            border.round().max(1.0) as i32
+                                        } else {
+                                            0
+                                        }
+                                    };
+                                    let outline_glyphs = rasterizer.outline_glyphs_xy(
+                                        &[outline_glyph],
+                                        radius_for(effective_style.border_x),
+                                        radius_for(effective_style.border_y),
+                                    );
+                                    outline_planes.extend(
+                                        image_planes_from_absolute_glyphs(
+                                            &outline_glyphs,
+                                            effective_style.outline_colour,
+                                            ass::ImageType::Outline,
+                                        )
+                                        .into_iter()
+                                        .map(|plane| blur_image_plane_xy(plane, bitmap_blur)),
+                                    );
+                                }
+                            }
+                            character_planes.push(plane);
+                            if style.border_style != 4
+                                && (effective_style.shadow_x.abs() > f64::EPSILON
+                                    || effective_style.shadow_y.abs() > f64::EPSILON)
+                            {
+                                if let Some(shadow_glyph) = plane_to_raster_glyph(
+                                    character_planes.last().expect("drawing plane"),
+                                ) {
+                                    // Positive \xshad/\yshad offsets down-right; bitmap top is baseline-relative, so add shadow_y.
+                                    shadow_planes.extend(
+                                        image_planes_from_absolute_glyphs(
+                                            &[RasterGlyph {
+                                                left: shadow_glyph.left.saturating_add(
+                                                    effective_style.shadow_x.round() as i32,
+                                                ),
+                                                top: shadow_glyph.top.saturating_add(
+                                                    effective_style.shadow_y.round() as i32,
+                                                ),
+                                                ..shadow_glyph
+                                            }],
+                                            effective_style.back_colour,
+                                            ass::ImageType::Shadow,
+                                        )
+                                        .into_iter()
+                                        .map(|plane| blur_image_plane_xy(plane, bitmap_blur)),
+                                    );
+                                }
+                            }
+                        }
+                        apply_run_transform_to_recent_planes(
+                            &mut shadow_planes,
+                            &mut outline_planes,
+                            &mut character_planes,
+                            drawing_plane_starts,
+                            RunTransformContext {
+                                transform: run_transform,
+                                event,
+                                effective_position,
+                                event_layout_bounds,
+                                projection_scale_y,
+                                mapping: &mapping,
+                                shear_pivot_x: Some(f64::from(run_origin_x_26_6) / 64.0),
+                                shear_pivot_y: Some(f64::from(line_top)),
+                            },
+                        );
+                        // run.width already includes \fscx from layout measurement.
+                        let drawing_advance_26_6 = (f64::from(run.width) * render_scale_x * 64.0)
                             .round()
                             .max(0.0) as i32;
-                        line_pen_x += drawing_advance;
+                        line_pen_x_26_6 += drawing_advance_26_6;
                         continue;
                     }
                     let rasterizer = Rasterizer::with_options(RasterOptions {
                         size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
                         hinting: config.hinting,
                     });
+                    let position_scale =
+                        shaped_position_render_scale(run, &effective_style, render_scale_all);
                     let glyph_infos =
-                        scale_glyph_infos(&run.glyphs, render_scale_x, render_scale_y);
+                        scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
                     let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos)
                     else {
-                        line_pen_x += run.width.round() as i32;
+                        line_pen_x_26_6 += (run.width * 64.0).round() as i32;
                         continue;
                     };
-                    let raster_glyphs =
-                        apply_vertical_font_raster_advances(raster_glyphs, &effective_style);
+                    let raster_glyphs = apply_vertical_font_raster_advances(
+                        raster_glyphs,
+                        &glyph_infos,
+                        &effective_style,
+                        &run.font,
+                    );
+                    if let Some((exact_line_origin_x, exact_baseline_y)) =
+                        exact_positioned_text_layout
+                    {
+                        let scale_x = style_scale(
+                            effective_style.scale_x * effective_pixel_aspect(track, config),
+                        );
+                        let scale_y = style_scale(effective_style.scale_y);
+                        let spacing = f64::from(text_spacing_advance_26_6(&effective_style)) / 64.0;
+                        let mut pen_x = 0.0_f64;
+                        let mut pen_y = 0.0_f64;
+                        let mut baseline_positions = Vec::with_capacity(raster_glyphs.len());
+                        for glyph in &raster_glyphs {
+                            let offset_x_26_6 = if glyph.offset_x_26_6 == 0 && glyph.offset_x != 0 {
+                                glyph.offset_x.saturating_mul(64)
+                            } else {
+                                glyph.offset_x_26_6
+                            };
+                            let offset_y_26_6 = if glyph.offset_y_26_6 == 0 && glyph.offset_y != 0 {
+                                glyph.offset_y.saturating_mul(64)
+                            } else {
+                                glyph.offset_y_26_6
+                            };
+                            baseline_positions.push((
+                                exact_line_origin_x
+                                    + exact_line_pen_x
+                                    + pen_x
+                                    + f64::from(offset_x_26_6) / 64.0 * scale_x,
+                                exact_baseline_y - pen_y
+                                    + f64::from(offset_y_26_6) / 64.0 * scale_y,
+                            ));
+                            pen_x += f64::from(glyph.advance_x_26_6) / 64.0 * scale_x + spacing;
+                            pen_y += f64::from(glyph.advance_y_26_6) / 64.0 * scale_y;
+                        }
+                        if let Ok(positioned_glyphs) = rasterizer
+                            .rasterize_positioned_identity_glyphs(
+                                &run.font,
+                                &glyph_infos,
+                                &baseline_positions,
+                                scale_x,
+                                scale_y,
+                            )
+                        {
+                            let fill_color =
+                                resolve_run_fill_color(run, &effective_style, source_event, now_ms);
+                            if let Some(plane) = combined_image_plane_from_positioned_glyphs(
+                                &positioned_glyphs,
+                                fill_color,
+                                ass::ImageType::Character,
+                                bitmap_blur,
+                            ) {
+                                character_planes.push(plane);
+                            }
+                            exact_line_pen_x += pen_x;
+                            line_pen_x_26_6 = line_pen_x_26_6
+                                .saturating_add((pen_x * 64.0).round_ties_even() as i32);
+                            continue;
+                        }
+                        // Keep later exact runs on the whole-line pen if this glyph falls back to the bitmap path.
+                        exact_line_pen_x += pen_x;
+                    }
                     let raster_glyphs = scale_raster_glyphs(
                         raster_glyphs,
-                        effective_style.scale_x,
+                        effective_style.scale_x * effective_pixel_aspect(track, config),
                         effective_style.scale_y,
                     );
                     let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
-                    let positioned_center_text_anchor_adjust =
-                        if positioned_center_metric_plane_adjust
-                            && (event.alignment & 0x3) == ass::HALIGN_CENTER
-                        {
-                            style_scale(render_scale_x).round().max(1.0) as i32
-                        } else {
-                            0
-                        };
-                    let glyph_origin_x = run_origin_x + positioned_center_text_anchor_adjust
-                        - i32::from(has_scaled_run);
-                    let run_line_metrics = Some(TextLineMetrics {
-                        ascender: line_ascender,
-                        height: Some(line_metric_height),
-                        positioned_center_metric_anchor,
-                        positioned_center_metric_plane_adjust,
-                    });
-                    let effective_blur = effective_style.blur.max(effective_style.be);
+                    let run_ascender = Some(line_ascender);
                     let has_outline = style.border_style != 3
-                        && effective_style.border > 0.0
+                        && (effective_style.border_x > 0.0 || effective_style.border_y > 0.0)
                         && !karaoke_hides_outline(run, source_event, now_ms);
-                    let has_shadow = effective_style.shadow_x.abs() > f64::EPSILON
-                        || effective_style.shadow_y.abs() > f64::EPSILON;
+                    // BorderStyle 4 skips shadow bitmaps; the background box replaces them.
+                    let has_shadow = style.border_style != 4
+                        && (effective_style.shadow_x.abs() > f64::EPSILON
+                            || effective_style.shadow_y.abs() > f64::EPSILON);
                     let fill_blur = if has_outline || has_shadow {
-                        0
+                        BitmapBlur::default()
                     } else {
-                        renderer_blur_radius(effective_blur)
+                        bitmap_blur
                     };
                     let mut outlined_shadow_source_glyphs = None;
                     if has_outline {
-                        let outline_radius = effective_style.border.round().max(1.0) as i32;
-                        let outline_glyphs =
-                            rasterizer.outline_glyphs(&raster_glyphs, outline_radius);
+                        // Stroke with independent \xbord/\ybord radii; a zero radius leaves that axis unexpanded.
+                        let radius_for = |border: f64| {
+                            if border > 0.0 {
+                                border.round().max(1.0) as i32
+                            } else {
+                                0
+                            }
+                        };
+                        let outline_glyphs = rasterizer.outline_glyphs_xy(
+                            &raster_glyphs,
+                            radius_for(effective_style.border_x),
+                            radius_for(effective_style.border_y),
+                        );
                         if has_shadow {
                             outlined_shadow_source_glyphs = Some(outline_glyphs.clone());
                         }
-                        let outline_blur = renderer_blur_radius(effective_blur);
-                        if let Some(plane) = combined_image_plane_from_glyphs(
+                        if let Some(plane) = combined_image_plane_from_glyphs_xy(
                             &outline_glyphs,
-                            glyph_origin_x,
-                            text_line_top,
-                            run_line_metrics,
+                            run_origin_x_26_6,
+                            line_top,
+                            run_ascender,
                             effective_style.outline_colour,
                             ass::ImageType::Outline,
-                            outline_blur,
+                            bitmap_blur,
                         ) {
                             outline_planes.push(plane);
                         }
                     }
                     let fill_color =
                         resolve_run_fill_color(run, &effective_style, source_event, now_ms);
-                    if run.karaoke.is_none() && effective_blur > 0.0 {
-                        if let Some(plane) = combined_image_plane_from_glyphs(
+                    if run.karaoke.is_none() && !bitmap_blur.is_zero() {
+                        if let Some(plane) = combined_image_plane_from_glyphs_xy(
                             &raster_glyphs,
-                            glyph_origin_x,
-                            text_line_top,
-                            run_line_metrics,
+                            run_origin_x_26_6,
+                            line_top,
+                            run_ascender,
                             fill_color,
                             ass::ImageType::Character,
                             fill_blur,
@@ -598,58 +814,103 @@ impl RenderEngine {
                             character_planes.push(plane);
                         }
                     } else {
-                        let maybe_fill_plane = combined_image_plane_from_glyphs(
+                        let maybe_fill_plane = combined_image_plane_from_glyphs_xy(
                             &raster_glyphs,
-                            glyph_origin_x,
-                            text_line_top,
-                            run_line_metrics,
+                            run_origin_x_26_6,
+                            line_top,
+                            run_ascender,
                             fill_color,
                             ass::ImageType::Character,
                             fill_blur,
                         );
                         if run.karaoke.is_some() {
                             let fill_planes = maybe_fill_plane.into_iter().collect();
-                            character_planes.extend(apply_karaoke_to_character_planes(
-                                fill_planes,
-                                run,
-                                &effective_style,
-                                source_event,
-                                now_ms,
-                                glyph_origin_x,
-                                raster_glyphs
-                                    .iter()
-                                    .map(|glyph| glyph.advance_x)
-                                    .sum::<i32>(),
-                            ));
+                            let quarter_turn_sweep = run.karaoke.is_some_and(|karaoke| {
+                                karaoke.mode == ParsedKaraokeMode::Sweep
+                                    && (effective_style.rotation_z.abs() % 180.0 - 90.0).abs()
+                                        < f64::EPSILON
+                            });
+                            if quarter_turn_sweep {
+                                character_planes.extend(fill_planes);
+                            } else {
+                                character_planes.extend(apply_karaoke_to_character_planes(
+                                    fill_planes,
+                                    run,
+                                    &effective_style,
+                                    source_event,
+                                    now_ms,
+                                    run_origin_x,
+                                    raster_glyphs
+                                        .iter()
+                                        .map(|glyph| glyph.advance_x_26_6)
+                                        .sum::<i32>()
+                                        >> 6,
+                                ));
+                            }
                         } else if let Some(plane) = maybe_fill_plane {
                             character_planes.push(plane);
                         }
                     }
-                    let run_advance = raster_glyphs
+                    let run_advance_26_6 = raster_glyphs
                         .iter()
-                        .map(|glyph| glyph.advance_x)
+                        .map(|glyph| glyph.advance_x_26_6)
                         .sum::<i32>();
-                    character_planes.extend(text_decoration_planes(
+                    let decoration_bars = text_decoration_bars(
                         &effective_style,
-                        glyph_origin_x,
-                        text_line_top,
-                        run_advance,
-                        fill_color,
-                    ));
-                    if effective_style.shadow_x.abs() > f64::EPSILON
-                        || effective_style.shadow_y.abs() > f64::EPSILON
-                    {
+                        &run.font,
+                        line_top + line_ascender,
+                        run_origin_x,
+                        (run_advance_26_6 + 32) >> 6,
+                    );
+                    for bar in &decoration_bars {
+                        character_planes.push(solid_plane_from_rect(
+                            *bar,
+                            fill_color,
+                            ass::ImageType::Character,
+                        ));
+                        if has_outline {
+                            let expand = |border: f64| {
+                                if border > 0.0 {
+                                    border.round().max(1.0) as i32
+                                } else {
+                                    0
+                                }
+                            };
+                            outline_planes.push(solid_plane_from_rect(
+                                expand_rect_xy(
+                                    *bar,
+                                    expand(effective_style.border_x),
+                                    expand(effective_style.border_y),
+                                ),
+                                effective_style.outline_colour,
+                                ass::ImageType::Outline,
+                            ));
+                        }
+                        if has_shadow {
+                            let mut shadow_bar = *bar;
+                            shadow_bar.x_min += effective_style.shadow_x.round() as i32;
+                            shadow_bar.x_max += effective_style.shadow_x.round() as i32;
+                            shadow_bar.y_min += effective_style.shadow_y.round() as i32;
+                            shadow_bar.y_max += effective_style.shadow_y.round() as i32;
+                            shadow_planes.push(solid_plane_from_rect(
+                                shadow_bar,
+                                effective_style.back_colour,
+                                ass::ImageType::Shadow,
+                            ));
+                        }
+                    }
+                    if has_shadow {
                         let shadow_glyphs = outlined_shadow_source_glyphs
                             .as_deref()
                             .unwrap_or(&raster_glyphs);
-                        if let Some(plane) = combined_image_plane_from_glyphs(
+                        if let Some(plane) = combined_image_plane_from_glyphs_xy(
                             shadow_glyphs,
-                            glyph_origin_x + effective_style.shadow_x.round() as i32,
-                            text_line_top + effective_style.shadow_y.round() as i32,
-                            run_line_metrics,
+                            run_origin_x_26_6 + (effective_style.shadow_x * 64.0).round() as i32,
+                            line_top + effective_style.shadow_y.round() as i32,
+                            run_ascender,
                             effective_style.back_colour,
                             ass::ImageType::Shadow,
-                            renderer_blur_radius(effective_blur),
+                            bitmap_blur,
                         ) {
                             shadow_planes.push(plane);
                         }
@@ -667,135 +928,119 @@ impl RenderEngine {
                             transform: run_transform,
                             event,
                             effective_position,
-                            render_scale: RenderScale {
-                                x: render_scale_x,
-                                y: render_scale_y,
-                                uniform: render_scale,
-                            },
-                            drawing_run: false,
-                            blur: effective_blur,
+                            event_layout_bounds,
+                            projection_scale_y,
+                            mapping: &mapping,
+                            shear_pivot_x: Some(f64::from(run_origin_x_26_6) / 64.0),
+                            shear_pivot_y: Some(f64::from(line_top)),
                         },
                     );
-                    line_pen_x += run_advance;
-                }
-                if style.border_style == 3 && !line_has_transformed_borderstyle3_box {
-                    let box_scale = renderer_font_scale(config) * style_scale(render_scale);
-                    let compensation = if track.scaled_border_and_shadow {
-                        1.0
-                    } else {
-                        border_shadow_compensation_scale(track, config)
-                    };
-                    let box_padding =
-                        (style.outline * box_scale / compensation).round().max(0.0) as i32;
-                    let box_visible_height = (style.font_size * style_scale(render_scale_y))
-                        .round()
-                        .max(1.0) as i32
-                        + box_padding * 2;
-                    let box_visible_top = if let Some((_, y)) = effective_position {
-                        match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
-                            ass::VALIGN_TOP => y,
-                            ass::VALIGN_CENTER => y - box_visible_height / 2,
-                            _ => y - box_visible_height,
-                        }
-                    } else {
-                        line_top
-                    };
-                    let box_line_width = if line_pen_x > 0 {
-                        line_pen_x
-                    } else {
-                        scaled_line_width
-                    };
-                    let box_origin_x = compute_horizontal_origin(
-                        track,
-                        event,
-                        box_line_width,
-                        effective_position,
-                        render_scale_x,
-                    );
-                    let box_vertical_pixel = style_scale(render_scale_y).round().max(1.0) as i32;
-                    opaque_box_rects.push(Rect {
-                        x_min: box_origin_x - box_padding,
-                        y_min: box_visible_top - 1 - box_vertical_pixel,
-                        x_max: box_origin_x + box_line_width + box_padding,
-                        y_max: box_visible_top + box_visible_height + 1 - box_vertical_pixel,
-                    });
-                }
-                align_positioned_text_line_bottom(
-                    &mut shadow_planes,
-                    &mut outline_planes,
-                    &mut character_planes,
-                    line_plane_starts,
-                    PositionedLineBottomContext {
-                        event,
-                        line,
-                        line_index,
-                        line_count: event.lines.len(),
-                        effective_position,
-                        render_scale_y,
-                    },
-                );
-            }
-
-            if style.border_style == 3 {
-                let box_scale = renderer_font_scale(config) * style_scale(render_scale);
-                let compensation = if track.scaled_border_and_shadow {
-                    1.0
-                } else {
-                    border_shadow_compensation_scale(track, config)
-                };
-                let box_shadow = (style.shadow * box_scale / compensation).round() as i32;
-                if let Some(box_plane) = opaque_box_plane_from_rects(
-                    &opaque_box_rects,
-                    style.outline_colour,
-                    ass::ImageType::Outline,
-                    Point { x: 0, y: 0 },
-                ) {
-                    outline_planes.insert(0, box_plane);
-                }
-                if box_shadow > 0 {
-                    if let Some(shadow_plane) = opaque_box_plane_from_rects(
-                        &opaque_box_rects,
-                        style.back_colour,
-                        ass::ImageType::Shadow,
-                        Point {
-                            x: box_shadow,
-                            y: box_shadow,
-                        },
-                    ) {
-                        shadow_planes.clear();
-                        shadow_planes.push(shadow_plane);
+                    if run.karaoke.is_some()
+                        && (effective_style.rotation_z.abs() % 180.0 - 90.0).abs() < f64::EPSILON
+                    {
+                        let transformed = character_planes.split_off(run_character_start);
+                        let swept = apply_quarter_turn_karaoke_sweep_after_transform(
+                            transformed,
+                            run,
+                            &effective_style,
+                            source_event,
+                            now_ms,
+                            run_advance_26_6 >> 6,
+                        );
+                        character_planes.extend(swept);
                     }
+                    line_pen_x_26_6 += run_advance_26_6;
                 }
+                // border_top is the first line's max border; border_bottom is overwritten per line.
+                if line_index == 0 {
+                    event_border_top = line_border_y;
+                }
+                event_border_bottom = line_border_y;
             }
 
+            // EventImages: top = device_y - first asc - border_top; height = text + borders; width = bbox + 2*border_x.
+            let event_line_box = (!event.lines.is_empty() && event_left < event_right).then(|| {
+                let total_height = total_text_height(&line_metrics, config).round() as i32;
+                Rect {
+                    x_min: event_left - event_border_x,
+                    y_min: vertical_layout.first().copied().unwrap_or(0) - event_border_top,
+                    x_max: event_right + event_border_x,
+                    y_max: vertical_layout.first().copied().unwrap_or(0)
+                        + total_height
+                        + event_border_bottom,
+                }
+            });
             let mut event_planes = shadow_planes;
             event_planes.extend(outline_planes);
             event_planes.extend(character_planes);
-            let coalesce_split_runs = track
-                .events
-                .get(event.event_index)
-                .map(|source| {
-                    let override_blocks = source.text.matches('{').count();
-                    (source.text.contains("\\t(") && source.text.contains("\\alpha"))
-                        || (override_blocks <= 1 && !source.text.contains("\\N"))
-                })
-                .unwrap_or(false);
-            if coalesce_split_runs {
-                event_planes = merge_compatible_event_planes(event_planes);
+            // Do not merge overlapping runs: blur/filter is a run key even when type/colour match.
+            let apply_script_clip = event_is_explicit || !config.use_margins;
+            if apply_script_clip {
+                if let Some((clip_rect, inverse_clip)) =
+                    resolve_rect_clip(event, track, source_event, now_ms)
+                {
+                    let clip_rect = scale_clip_rect_exact(clip_rect, &mapping);
+                    // \clip and \iclip use the exact clip rectangle; inverse does not bleed by border/shadow.
+                    event_planes = apply_event_clip(event_planes, clip_rect, inverse_clip);
+                }
+                if let Some(vector_clip) = &event.vector_clip {
+                    // A failed outline transform skips vector clipping for both regular and inverse clips.
+                    if let Some(exact_clip) =
+                        source_event.and_then(|source| parse_dialogue_vector_clip_d6(&source.text))
+                    {
+                        if let Some(vector_clip) = scale_vector_clip_d6(&exact_clip, &mapping) {
+                            event_planes = apply_vector_clip_d6(
+                                event_planes,
+                                &vector_clip,
+                                event.vector_clip_inverse,
+                            );
+                        }
+                    } else if let Some(vector_clip) = scale_vector_clip(vector_clip, &mapping) {
+                        event_planes = apply_vector_clip(
+                            event_planes,
+                            &vector_clip,
+                            event.vector_clip_inverse,
+                        );
+                    }
+                }
             }
-            if let Some(clip_rect) = event.clip_rect {
-                let clip_rect = scale_clip_rect(clip_rect, render_scale_x, render_scale_y);
-                let clip_rect = if event.inverse_clip {
-                    expand_rect(clip_rect, clip_mask_bleed)
-                } else {
-                    clip_rect
-                };
-                event_planes = apply_event_clip(event_planes, clip_rect, event.inverse_clip);
-            } else if let Some(vector_clip) = &event.vector_clip {
-                event_planes = apply_vector_clip(event_planes, vector_clip, event.inverse_clip);
+            if style.border_style == 4 {
+                if let Some(rect) = event_line_box {
+                    // Background is the event box expanded by positive shadow offsets, clamped to the frame.
+                    let size_x = if event_shadow.0 > 0.0 {
+                        event_shadow.0.round() as i32
+                    } else {
+                        0
+                    };
+                    let size_y = if event_shadow.1 > 0.0 {
+                        event_shadow.1.round() as i32
+                    } else {
+                        0
+                    };
+                    let frame = frame_clip_rect(track, config, event_is_explicit);
+                    let background = Rect {
+                        x_min: (rect.x_min - size_x).clamp(frame.x_min, frame.x_max),
+                        y_min: (rect.y_min - size_y).clamp(frame.y_min, frame.y_max),
+                        x_max: (rect.x_max + size_x).clamp(frame.x_min, frame.x_max),
+                        y_max: (rect.y_max + size_y).clamp(frame.y_min, frame.y_max),
+                    };
+                    if background.width() > 0 && background.height() > 0 {
+                        event_planes.insert(
+                            0,
+                            solid_plane_from_rect(
+                                background,
+                                event_back_colour,
+                                ass::ImageType::Shadow,
+                            ),
+                        );
+                    }
+                }
             }
             if let Some(fade) = event.fade {
                 event_planes = apply_fade_to_planes(event_planes, fade, source_event, now_ms);
+            } else if planes_have_translucent_fill(&event_planes) {
+                // Translucent fill: carve it out of the border (FILTER_FILL_IN_BORDER stays clear).
+                carve_fill_out_of_outline(&mut event_planes);
             }
             event_planes = apply_effect_to_planes(
                 event_planes,
@@ -803,25 +1048,46 @@ impl RenderEngine {
                 track,
                 config,
                 now_ms,
-                render_scale_x,
-                render_scale_y,
+                &mapping,
+                event_line_box,
             );
-            let mut render_offset = output_offset(config);
-            if style_scale(render_scale_y) > 1.0 {
-                render_offset.y += render_scale_y.round() as i32;
-            }
-            event_planes = translate_planes(event_planes, render_offset);
-            event_planes = apply_event_clip(
-                event_planes,
-                frame_clip_rect(track, config, event, effective_position),
-                false,
-            );
-            if let Some(occupied_bound) = occupied_bound {
-                occupied_bounds.push(occupied_bound);
-            }
-            planes.extend(event_planes);
+            // Collision coords are already screen space; the event mapping folded in margins.
+            let collision_rect = event_line_box;
+            rendered_events.push(RenderedEvent {
+                event_index: event.event_index,
+                planes: event_planes,
+                collision_rect,
+                detect_collisions: effective_position.is_none()
+                    && event.origin.is_none()
+                    && event.origin_exact.is_none()
+                    && !event.transform_disables_collision
+                    && !effect_disables_collision,
+                shift_direction: if (event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER))
+                    == ass::VALIGN_SUB
+                {
+                    -1
+                } else {
+                    1
+                },
+                frame_clip: frame_clip_rect(track, config, event_is_explicit),
+            });
         }
 
+        // fix_collisions runs independently per same-layer group, then lists are concatenated and frame-clipped.
+        {
+            let mut cache = self
+                .collision_cache
+                .lock()
+                .expect("collision cache mutex poisoned");
+            fix_collisions_by_layer(&mut cache, &mut rendered_events, track);
+        }
+
+        let mut planes = Vec::new();
+        for record in rendered_events {
+            planes.extend(apply_event_clip(record.planes, record.frame_clip, false));
+        }
+        // Drop ASS alpha 0xFF planes only after render, collision, and clip (keep zero-sized clip nodes).
+        planes.retain(|plane| plane.color.0 & 0xFF != 0xFF);
         planes
     }
 

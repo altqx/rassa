@@ -4,82 +4,195 @@ use super::*;
 pub(crate) struct FontVerticalMetrics {
     pub(crate) ascender_26_6: i32,
     pub(crate) descender_26_6: i32,
+    /// Underline (top, thickness) in 26.6: top = -underlinePosition - thickness/2 from the raw post table.
+    pub(crate) underline_26_6: Option<(i32, i32)>,
+    /// Strikeout (top, thickness) in 26.6 from OS/2 yStrikeoutPosition/ySize.
+    pub(crate) strikeout_26_6: Option<(i32, i32)>,
+    /// Scaled OS/2 sTypoDescender for DECO_ROTATE @font offset; 0 without OS/2.
+    pub(crate) typo_descender_26_6: i32,
 }
 
-pub(crate) fn layout_line_height(config: &RendererConfig, scale_y: f64) -> i32 {
-    let scale_y = style_scale(scale_y);
-    let extra_spacing = if config.line_spacing.is_finite() {
-        (config.line_spacing * scale_y).round() as i32
-    } else {
-        0
+/// Line asc/desc is max win-metrics × \fscy; drawings use asc = height - pbo, desc = pbo.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct LineMetrics {
+    pub(crate) asc: f64,
+    pub(crate) desc: f64,
+}
+
+impl LineMetrics {
+    pub(crate) fn height(self) -> f64 {
+        self.asc + self.desc
+    }
+}
+
+pub(crate) struct LineMetricsContext<'a> {
+    pub(crate) track: &'a ParsedTrack,
+    pub(crate) config: &'a RendererConfig,
+    pub(crate) source_event: Option<&'a ParsedEvent>,
+    pub(crate) now_ms: i64,
+    pub(crate) render_scale: RenderScale,
+    pub(crate) font_scale: f64,
+    pub(crate) scaled_drawings: &'a [Vec<Option<Vec<Vec<Point>>>>],
+}
+
+fn run_is_whitespace_text(run: &LayoutGlyphRun) -> bool {
+    run.drawing.is_none() && run.text.chars().all(|character| character == ' ')
+}
+
+fn text_run_metrics(run: &LayoutGlyphRun, context: &LineMetricsContext<'_>) -> LineMetrics {
+    let effective_style = apply_renderer_style_scale(
+        resolve_run_style(run, context.source_event, context.now_ms),
+        context.track,
+        context.config,
+        context.font_scale,
+        context.render_scale,
+    );
+    if !(effective_style.font_size.is_finite() && effective_style.font_size > 0.0) {
+        return LineMetrics::default();
+    }
+    let font_size = effective_style.font_size.max(1.0);
+    let scale_y = style_scale(effective_style.scale_y);
+    let size_26_6 = (font_size * 64.0).round() as i32;
+    if let Some(metrics) = font_vertical_metrics(&run.font, size_26_6) {
+        return LineMetrics {
+            asc: f64::from(metrics.ascender_26_6) / 64.0 * scale_y,
+            desc: f64::from(metrics.descender_26_6) / 64.0 * scale_y,
+        };
+    }
+    // Without face metrics, REAL_DIM keeps asc+desc == font_size; split from ink.
+    let mut ink_ascender = 0_i32;
+    if !run.glyphs.is_empty() {
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6,
+            hinting: context.config.hinting,
+        });
+        let position_scale =
+            shaped_position_render_scale(run, &effective_style, context.render_scale);
+        let glyph_infos = scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
+        if let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) {
+            ink_ascender = raster_glyphs
+                .iter()
+                .map(|glyph| glyph.top)
+                .max()
+                .unwrap_or(0);
+        }
+    }
+    let asc = f64::from(ink_ascender).clamp(0.0, font_size) * scale_y;
+    LineMetrics {
+        asc,
+        desc: (font_size * scale_y - asc).max(0.0),
+    }
+}
+
+fn drawing_run_metrics(
+    run: &LayoutGlyphRun,
+    scaled_polygons: Option<&[Vec<Point>]>,
+    context: &LineMetricsContext<'_>,
+) -> LineMetrics {
+    let Some(drawing) = run.drawing.as_ref() else {
+        return LineMetrics::default();
     };
-    ((f64::from(LINE_HEIGHT) * scale_y).round() as i32 + extra_spacing).max(1)
-}
-
-pub(crate) fn layout_line_height_for_line(
-    line: &rassa_layout::LayoutLine,
-    config: &RendererConfig,
-    scale_y: f64,
-) -> i32 {
-    if line.runs.iter().all(|run| run.drawing.is_some()) {
-        return drawing_only_line_height(line, scale_y);
+    // Use the same 26.6 outline as rasterization so metrics and ink cross pixel thresholds together.
+    let effective_style = resolve_run_style(run, context.source_event, context.now_ms);
+    let Some(height) = scaled_polygons.and_then(drawing_height_exact_from_d6) else {
+        return LineMetrics::default();
+    };
+    let scale_y = style_scale(effective_style.scale_y) * style_scale(context.render_scale.y);
+    // Drawing desc = pbo, asc = bbox height - pbo; only pbo still needs the 2^(\p-1) divide.
+    let height = height.max(0.0);
+    let pbo = drawing_pbo_script_pixels(&effective_style, drawing) * scale_y;
+    if libass_outline_coordinate_from_f64(height).is_none()
+        || libass_outline_coordinate_from_f64(pbo).is_none()
+    {
+        return LineMetrics::default();
     }
-
-    text_layout_line_height_for_line(line, config, scale_y)
-}
-
-pub(crate) fn positioned_layout_line_height_for_line(
-    line: &rassa_layout::LayoutLine,
-    config: &RendererConfig,
-    scale_y: f64,
-    _alignment: i32,
-) -> i32 {
-    if line.runs.iter().all(|run| run.drawing.is_some()) {
-        return drawing_only_line_height(line, scale_y);
+    LineMetrics {
+        asc: height - pbo,
+        desc: pbo,
     }
+}
 
-    let layout_height = layout_line_height(config, scale_y);
-    if style_scale(scale_y) < 1.0 {
-        return layout_height;
+/// \pbo in script pixels: divide drawing-coordinate pbo by the same 2^(\p-1) as the drawing.
+pub(crate) fn drawing_pbo_script_pixels(style: &ParsedSpanStyle, drawing: &ParsedDrawing) -> f64 {
+    if !style.pbo.is_finite() {
+        return 0.0;
     }
-    layout_height.max(font_metric_height_for_line(line, scale_y))
+    let scale_base = rassa_parse::libass_drawing_scale_base(drawing.scale);
+    if scale_base <= 0 {
+        return 0.0;
+    }
+    style.pbo / f64::from(scale_base)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn positioned_layout_line_height_for_line_at(
-    line: &rassa_layout::LayoutLine,
-    source_event: Option<&ParsedEvent>,
-    now_ms: i64,
-    track: &ParsedTrack,
-    config: &RendererConfig,
-    render_scale: RenderScale,
-    alignment: i32,
-) -> i32 {
-    let _ = (source_event, now_ms, track, config, render_scale, alignment);
-    positioned_layout_line_height_for_line(line, config, render_scale.y, alignment)
+fn run_metrics(
+    run: &LayoutGlyphRun,
+    scaled_polygons: Option<&[Vec<Point>]>,
+    context: &LineMetricsContext<'_>,
+) -> LineMetrics {
+    if run.drawing.is_some() {
+        drawing_run_metrics(run, scaled_polygons, context)
+    } else {
+        text_run_metrics(run, context)
+    }
 }
 
-pub(crate) fn text_layout_line_height_for_line(
+pub(crate) fn line_metrics_for_line(
     line: &rassa_layout::LayoutLine,
-    config: &RendererConfig,
-    scale_y: f64,
-) -> i32 {
-    let scale_y = style_scale(scale_y);
-    let max_font_size = line
+    line_index: usize,
+    context: &LineMetricsContext<'_>,
+) -> LineMetrics {
+    // Trimmed leading/trailing whitespace is ignored; an empty line is half height.
+    let content_runs = line
         .runs
         .iter()
-        .filter(|run| run.drawing.is_none())
-        .map(|run| run.style.font_size)
-        .filter(|size| size.is_finite() && *size > 0.0)
-        .fold(0.0_f64, f64::max);
-    let extra_spacing = if config.line_spacing.is_finite() {
-        (config.line_spacing * scale_y).round() as i32
+        .enumerate()
+        .filter(|(_, run)| !run_is_whitespace_text(run))
+        .collect::<Vec<_>>();
+    let (runs, factor): (Vec<(usize, &LayoutGlyphRun)>, f64) = if content_runs.is_empty() {
+        (line.runs.iter().enumerate().collect(), 0.5)
     } else {
-        0
+        (content_runs, 1.0)
     };
-    ((max_font_size * scale_y).round() as i32 + extra_spacing).max(1)
+    let mut metrics = LineMetrics::default();
+    for (run_index, run) in runs {
+        let scaled_polygons = context
+            .scaled_drawings
+            .get(line_index)
+            .and_then(|line| line.get(run_index))
+            .and_then(Option::as_deref);
+        let run_metrics = run_metrics(run, scaled_polygons, context);
+        metrics.asc = metrics.asc.max(run_metrics.asc * factor);
+        metrics.desc = metrics.desc.max(run_metrics.desc * factor);
+    }
+    metrics
 }
 
+pub(crate) fn event_line_metrics(
+    lines: &[rassa_layout::LayoutLine],
+    context: &LineMetricsContext<'_>,
+) -> Vec<LineMetrics> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(line_index, line)| line_metrics_for_line(line, line_index, context))
+        .collect()
+}
+
+pub(crate) fn line_spacing(config: &RendererConfig) -> f64 {
+    if config.line_spacing.is_finite() {
+        config.line_spacing
+    } else {
+        0.0
+    }
+}
+
+/// Sum of per-line asc+desc plus line_spacing per break.
+pub(crate) fn total_text_height(metrics: &[LineMetrics], config: &RendererConfig) -> f64 {
+    let height: f64 = metrics.iter().map(|line| line.height()).sum();
+    height + line_spacing(config) * metrics.len().saturating_sub(1) as f64
+}
+
+/// Line advance from cluster advances (\fsp/\fscx), never from rendered ink.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rendered_text_alignment_width(
     line: &rassa_layout::LayoutLine,
@@ -88,38 +201,9 @@ pub(crate) fn rendered_text_alignment_width(
     track: &ParsedTrack,
     config: &RendererConfig,
     render_scale: RenderScale,
-    use_visible_ink_bounds: bool,
-    alignment: i32,
+    font_scale: f64,
 ) -> i32 {
-    if line.runs.iter().all(|run| run.drawing.is_some()) {
-        let mut width = (f64::from(line.width) * style_scale(render_scale.x)).round() as i32;
-        let suppress_center_padding = source_event
-            .map(|event| {
-                event.text.contains("\\clip")
-                    || event.text.contains("\\iclip")
-                    || event.text.contains("\\t(")
-            })
-            .unwrap_or(false);
-        let has_blur = line
-            .runs
-            .iter()
-            .any(|run| run.style.blur.max(run.style.be) > 0.0);
-        let centered_identity_drawing = !suppress_center_padding
-            && has_blur
-            && (alignment & ass::HALIGN_CENTER) == ass::HALIGN_CENTER
-            && line.runs.iter().all(|run| {
-                let effective_style = resolve_run_style(run, source_event, now_ms);
-                style_transform(&effective_style).is_identity()
-            });
-        if centered_identity_drawing {
-            width += (10.0 * render_scale.x.max(0.0)).round() as i32;
-        }
-        return width.max(1);
-    }
-
     let mut width = 0_i32;
-    let mut leading_ink_offset = i32::MAX;
-    let mut all_text_runs_identity_transform = true;
     for run in &line.runs {
         if run.drawing.is_some() {
             width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
@@ -132,93 +216,96 @@ pub(crate) fn rendered_text_alignment_width(
             resolve_run_style(run, source_event, now_ms),
             track,
             config,
-            render_scale.uniform,
+            font_scale,
+            render_scale,
         );
         let rasterizer = Rasterizer::with_options(RasterOptions {
             size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
             hinting: config.hinting,
         });
-        if !style_transform(&effective_style).is_identity() {
-            all_text_runs_identity_transform = false;
-        }
-        let glyph_infos = scale_glyph_infos(&run.glyphs, render_scale.x, render_scale.y);
+        let position_scale = shaped_position_render_scale(run, &effective_style, render_scale);
+        let glyph_infos = scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
         let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
-            width += (f64::from(run.width) * style_scale(render_scale.x)).round() as i32;
+            width += (f64::from(run.width)
+                * style_scale(render_scale.y)
+                * effective_pixel_aspect(track, config))
+            .round() as i32;
             continue;
         };
-        let raster_glyphs = apply_vertical_font_raster_advances(raster_glyphs, &effective_style);
+        let raster_glyphs = apply_vertical_font_raster_advances(
+            raster_glyphs,
+            &glyph_infos,
+            &effective_style,
+            &run.font,
+        );
         let raster_glyphs = scale_raster_glyphs(
             raster_glyphs,
-            effective_style.scale_x,
+            effective_style.scale_x * effective_pixel_aspect(track, config),
             effective_style.scale_y,
         );
         let raster_glyphs = apply_text_spacing(raster_glyphs, &effective_style);
-        for glyph in &raster_glyphs {
-            if glyph.width > 0 && glyph.height > 0 && glyph.bitmap.iter().any(|value| *value > 0) {
-                leading_ink_offset = leading_ink_offset.min(width + glyph.left);
-            }
-            width += glyph.advance_x;
+        width += (raster_glyphs
+            .iter()
+            .map(|glyph| glyph.advance_x_26_6)
+            .sum::<i32>()
+            + 32)
+            >> 6;
+    }
+    // Keep a true zero advance so combining-only events stay out of collision placement.
+    width
+}
+
+/// Unrounded line advance for positioned text; integer width still owns collision/layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rendered_text_alignment_width_exact(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    render_scale: RenderScale,
+    font_scale: f64,
+) -> f64 {
+    let mut width = 0.0_f64;
+    for run in &line.runs {
+        if run.drawing.is_some() {
+            width += f64::from(run.width) * style_scale(render_scale.x);
+            continue;
         }
-    }
-
-    if leading_ink_offset != i32::MAX && leading_ink_offset > 0 {
-        if use_visible_ink_bounds {
-            if !all_text_runs_identity_transform {
-                // libass positions transformed text from a padded event bitmap before applying the
-                // transform.  Keep padding there, but do not shrink untransformed positioned text:
-                // compute_string_bbox() anchors the original glyph advance width, and manually
-                // subtracting pixels moves centered \pos text one high-resolution pixel to the right.
-                width += leading_ink_offset * 2;
-            }
-        } else {
-            width += leading_ink_offset;
+        if run.glyphs.is_empty() {
+            continue;
         }
+        let effective_style = apply_renderer_style_scale(
+            resolve_run_style(run, source_event, now_ms),
+            track,
+            config,
+            font_scale,
+            render_scale,
+        );
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
+            hinting: config.hinting,
+        });
+        let position_scale = shaped_position_render_scale(run, &effective_style, render_scale);
+        let glyph_infos = scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
+        let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
+            width += f64::from(run.width) * font_scale * style_scale(render_scale.x);
+            continue;
+        };
+        let raster_glyphs = apply_vertical_font_raster_advances(
+            raster_glyphs,
+            &glyph_infos,
+            &effective_style,
+            &run.font,
+        );
+        let scale_x = style_scale(effective_style.scale_x * effective_pixel_aspect(track, config));
+        let spacing = f64::from(text_spacing_advance_26_6(&effective_style)) / 64.0;
+        width += raster_glyphs
+            .iter()
+            .map(|glyph| f64::from(glyph.advance_x_26_6) / 64.0 * scale_x + spacing)
+            .sum::<f64>();
     }
-    width.max(1)
-}
-
-pub(crate) fn font_metric_height_for_line(line: &rassa_layout::LayoutLine, scale_y: f64) -> i32 {
-    if line.runs.iter().all(|run| run.drawing.is_some()) {
-        return drawing_only_line_height(line, scale_y);
-    }
-
-    let scale_y = style_scale(scale_y);
-    line.runs
-        .iter()
-        .filter(|run| run.drawing.is_none())
-        .filter_map(|run| font_metric_height_for_run(run, scale_y))
-        .max()
-        .unwrap_or_else(|| (max_text_font_size(line) * scale_y).round() as i32)
-        .max(1)
-}
-
-pub(crate) fn font_metric_height_for_run(run: &LayoutGlyphRun, scale_y: f64) -> Option<i32> {
-    if run.style.font_name.starts_with('@')
-        || !(run.style.font_size.is_finite() && run.style.font_size > 0.0)
-    {
-        return None;
-    }
-    let size_26_6 = (run.style.font_size * scale_y).max(1.0).round() as i32 * 64;
-    let metrics = font_vertical_metrics(&run.font, size_26_6)?;
-    let height = f64::from(metrics.ascender_26_6 + metrics.descender_26_6) / 64.0;
-    Some((height * style_scale(run.style.scale_y)).round() as i32)
-}
-
-pub(crate) fn font_metric_ascender_for_run(
-    run: &LayoutGlyphRun,
-    effective_style: &ParsedSpanStyle,
-) -> Option<i32> {
-    if effective_style.font_name.starts_with('@')
-        || !(effective_style.font_size.is_finite() && effective_style.font_size > 0.0)
-    {
-        return None;
-    }
-    let size_26_6 = (effective_style.font_size.max(1.0) * 64.0).round() as i32;
-    let metrics = font_vertical_metrics(&run.font, size_26_6)?;
-    Some(
-        (f64::from(metrics.ascender_26_6) / 64.0 * style_scale(effective_style.scale_y)).round()
-            as i32,
-    )
+    if width.is_finite() { width } else { 0.0 }
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
@@ -231,216 +318,175 @@ pub(crate) fn font_vertical_metrics(
     let mut face = library
         .new_face(font_path, font.face_index.unwrap_or(0) as isize)
         .ok()?;
-    request_real_dim_size(&mut face, size_26_6.max(64))?;
+    rassa_raster::request_real_dim_size(&mut face, size_26_6.max(64)).ok()?;
     let metrics = face.size_metrics()?;
-    let ascender = unsafe { ffi::FT_MulFix(face.ascender().into(), metrics.y_scale) } as i32;
-    let descender = unsafe { ffi::FT_MulFix((-face.descender()).into(), metrics.y_scale) } as i32;
+    let scale = |value: i32| unsafe { ffi::FT_MulFix(value.into(), metrics.y_scale) } as i32;
+    let ascender = scale(face.ascender().into());
+    let descender = scale((-face.descender()).into());
+
+    // Underline from raw post (not FreeType's recentered face value); scale (val*y_scale+0x8000)>>16.
+    let scale_libass = |value: i32| ((i64::from(value) * metrics.y_scale + 0x8000) >> 16) as i32;
+    let post = unsafe {
+        ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_post)
+            as *const ffi::TT_Postscript
+    };
+    let underline = (!post.is_null())
+        .then(|| unsafe { &*post })
+        .filter(|ps| ps.underlinePosition <= 0 && ps.underlineThickness > 0)
+        .map(|ps| {
+            let pos = scale_libass(ps.underlinePosition.into());
+            let size = scale_libass(ps.underlineThickness.into());
+            (-pos - size / 2, size)
+        });
+    let os2 = unsafe {
+        ffi::FT_Get_Sfnt_Table(face.raw_mut() as *mut ffi::FT_FaceRec, ffi::ft_sfnt_os2)
+            as *const ffi::TT_OS2
+    };
+    let strikeout = (!os2.is_null())
+        .then(|| unsafe { &*os2 })
+        .filter(|os2| os2.yStrikeoutPosition >= 0 && os2.yStrikeoutSize > 0)
+        .map(|os2| {
+            let pos = scale_libass(os2.yStrikeoutPosition.into());
+            let size = scale_libass(os2.yStrikeoutSize.into());
+            (-pos - size / 2, size)
+        });
+    let typo_descender = (!os2.is_null())
+        .then(|| unsafe { &*os2 })
+        .map(|os2| scale(os2.sTypoDescender.into()))
+        .unwrap_or(0);
+
     Some(FontVerticalMetrics {
         ascender_26_6: ascender,
         descender_26_6: descender,
+        underline_26_6: underline,
+        strikeout_26_6: strikeout,
+        typo_descender_26_6: typo_descender,
     })
 }
 
 #[cfg(any(target_os = "macos", target_arch = "wasm32", not(unix)))]
 pub(crate) fn font_vertical_metrics(
-    _font: &FontMatch,
-    _size_26_6: i32,
+    font: &FontMatch,
+    size_26_6: i32,
 ) -> Option<FontVerticalMetrics> {
-    None
+    let font_path = font.path.as_ref()?;
+    let data = std::fs::read(font_path).ok()?;
+    font_vertical_metrics_from_data(&data, font.face_index.unwrap_or(0), size_26_6)
 }
 
-#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-pub(crate) fn request_real_dim_size(face: &mut freetype::Face, size_26_6: i32) -> Option<()> {
-    let mut request = ffi::FT_Size_RequestRec {
-        size_request_type: ffi::FT_SIZE_REQUEST_TYPE_REAL_DIM,
-        width: 0,
-        height: size_26_6.into(),
-        horiResolution: 0,
-        vertResolution: 0,
-    };
-    let err = unsafe {
-        ffi::FT_Request_Size(
-            face.raw_mut() as *mut ffi::FT_FaceRec,
-            &mut request as ffi::FT_Size_Request,
-        )
-    };
-    (err == 0).then_some(())
-}
+/// FreeType-free metrics: win → typo → bbox, then REAL_DIM via FT_DivFix/FT_MulFix rounding.
+#[cfg(any(test, target_os = "macos", target_arch = "wasm32", not(unix)))]
+pub(crate) fn font_vertical_metrics_from_data(
+    data: &[u8],
+    face_index: u32,
+    size_26_6: i32,
+) -> Option<FontVerticalMetrics> {
+    let face = ttf_parser::Face::parse(data, face_index).ok()?;
+    let tables = face.tables();
 
-pub(crate) fn max_text_font_size(line: &rassa_layout::LayoutLine) -> f64 {
-    line.runs
-        .iter()
-        .filter(|run| run.drawing.is_none())
-        .map(|run| run.style.font_size)
-        .filter(|size| size.is_finite() && *size > 0.0)
-        .fold(0.0_f64, f64::max)
-}
-
-pub(crate) fn drawing_only_line_height(
-    line: &rassa_layout::LayoutLine,
-    render_scale_y: f64,
-) -> i32 {
-    let render_scale_y = style_scale(render_scale_y);
-    line.runs
-        .iter()
-        .filter_map(|run| {
-            let drawing = run.drawing.as_ref()?;
-            let bounds = drawing.bounds()?;
-            let drawing_height = (bounds.height() - 1).max(0) as f64;
-            Some((drawing_height * style_scale(run.style.scale_y) * render_scale_y).round() as i32)
-        })
-        .max()
-        .unwrap_or(0)
-        .max(1)
-}
-
-pub(crate) fn unpositioned_text_y_correction(
-    line: &rassa_layout::LayoutLine,
-    config: &RendererConfig,
-    scale_y: f64,
-) -> i32 {
-    if line.runs.iter().all(|run| run.drawing.is_some()) {
-        return 0;
-    }
-    let layout_height = text_layout_line_height_for_line(line, config, scale_y);
-    // Keep non-\pos layout on the historical bitmap-box baseline.  The newer
-    // font-metric height is only for ASS positioned text anchors; using it here
-    // raises margin-aligned text several pixels above libass.
-    let visual_height = legacy_unpositioned_text_visual_height(line, scale_y).max(1);
-    (layout_height - visual_height).max(0) / 3
-}
-
-pub(crate) fn legacy_unpositioned_text_visual_height(
-    line: &rassa_layout::LayoutLine,
-    scale_y: f64,
-) -> i32 {
-    let scale_y = style_scale(scale_y);
-    (max_text_font_size(line) * scale_y * 0.52).round() as i32
-}
-
-pub(crate) fn positioned_text_y_correction(
-    line: &rassa_layout::LayoutLine,
-    config: &RendererConfig,
-    scale_y: f64,
-    alignment: i32,
-    _center_transformed_position: bool,
-) -> i32 {
-    let layout_height = positioned_layout_line_height_for_line(line, config, scale_y, alignment);
-    let metric_height = font_metric_height_for_line(line, scale_y).max(1);
-    ((layout_height - metric_height).max(0) * 4) / 9
-}
-
-pub(crate) fn positioned_center_line_has_active_projective_transform(
-    line: &rassa_layout::LayoutLine,
-    source_event: Option<&ParsedEvent>,
-    now_ms: i64,
-) -> bool {
-    line.runs.iter().any(|run| {
-        let effective_style = resolve_run_style(run, source_event, now_ms);
-        if !style_transform(&effective_style).is_identity() {
-            return true;
+    let hhea = tables.hhea;
+    let mut ascender = i32::from(hhea.ascender);
+    let mut descender = i32::from(hhea.descender);
+    let mut height = ascender - descender + i32::from(hhea.line_gap);
+    if let Some(os2) = tables.os2 {
+        // ttf-parser treats the unsigned spec fields as signed and already negates the descender.
+        let win_ascender = i32::from(os2.windows_ascender());
+        let win_descender = i32::from(os2.windows_descender());
+        if win_ascender - win_descender != 0 {
+            ascender = win_ascender;
+            descender = win_descender;
+            height = ascender - descender;
         }
+    }
+    if ascender - descender == 0 || height == 0 {
+        if let Some(os2) = tables.os2 {
+            let typo_ascender = i32::from(os2.typographic_ascender());
+            let typo_descender = i32::from(os2.typographic_descender());
+            if typo_ascender - typo_descender != 0 {
+                ascender = typo_ascender;
+                descender = typo_descender;
+                height = ascender - descender;
+            }
+        }
+        if ascender - descender == 0 || height == 0 {
+            let bbox = face.global_bounding_box();
+            ascender = i32::from(bbox.y_max);
+            descender = i32::from(bbox.y_min);
+        }
+    }
 
-        let Some(event) = source_event else {
-            return false;
-        };
-        let elapsed = (now_ms - event.start).clamp(0, event.duration.max(0)) as i32;
-        run.transforms.iter().any(|transform| {
-            elapsed > transform.start_ms.max(0)
-                && animated_style_affects_projective_transform(&transform.style)
-        })
+    // REAL_DIM: y_scale = FT_DivFix(size, asc - desc); values are FT_MulFix'ed by it.
+    let units = i64::from(ascender - descender);
+    if units <= 0 {
+        return None;
+    }
+    let y_scale = ((i64::from(size_26_6.max(64)) << 16) + (units >> 1)) / units;
+    let scale = |value: i32| {
+        let product = i64::from(value) * y_scale;
+        ((product + 0x8000 - i64::from(product < 0)) >> 16) as i32
+    };
+    // Decoration bars: (val * y_scale + 0x8000) >> 16 on raw post/OS/2, no negative bias.
+    let scale_deco = |value: i32| ((i64::from(value) * y_scale + 0x8000) >> 16) as i32;
+
+    let underline = tables
+        .post
+        .map(|post| post.underline_metrics)
+        .filter(|line| line.position <= 0 && line.thickness > 0)
+        .map(|line| {
+            // Raw post-table position; recenter once as -pos - size/2.
+            let pos = scale_deco(line.position.into());
+            let size = scale_deco(line.thickness.into());
+            (-pos - size / 2, size)
+        });
+    let strikeout = tables
+        .os2
+        .map(|os2| os2.strikeout_metrics())
+        .filter(|line| line.position >= 0 && line.thickness > 0)
+        .map(|line| {
+            let pos = scale_deco(line.position.into());
+            let size = scale_deco(line.thickness.into());
+            (-pos - size / 2, size)
+        });
+    let typo_descender = tables
+        .os2
+        .map(|os2| scale(os2.typographic_descender().into()))
+        .unwrap_or(0);
+
+    Some(FontVerticalMetrics {
+        ascender_26_6: scale(ascender),
+        descender_26_6: scale(-descender),
+        underline_26_6: underline,
+        strikeout_26_6: strikeout,
+        typo_descender_26_6: typo_descender,
     })
 }
 
-pub(crate) fn animated_style_affects_projective_transform(
-    style: &rassa_parse::ParsedAnimatedStyle,
-) -> bool {
-    style.rotation_x.is_some()
-        || style.rotation_y.is_some()
-        || style.rotation_z.is_some()
-        || style.shear_x.is_some()
-        || style.shear_y.is_some()
+pub(crate) fn effective_bitmap_blur(
+    style: &ParsedSpanStyle,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    font_scale: f64,
+    mapping: &EventMapping,
+) -> BitmapBlur {
+    let blur = if style.blur.is_finite() && style.blur > 0.0 {
+        style.blur
+    } else {
+        0.0
+    };
+    let be = if style.be.is_finite() && style.be > 0.0 {
+        style.be.trunc().clamp(0.0, 127.0) as u32
+    } else {
+        0
+    };
+    let (scale_x, scale_y) = renderer_blur_scales(track, config, font_scale, mapping);
+    BitmapBlur::from_scaled_blur(blur * scale_x, blur * scale_y, be)
 }
 
-pub(crate) fn line_text(line: &rassa_layout::LayoutLine) -> String {
-    line.runs
-        .iter()
-        .filter(|run| run.drawing.is_none())
-        .map(|run| run.text.as_str())
-        .collect()
-}
-
-pub(crate) fn renderer_blur_radius(blur: f64) -> u32 {
-    if !(blur.is_finite() && blur > 0.0) {
-        return 0;
-    }
-    (blur * 4.0).ceil().max(1.0) as u32
-}
-
-pub(crate) fn style_clip_bleed(style: &ParsedSpanStyle) -> i32 {
-    let border_bleed = style.border_x.max(style.border_y).max(style.border) * 4.0;
-    let shadow_bleed = style
-        .shadow_x
-        .abs()
-        .max(style.shadow_y.abs())
-        .max(style.shadow);
-    let blur_bleed = renderer_blur_radius(style.blur.max(style.be)) as f64;
-    (border_bleed + shadow_bleed + blur_bleed).ceil().max(0.0) as i32
-}
-
-pub(crate) fn expand_rect(rect: Rect, amount: i32) -> Rect {
-    if amount <= 0 {
-        return rect;
-    }
+pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {
     Rect {
-        x_min: rect.x_min - amount,
-        y_min: rect.y_min - amount,
-        x_max: rect.x_max + amount,
-        y_max: rect.y_max + amount,
-    }
-}
-
-pub(crate) fn visible_bounds_for_planes(planes: &[ImagePlane]) -> Option<Rect> {
-    let mut bounds: Option<Rect> = None;
-    for plane in planes {
-        let stride = plane.stride.max(0) as usize;
-        if stride == 0 {
-            continue;
-        }
-        for y in 0..plane.size.height.max(0) as usize {
-            for x in 0..plane.size.width.max(0) as usize {
-                if plane.bitmap[y * stride + x] == 0 {
-                    continue;
-                }
-                let px = plane.destination.x + x as i32;
-                let py = plane.destination.y + y as i32;
-                match &mut bounds {
-                    Some(rect) => {
-                        rect.x_min = rect.x_min.min(px);
-                        rect.y_min = rect.y_min.min(py);
-                        rect.x_max = rect.x_max.max(px + 1);
-                        rect.y_max = rect.y_max.max(py + 1);
-                    }
-                    None => {
-                        bounds = Some(Rect {
-                            x_min: px,
-                            y_min: py,
-                            x_max: px + 1,
-                            y_max: py + 1,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    bounds
-}
-
-pub(crate) fn translate_planes_y(planes: &mut [ImagePlane], delta_y: i32) {
-    if delta_y == 0 {
-        return;
-    }
-    for plane in planes {
-        plane.destination.y += delta_y;
+        x_min: rect.x_min - amount_x.max(0),
+        y_min: rect.y_min - amount_y.max(0),
+        x_max: rect.x_max + amount_x.max(0),
+        y_max: rect.y_max + amount_y.max(0),
     }
 }

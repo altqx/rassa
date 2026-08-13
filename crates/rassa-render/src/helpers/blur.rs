@@ -1,14 +1,37 @@
 use super::*;
 
-pub(crate) fn blur_image_plane(plane: ImagePlane, radius: u32) -> ImagePlane {
-    if radius == 0 || plane.size.width <= 0 || plane.size.height <= 0 || plane.bitmap.is_empty() {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BitmapBlur {
+    /// libass's logarithmically quantized Gaussian radius, not pixels.
+    pub(crate) qblur_x: u32,
+    pub(crate) qblur_y: u32,
+    pub(crate) be: u32,
+}
+
+impl BitmapBlur {
+    pub(crate) fn from_scaled_blur(blur_x: f64, blur_y: f64, be: u32) -> Self {
+        Self {
+            qblur_x: libass_quantize_blur(blur_x),
+            qblur_y: libass_quantize_blur(blur_y),
+            be,
+        }
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.qblur_x == 0 && self.qblur_y == 0 && self.be == 0
+    }
+}
+
+pub(crate) fn blur_image_plane_xy(plane: ImagePlane, blur: BitmapBlur) -> ImagePlane {
+    if blur.is_zero() || plane.size.width <= 0 || plane.size.height <= 0 || plane.bitmap.is_empty()
+    {
         return plane;
     }
-    let (bitmap, width, height, pad) = blur_bitmap(
+    let (bitmap, width, height, pad_x, pad_y) = blur_bitmap_xy(
         plane.bitmap,
         plane.size.width as usize,
         plane.size.height as usize,
-        radius,
+        blur,
     );
     ImagePlane {
         size: Size {
@@ -17,28 +40,242 @@ pub(crate) fn blur_image_plane(plane: ImagePlane, radius: u32) -> ImagePlane {
         },
         stride: width as i32,
         destination: Point {
-            x: plane.destination.x - pad as i32,
-            y: plane.destination.y - pad as i32,
+            x: plane.destination.x - pad_x as i32,
+            y: plane.destination.y - pad_y as i32,
         },
         bitmap,
         ..plane
     }
 }
 
-pub(crate) fn blur_bitmap(
-    source: Vec<u8>,
-    width: usize,
-    height: usize,
-    radius: u32,
-) -> (Vec<u8>, usize, usize, usize) {
-    if radius == 0 || width == 0 || height == 0 || source.is_empty() {
-        return (source, width, height, 0);
+pub(crate) fn blur_bitmap_xy(
+    mut source: Vec<u8>,
+    mut width: usize,
+    mut height: usize,
+    blur: BitmapBlur,
+) -> (Vec<u8>, usize, usize, usize, usize) {
+    if blur.is_zero() || width == 0 || height == 0 || source.is_empty() {
+        return (source, width, height, 0, 0);
     }
-    let r2 = libass_blur_r2_from_radius(radius);
-    let (bitmap, width, height, pad_x, pad_y) =
-        libass_gaussian_blur(&source, width, height, r2, r2);
-    debug_assert_eq!(pad_x, pad_y);
-    (bitmap, width, height, pad_x)
+
+    // Zero-pad before \be (box filter does not grow the bitmap); enough for MAX_BE = 127.
+    let be = blur.be.min(127);
+    let be_pad = ass_be_padding(be);
+    if be_pad > 0 {
+        let Some(padded_width) = width.checked_add(2 * be_pad) else {
+            return (source, width, height, 0, 0);
+        };
+        let Some(padded_height) = height.checked_add(2 * be_pad) else {
+            return (source, width, height, 0, 0);
+        };
+        let Some(padded_len) = padded_width.checked_mul(padded_height) else {
+            return (source, width, height, 0, 0);
+        };
+        let Some(mut padded) = zeroed_blur_bitmap(padded_len) else {
+            return (source, width, height, 0, 0);
+        };
+        for row in 0..height {
+            let src_start = row * width;
+            let dst_start = (row + be_pad) * padded_width + be_pad;
+            padded[dst_start..dst_start + width]
+                .copy_from_slice(&source[src_start..src_start + width]);
+        }
+        source = padded;
+        width = padded_width;
+        height = padded_height;
+    }
+
+    let mut pad_x = be_pad;
+    let mut pad_y = be_pad;
+    if blur.qblur_x > 0 || blur.qblur_y > 0 {
+        let r2x = libass_blur_r2_from_qblur(blur.qblur_x);
+        let r2y = libass_blur_r2_from_qblur(blur.qblur_y);
+        let (bitmap, blurred_width, blurred_height, gaussian_pad_x, gaussian_pad_y) =
+            libass_gaussian_blur(&source, width, height, r2x, r2y);
+        source = bitmap;
+        width = blurred_width;
+        height = blurred_height;
+        pad_x = pad_x.saturating_add(gaussian_pad_x);
+        pad_y = pad_y.saturating_add(gaussian_pad_y);
+    }
+
+    if be > 0 && width > 1 && height > 1 {
+        apply_ass_be_blur(&mut source, width, height, be);
+    }
+    (source, width, height, pad_x, pad_y)
+}
+
+const MAX_BLUR_BITMAP_BYTES: usize = 128 * 1024 * 1024;
+
+fn zeroed_blur_bitmap(len: usize) -> Option<Vec<u8>> {
+    if len > MAX_BLUR_BITMAP_BYTES {
+        return None;
+    }
+    let mut bitmap = Vec::new();
+    bitmap.try_reserve_exact(len).ok()?;
+    bitmap.resize(len, 0);
+    Some(bitmap)
+}
+
+fn ass_be_padding(be: u32) -> usize {
+    match be {
+        0 => 0,
+        1..=3 => be as usize,
+        4..=7 => 4,
+        _ => 5,
+    }
+}
+
+fn apply_ass_be_blur(bitmap: &mut [u8], width: usize, height: usize, be: u32) {
+    let passes = be.min(127);
+    if passes > 1 {
+        for value in bitmap.iter_mut() {
+            *value = ((*value >> 1) + 1) >> 1;
+        }
+        for _ in 1..passes {
+            ass_be_blur_pass(bitmap, width, height);
+        }
+        for value in bitmap.iter_mut() {
+            let expanded = (u16::from(*value) << 2) - u16::from(*value > 32);
+            *value = expanded.min(u16::from(u8::MAX)) as u8;
+        }
+    }
+    ass_be_blur_pass(bitmap, width, height);
+}
+
+fn ass_be_blur_pass(bitmap: &mut [u8], width: usize, height: usize) {
+    let source = bitmap.to_vec();
+    const WEIGHTS: [u32; 3] = [1, 2, 1];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0_u32;
+            for (kernel_y, weight_y) in WEIGHTS.iter().copied().enumerate() {
+                let sample_y = y as isize + kernel_y as isize - 1;
+                if !(0..height as isize).contains(&sample_y) {
+                    continue;
+                }
+                for (kernel_x, weight_x) in WEIGHTS.iter().copied().enumerate() {
+                    let sample_x = x as isize + kernel_x as isize - 1;
+                    if (0..width as isize).contains(&sample_x) {
+                        sum += u32::from(source[sample_y as usize * width + sample_x as usize])
+                            * weight_x
+                            * weight_y;
+                    }
+                }
+            }
+            bitmap[y * width + x] = (sum >> 4) as u8;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaussian_blur_uses_libass_logarithmic_buckets() {
+        let qblur_2 = libass_quantize_blur(2.0);
+        assert_eq!(qblur_2, 13);
+        assert_eq!(libass_quantize_blur(2.01), qblur_2);
+        assert_eq!(libass_quantize_blur(2.04), qblur_2);
+        assert_eq!(libass_quantize_blur(2.05), 14);
+
+        let r2 = libass_blur_r2_from_qblur(qblur_2);
+        assert!((r2 - 2.778_779_413_952_41).abs() < 1e-12, "r2={r2}");
+    }
+
+    #[test]
+    fn nearby_blur_values_in_one_bucket_produce_identical_bitmaps() {
+        let mut source = vec![0_u8; 9 * 9];
+        source[4 * 9 + 4] = 255;
+        let blur_2 = BitmapBlur::from_scaled_blur(2.0, 2.0, 0);
+        let blur_201 = BitmapBlur::from_scaled_blur(2.01, 2.01, 0);
+        assert_eq!(blur_2, blur_201);
+        assert_eq!(
+            blur_bitmap_xy(source.clone(), 9, 9, blur_2),
+            blur_bitmap_xy(source, 9, 9, blur_201)
+        );
+    }
+
+    #[test]
+    fn hostile_blur_quantization_cannot_overflow_filter_geometry() {
+        let source = vec![255_u8];
+        let result = blur_bitmap_xy(
+            source.clone(),
+            1,
+            1,
+            BitmapBlur {
+                qblur_x: u32::MAX,
+                qblur_y: u32::MAX,
+                be: 0,
+            },
+        );
+        assert_eq!(result, (source, 1, 1, 0, 0));
+        assert_eq!(
+            libass_gaussian_blur(&[255], 1, 1, f64::MAX, f64::MAX),
+            (vec![255], 1, 1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn anisotropic_gaussian_blur_expands_axes_independently() {
+        let source = vec![255_u8; 9];
+        let (horizontal, horizontal_width, horizontal_height, pad_x, pad_y) = blur_bitmap_xy(
+            source.clone(),
+            3,
+            3,
+            BitmapBlur {
+                qblur_x: libass_quantize_blur(8.0),
+                qblur_y: libass_quantize_blur(1.0),
+                be: 0,
+            },
+        );
+        assert_eq!(horizontal.len(), horizontal_width * horizontal_height);
+        assert!(pad_x > pad_y);
+        assert!(horizontal_width - 3 > horizontal_height - 3);
+
+        let (vertical, vertical_width, vertical_height, vertical_pad_x, vertical_pad_y) =
+            blur_bitmap_xy(
+                source,
+                3,
+                3,
+                BitmapBlur {
+                    qblur_x: libass_quantize_blur(1.0),
+                    qblur_y: libass_quantize_blur(8.0),
+                    be: 0,
+                },
+            );
+        assert_eq!(vertical.len(), vertical_width * vertical_height);
+        assert!(vertical_pad_y > vertical_pad_x);
+        assert!(vertical_height - 3 > vertical_width - 3);
+    }
+
+    #[test]
+    fn edge_blur_uses_unscaled_be_pass_count_and_padding() {
+        let mut source = vec![0_u8; 25];
+        source[12] = 255;
+        let (bitmap, width, height, pad_x, pad_y) = blur_bitmap_xy(
+            source,
+            5,
+            5,
+            BitmapBlur {
+                qblur_x: 0,
+                qblur_y: 0,
+                be: 1,
+            },
+        );
+        assert_eq!((width, height, pad_x, pad_y), (7, 7, 1, 1));
+        assert!(bitmap[3 * width + 2] > 0);
+        assert!(bitmap[3 * width + 3] > bitmap[3 * width + 2]);
+
+        let mut solid = vec![255_u8; 9 * 9];
+        apply_ass_be_blur(&mut solid, 9, 9, 2);
+        assert_eq!(
+            solid[4 * 9 + 4],
+            255,
+            r"\be pre/post scaling keeps solid alpha"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -48,14 +285,28 @@ pub(crate) struct LibassBlurMethod {
     pub(crate) coeff: [i16; 8],
 }
 
-pub(crate) fn libass_blur_r2_from_radius(radius: u32) -> f64 {
+/// Logarithmic `\blur` cache key after per-axis scale; nearby values share one kernel.
+pub(crate) fn libass_quantize_blur(blur: f64) -> u32 {
     const POSITION_PRECISION: f64 = 8.0;
     const BLUR_PRECISION: f64 = 1.0 / 256.0;
-    let blur = f64::from(radius) / 4.0;
+    if !(blur.is_finite() && blur > 0.0) {
+        return 0;
+    }
     let blur_radius_scale = 2.0 / 256.0_f64.ln().sqrt();
     let scale = 64.0 * BLUR_PRECISION / POSITION_PRECISION;
-    let qblur = ((1.0 + blur * blur_radius_scale * scale).ln() / BLUR_PRECISION).round();
-    let sigma = (BLUR_PRECISION * qblur).exp_m1() / scale;
+    let qblur = (blur * blur_radius_scale * scale).ln_1p() / BLUR_PRECISION;
+    if !qblur.is_finite() {
+        return u32::MAX;
+    }
+    qblur.round_ties_even().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// Squared Gaussian sigma from the cached qblur index (do not re-quantize).
+pub(crate) fn libass_blur_r2_from_qblur(qblur: u32) -> f64 {
+    const POSITION_PRECISION: f64 = 8.0;
+    const BLUR_PRECISION: f64 = 1.0 / 256.0;
+    const SCALE: f64 = 64.0 * BLUR_PRECISION / POSITION_PRECISION;
+    let sigma = (BLUR_PRECISION * f64::from(qblur)).exp_m1() / SCALE;
     sigma * sigma
 }
 
@@ -66,6 +317,16 @@ pub(crate) fn libass_gaussian_blur(
     r2x: f64,
     r2y: f64,
 ) -> (Vec<u8>, usize, usize, usize, usize) {
+    let max_sigma = MAX_BLUR_BITMAP_BYTES as f64;
+    if !r2x.is_finite()
+        || !r2y.is_finite()
+        || r2x < 0.0
+        || r2y < 0.0
+        || r2x.sqrt() > max_sigma
+        || r2y.sqrt() > max_sigma
+    {
+        return (source.to_vec(), width, height, 0, 0);
+    }
     let blur_x = find_libass_blur_method(r2x);
     let blur_y = if (r2y - r2x).abs() < f64::EPSILON {
         blur_x.clone()
@@ -73,14 +334,60 @@ pub(crate) fn libass_gaussian_blur(
         find_libass_blur_method(r2y)
     };
 
-    let offset_x = ((2 * blur_x.radius + 9) << blur_x.level) - 5;
-    let offset_y = ((2 * blur_y.radius + 9) << blur_y.level) - 5;
-    let mask_x = (1_usize << blur_x.level) - 1;
-    let mask_y = (1_usize << blur_y.level) - 1;
-    let end_width = ((width + offset_x) & !mask_x).saturating_sub(4);
-    let end_height = ((height + offset_y) & !mask_y).saturating_sub(4);
-    let pad_x = ((blur_x.radius + 4) << blur_x.level) - 4;
-    let pad_y = ((blur_y.radius + 4) << blur_y.level) - 4;
+    let Some(factor_x) = u32::try_from(blur_x.level)
+        .ok()
+        .and_then(|level| 1_usize.checked_shl(level))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(factor_y) = u32::try_from(blur_y.level)
+        .ok()
+        .and_then(|level| 1_usize.checked_shl(level))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(offset_x) = (2 * blur_x.radius + 9)
+        .checked_mul(factor_x)
+        .and_then(|value| value.checked_sub(5))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(offset_y) = (2 * blur_y.radius + 9)
+        .checked_mul(factor_y)
+        .and_then(|value| value.checked_sub(5))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let mask_x = factor_x - 1;
+    let mask_y = factor_y - 1;
+    let Some(padded_width) = width.checked_add(offset_x) else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(padded_height) = height.checked_add(offset_y) else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let end_width = (padded_width & !mask_x).saturating_sub(4);
+    let end_height = (padded_height & !mask_y).saturating_sub(4);
+    let Some(pad_x) = (blur_x.radius + 4)
+        .checked_mul(factor_x)
+        .and_then(|value| value.checked_sub(4))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(pad_y) = (blur_y.radius + 4)
+        .checked_mul(factor_y)
+        .and_then(|value| value.checked_sub(4))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let safe_bitmap = |w: usize, h: usize| {
+        w.checked_mul(h)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<i16>()))
+            .is_some_and(|bytes| bytes <= MAX_BLUR_BITMAP_BYTES)
+    };
+    if !safe_bitmap(width, height) || !safe_bitmap(end_width, end_height) {
+        return (source.to_vec(), width, height, 0, 0);
+    }
 
     let mut buffer = unpack_libass_blur(source);
     let mut w = width;

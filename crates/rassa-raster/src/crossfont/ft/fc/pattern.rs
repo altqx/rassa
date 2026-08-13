@@ -56,7 +56,6 @@ impl<'a> StringPropertyIter<'a> {
     }
 }
 
-/// Iterator over integer properties.
 pub struct BooleanPropertyIter<'a> {
     pattern: &'a PatternRef,
     object: &'a [u8],
@@ -92,7 +91,6 @@ impl BooleanPropertyIter<'_> {
     }
 }
 
-/// Iterator over integer properties.
 pub struct IntPropertyIter<'a> {
     pattern: &'a PatternRef,
     object: &'a [u8],
@@ -207,7 +205,6 @@ impl<'a> LcdFilterPropertyIter<'a> {
     }
 }
 
-/// Iterator over integer properties.
 pub struct DoublePropertyIter<'a> {
     pattern: &'a PatternRef,
     object: &'a [u8],
@@ -243,7 +240,6 @@ impl DoublePropertyIter<'_> {
     }
 }
 
-/// Implement debug for a property iterator.
 macro_rules! impl_property_iter_debug {
     ($iter:ty => $item:ty) => {
         impl<'a> fmt::Debug for $iter {
@@ -267,7 +263,6 @@ macro_rules! impl_property_iter_debug {
     };
 }
 
-/// Implement Iterator and Debug for a property iterator.
 macro_rules! impl_property_iter {
     ($($iter:ty => $item:ty),*) => {
         $(
@@ -291,8 +286,7 @@ macro_rules! impl_property_iter {
     }
 }
 
-/// Implement Iterator and Debug for a property iterator which internally relies
-/// on another property iterator.
+/// Iterator+Debug for a property iter that wraps another.
 macro_rules! impl_derived_property_iter {
     ($($iter:ty => $item:ty),*) => {
         $(
@@ -317,7 +311,6 @@ macro_rules! impl_derived_property_iter {
     }
 }
 
-// Basic Iterators.
 impl_property_iter! {
     StringPropertyIter<'a> => &'a str,
     IntPropertyIter<'a> => isize,
@@ -325,7 +318,6 @@ impl_property_iter! {
     BooleanPropertyIter<'a> => bool
 }
 
-// Derived Iterators.
 impl_derived_property_iter! {
     RgbaPropertyIter<'a> => Rgba,
     HintStylePropertyIter<'a> => HintStyle,
@@ -468,23 +460,13 @@ impl PatternRef {
         index() => b"index\0"
     }
 
-    /// Prints the pattern to stdout.
-    ///
-    /// FontConfig doesn't expose a way to iterate over all members of a pattern;
-    /// instead, we just defer to FcPatternPrint. Otherwise, this could have been
-    /// a `fmt::Debug` impl.
+    /// Dump via FcPatternPrint; Fontconfig has no member iterator.
     pub fn print(&self) {
         unsafe { FcPatternPrint(self.as_ptr()) }
     }
 
-    /// Add a string value to the pattern.
-    ///
-    /// If the returned value is `true`, the value is added at the end of
-    /// any existing list, otherwise it is inserted at the beginning.
-    ///
-    /// # Unsafety
-    ///
-    /// `object` is not checked to be a valid null-terminated string.
+    /// Returns whether the string was appended (true) or prepended (false).
+    /// `object` must be a valid NUL-terminated C string.
     unsafe fn add_string(&mut self, object: &[u8], value: &str) -> bool {
         let value = CString::new(value).unwrap();
         let value = value.as_ptr();
@@ -571,12 +553,7 @@ impl PatternRef {
         unsafe { PatternHash(FcPatternHash(self.as_ptr())) }
     }
 
-    /// Add charset to the pattern.
-    ///
-    /// The referenced charset is copied by Fontconfig internally using
-    /// FcValueSave so that no references to application provided memory are
-    /// retained. That is, the CharSet can be safely dropped immediately
-    /// after being added to the pattern.
+    /// Fontconfig copies the charset; the CharSet may be dropped immediately after.
     pub fn add_charset(&self, charset: &CharSetRef) -> bool {
         unsafe {
             FcPatternAddCharSet(
@@ -587,7 +564,6 @@ impl PatternRef {
         }
     }
 
-    /// Get charset from the pattern.
     pub fn get_charset(&self) -> Option<&CharSetRef> {
         unsafe {
             let mut charset = ptr::null_mut();
@@ -603,7 +579,6 @@ impl PatternRef {
         }
     }
 
-    /// Get matrix from the pattern.
     pub fn get_matrix(&self) -> Option<FcMatrix> {
         unsafe {
             let mut matrix = ptr::null_mut();

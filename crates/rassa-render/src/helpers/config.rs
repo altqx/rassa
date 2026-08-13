@@ -14,9 +14,8 @@ pub fn default_renderer_config(track: &ParsedTrack) -> RendererConfig {
 pub(crate) fn output_scale_x(track: &ParsedTrack, config: &RendererConfig) -> f64 {
     let frame_width = output_mapping_size(track, config).width;
     let base_width = track.play_res_x.max(1);
-    let aspect = effective_pixel_aspect(track, config);
 
-    f64::from(frame_width.max(1)) / f64::from(base_width) * aspect
+    f64::from(frame_width.max(1)) / f64::from(base_width)
 }
 
 pub(crate) fn output_scale_y(track: &ParsedTrack, config: &RendererConfig) -> f64 {
@@ -27,13 +26,14 @@ pub(crate) fn output_scale_y(track: &ParsedTrack, config: &RendererConfig) -> f6
 }
 
 pub(crate) fn effective_pixel_aspect(track: &ParsedTrack, config: &RendererConfig) -> f64 {
-    if layout_resolution(track).is_some()
-        || !(config.pixel_aspect.is_finite() && config.pixel_aspect > 0.0)
-    {
+    // LayoutRes always wins for PAR; else a positive explicit PAR beats storage (used only when PAR is 0).
+    if layout_resolution(track).is_some() {
         return derived_pixel_aspect(track, config).unwrap_or(1.0);
     }
-
-    config.pixel_aspect
+    if config.pixel_aspect.is_finite() && config.pixel_aspect > 0.0 {
+        return config.pixel_aspect;
+    }
+    derived_pixel_aspect(track, config).unwrap_or(1.0)
 }
 
 pub(crate) fn derived_pixel_aspect(track: &ParsedTrack, config: &RendererConfig) -> Option<f64> {
@@ -78,31 +78,382 @@ pub(crate) fn frame_content_size(track: &ParsedTrack, config: &RendererConfig) -
 }
 
 pub(crate) fn output_mapping_size(track: &ParsedTrack, config: &RendererConfig) -> Size {
-    if config.use_margins {
+    // screen_scale maps PlayRes onto the content frame; use_margins only changes anchoring.
+    frame_content_size(track, config)
+}
+
+/// Blur/unscaled-border layout: explicit PAR can synthesize one axis if LayoutRes and storage are absent.
+pub(crate) fn filter_layout_resolution(track: &ParsedTrack, config: &RendererConfig) -> Size {
+    if let Some(layout) = layout_resolution(track).or_else(|| storage_resolution(config)) {
+        return layout;
+    }
+
+    let frame = frame_content_size(track, config);
+    let par = config.pixel_aspect;
+    if !par.is_finite()
+        || par <= 0.0
+        || (par - 1.0).abs() < f64::EPSILON
+        || frame.width <= 0
+        || frame.height <= 0
+    {
+        return Size {
+            width: track.play_res_x.max(1),
+            height: track.play_res_y.max(1),
+        };
+    }
+
+    if par > 1.0 {
         Size {
-            width: if config.frame.width > 0 {
-                config.frame.width
-            } else {
-                track.play_res_x
-            },
-            height: if config.frame.height > 0 {
-                config.frame.height
-            } else {
-                track.play_res_y
-            },
+            width: (f64::from(track.play_res_y.max(1)) * f64::from(frame.width)
+                / f64::from(frame.height)
+                / par)
+                .round()
+                .max(1.0) as i32,
+            height: track.play_res_y.max(1),
         }
     } else {
-        frame_content_size(track, config)
+        Size {
+            width: track.play_res_x.max(1),
+            height: (f64::from(track.play_res_x.max(1)) * f64::from(frame.height)
+                / f64::from(frame.width)
+                * par)
+                .round()
+                .max(1.0) as i32,
+        }
     }
 }
 
-pub(crate) fn output_offset(config: &RendererConfig) -> Point {
-    if config.use_margins {
-        Point { x: 0, y: 0 }
+pub(crate) fn renderer_blur_scales(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    font_scale: f64,
+    mapping: &EventMapping,
+) -> (f64, f64) {
+    let layout = filter_layout_resolution(track, config);
+    let font_scale = if font_scale.is_finite() {
+        font_scale.max(0.0)
     } else {
-        Point {
-            x: config.margins.left.max(0),
-            y: config.margins.top.max(0),
+        1.0
+    };
+    let (font_screen_width, font_screen_height) = if !mapping.explicit && mapping.use_margins {
+        (mapping.fit_w, mapping.fit_h)
+    } else {
+        let frame = frame_content_size(track, config);
+        (
+            f64::from(frame.width.max(1)),
+            f64::from(frame.height.max(1)),
+        )
+    };
+    (
+        style_scale(font_screen_width / f64::from(layout.width.max(1))) * font_scale,
+        style_scale(font_screen_height / f64::from(layout.height.max(1))) * font_scale,
+    )
+}
+
+/// 3D camera distance uses blur_scale_y (fitted height for margin events, content height for explicit).
+/// Denominator is storage/LayoutRes, not PlayRes.
+pub(crate) fn renderer_projection_scale_y(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    font_scale: f64,
+    mapping: &EventMapping,
+) -> f64 {
+    let layout = filter_layout_resolution(track, config);
+    let font_scale = if font_scale.is_finite() {
+        font_scale.max(0.0)
+    } else {
+        1.0
+    };
+    let font_screen_height = if !mapping.explicit && mapping.use_margins {
+        mapping.fit_h
+    } else {
+        f64::from(frame_content_size(track, config).height.max(1))
+    };
+    style_scale(font_screen_height / f64::from(layout.height.max(1))) * font_scale
+}
+
+/// Wrap scales: glyphs use the vertical font-screen scale; drawings and x2scr use horizontal/PAR.
+/// Non-explicit use_margins events measure the span on the aspect-fitted screen.
+pub(crate) fn renderer_wrap_scales(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    explicit: bool,
+) -> LayoutWrapScales {
+    let mapping = event_mapping(track, config, explicit);
+    let par = style_scale(effective_pixel_aspect(track, config));
+    let font_scale = renderer_font_scale_for_event(config, explicit);
+    let font_scale = if font_scale.is_finite() {
+        font_scale.max(0.0)
+    } else {
+        1.0
+    };
+    let text_screen_height = if !explicit && mapping.use_margins {
+        mapping.fit_h
+    } else {
+        f64::from(frame_content_size(track, config).height.max(1))
+    };
+    let horizontal_screen_width = if !explicit && mapping.use_margins {
+        mapping.fit_w
+    } else {
+        f64::from(frame_content_size(track, config).width.max(1))
+    };
+    LayoutWrapScales {
+        text: style_scale(text_screen_height / f64::from(track.play_res_y.max(1))) * font_scale,
+        spacing: style_scale(horizontal_screen_width / f64::from(track.play_res_x.max(1)) / par)
+            * font_scale,
+        drawing: style_scale(horizontal_screen_width / f64::from(track.play_res_x.max(1)) / par)
+            * font_scale,
+        available_width: style_scale(
+            horizontal_screen_width / f64::from(track.play_res_x.max(1)) / par,
+        ),
+        available_width_extra: if !explicit && mapping.use_margins {
+            (mapping.frame_w - mapping.fit_w).max(0.0)
+        } else {
+            0.0
+        },
+    }
+}
+
+pub(crate) fn frame_size(track: &ParsedTrack, config: &RendererConfig) -> Size {
+    Size {
+        width: if config.frame.width > 0 {
+            config.frame.width
+        } else {
+            track.play_res_x
+        },
+        height: if config.frame.height > 0 {
+            config.frame.height
+        } else {
+            track.play_res_y
+        },
+    }
+}
+
+/// Script-to-screen mapping: explicit/pos use the content frame; use_margins letterboxes normal events.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EventMapping {
+    pub(crate) explicit: bool,
+    pub(crate) use_margins: bool,
+    pub(crate) scale_x: f64,
+    pub(crate) scale_y: f64,
+    pub(crate) margin_left: f64,
+    pub(crate) margin_top: f64,
+    pub(crate) frame_w: f64,
+    pub(crate) frame_h: f64,
+    pub(crate) fit_w: f64,
+    pub(crate) fit_h: f64,
+    pub(crate) play_res_x: f64,
+    pub(crate) play_res_y: f64,
+}
+
+impl EventMapping {
+    fn pos_like(&self) -> bool {
+        self.explicit || !self.use_margins
+    }
+
+    pub(crate) fn map_x_pos(&self, x: f64) -> f64 {
+        x * self.scale_x + self.margin_left
+    }
+
+    pub(crate) fn map_y_pos(&self, y: f64) -> f64 {
+        y * self.scale_y + self.margin_top
+    }
+
+    pub(crate) fn x_left(&self, x: f64) -> f64 {
+        if self.pos_like() {
+            self.map_x_pos(x)
+        } else {
+            x * self.fit_w / self.play_res_x
         }
+    }
+
+    pub(crate) fn x_right(&self, x: f64) -> f64 {
+        if self.pos_like() {
+            self.map_x_pos(x)
+        } else {
+            x * self.fit_w / self.play_res_x + (self.frame_w - self.fit_w)
+        }
+    }
+
+    pub(crate) fn y_top(&self, y: f64) -> f64 {
+        if self.pos_like() {
+            self.map_y_pos(y)
+        } else {
+            y * self.fit_h / self.play_res_y
+        }
+    }
+
+    pub(crate) fn y_center(&self, y: f64) -> f64 {
+        if self.pos_like() {
+            self.map_y_pos(y)
+        } else {
+            y * self.fit_h / self.play_res_y + (self.frame_h - self.fit_h) * 0.5
+        }
+    }
+
+    pub(crate) fn y_sub(&self, y: f64) -> f64 {
+        if self.pos_like() {
+            self.map_y_pos(y)
+        } else {
+            y * self.fit_h / self.play_res_y + (self.frame_h - self.fit_h)
+        }
+    }
+}
+
+pub(crate) fn event_mapping(
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    explicit: bool,
+) -> EventMapping {
+    let scale_x = output_scale_x(track, config);
+    let scale_y = output_scale_y(track, config);
+    let frame = frame_size(track, config);
+    let frame_w = f64::from(frame.width.max(0));
+    let frame_h = f64::from(frame.height.max(0));
+    let content_w = f64::from(track.play_res_x.max(1)) * style_scale(scale_x);
+    let content_h = f64::from(track.play_res_y.max(1)) * style_scale(scale_y);
+    // Aspect-fit the content into the full frame.
+    let (fit_w, fit_h) = if content_w * frame_h >= content_h * frame_w {
+        (
+            frame_w,
+            if content_w > 0.0 {
+                content_h * frame_w / content_w
+            } else {
+                frame_h
+            },
+        )
+    } else {
+        (
+            if content_h > 0.0 {
+                content_w * frame_h / content_h
+            } else {
+                frame_w
+            },
+            frame_h,
+        )
+    };
+    EventMapping {
+        explicit,
+        use_margins: config.use_margins,
+        scale_x: style_scale(scale_x),
+        scale_y: style_scale(scale_y),
+        margin_left: f64::from(config.margins.left),
+        margin_top: f64::from(config.margins.top),
+        frame_w,
+        frame_h,
+        fit_w,
+        fit_h,
+        play_res_x: f64::from(track.play_res_x.max(1)),
+        play_res_y: f64::from(track.play_res_y.max(1)),
+    }
+}
+
+#[cfg(test)]
+mod wrap_scale_tests {
+    use super::*;
+
+    #[test]
+    fn normal_margin_events_include_right_letterbox_in_wrap_width() {
+        let track = ParsedTrack {
+            play_res_x: 640,
+            play_res_y: 480,
+            ..ParsedTrack::default()
+        };
+        let config = RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            margins: rassa_core::Margins {
+                left: 240,
+                right: 240,
+                ..rassa_core::Margins::default()
+            },
+            use_margins: true,
+            ..RendererConfig::default()
+        };
+
+        let normal = renderer_wrap_scales(&track, &config, false);
+        let explicit = renderer_wrap_scales(&track, &config, true);
+
+        assert_eq!(normal.available_width_extra, 480.0);
+        assert_eq!(explicit.available_width_extra, 0.0);
+        assert_eq!(normal.available_width, 2.25);
+        assert_eq!(explicit.available_width, 2.25);
+        assert_eq!(
+            620.0 * normal.available_width + normal.available_width_extra,
+            1875.0
+        );
+        assert_eq!(
+            620.0 * explicit.available_width + explicit.available_width_extra,
+            1395.0
+        );
+    }
+
+    #[test]
+    fn wrap_scales_honor_storage_par_and_selective_explicit_font_scale() {
+        let track = ParsedTrack {
+            play_res_x: 640,
+            play_res_y: 120,
+            ..ParsedTrack::default()
+        };
+        let config = RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            storage: Size {
+                width: 640,
+                height: 480,
+            },
+            font_scale: 2.0,
+            selective_font_scale: true,
+            ..RendererConfig::default()
+        };
+
+        let normal = renderer_wrap_scales(&track, &config, false);
+        let explicit = renderer_wrap_scales(&track, &config, true);
+
+        // Storage PAR is 4/3: glyphs use the 9× vertical scale; x2scr/drawings/hspacing use 2.25.
+        assert_eq!(normal.text, 18.0);
+        assert_eq!(normal.spacing, 4.5);
+        assert_eq!(normal.drawing, 4.5);
+        assert_eq!(normal.available_width, 2.25);
+        assert_eq!(explicit.text, 9.0);
+        assert_eq!(explicit.spacing, 2.25);
+        assert_eq!(explicit.drawing, 2.25);
+        assert_eq!(explicit.available_width, 2.25);
+    }
+
+    #[test]
+    fn blur_scales_use_aspect_fitted_screen_for_normal_margin_events() {
+        let track = ParsedTrack {
+            play_res_x: 640,
+            play_res_y: 480,
+            ..ParsedTrack::default()
+        };
+        let config = RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            margins: rassa_core::Margins {
+                left: 240,
+                right: 240,
+                top: 140,
+                bottom: 140,
+            },
+            use_margins: true,
+            ..RendererConfig::default()
+        };
+        let normal_mapping = event_mapping(&track, &config, false);
+        let explicit_mapping = event_mapping(&track, &config, true);
+        let normal = renderer_blur_scales(&track, &config, 1.0, &normal_mapping);
+        let explicit = renderer_blur_scales(&track, &config, 1.0, &explicit_mapping);
+
+        assert!((normal.0 - normal_mapping.fit_w / 640.0).abs() < 1e-12);
+        assert!((normal.1 - normal_mapping.fit_h / 480.0).abs() < 1e-12);
+        assert_eq!(explicit, (2.25, 5.0 / 3.0));
+        assert_ne!(normal, explicit);
     }
 }

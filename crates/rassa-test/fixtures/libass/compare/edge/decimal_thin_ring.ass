@@ -1,0 +1,13 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00AA58FF,&H000000FF,&H00FFFFFF,&H00AA58FF,0,0,0,0,100,100,0,0,1,1,1,5,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\an5\pos(960,540)\fscx30\fscy30\bord1\blur0.8\shad1\p1}m 41.909 83.818 b 65.378 83.818 83.818 65.378 83.818 41.909 b 83.818 18.44 65.378 0 41.909 0 b 18.44 0 0 18.44 0 41.909 b 0 65.378 18.44 83.818 41.909 83.818 m 41.909 0.838 b 66.216 0.838 82.979 17.602 82.979 41.909 b 82.979 63.701 67.054 77.95 56.996 80.465 b 51.967 82.141 55.32 78.789 41.909 78.789 b 28.498 78.789 31.851 82.141 26.822 80.465 b 16.764 77.95 0.838 65.378 0.838 41.909 b 0.838 18.44 18.44 0.838 41.909 0.838

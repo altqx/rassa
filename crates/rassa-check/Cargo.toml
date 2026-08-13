@@ -10,7 +10,9 @@ readme.workspace = true
 keywords.workspace = true
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Keep the workspace's declared Rust 1.85 MSRV. image 0.25.10 raised its
+# MSRV to 1.88, while 0.25.9 still supports 1.85.
+image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png"] }
 rassa-core = { path = "../rassa-core", version = "0.6.0" }
 rassa-fonts = { path = "../rassa-fonts", version = "0.6.0" }
 rassa-parse = { path = "../rassa-parse", version = "0.6.0" }

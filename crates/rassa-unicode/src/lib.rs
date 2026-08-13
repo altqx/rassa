@@ -1,8 +1,124 @@
 use std::ops::Range;
 
 use rassa_core::RassaResult;
-use rassa_unibreak::{BreakAnalysis, LineBreakOpportunity, WordBreakOpportunity, analyze_breaks};
-use unicode_bidi::{BidiClass, BidiInfo};
+use unicode_bidi::{BidiClass, BidiDataSource, BidiInfo, HardcodedBidiData};
+use unicode_linebreak::{BreakOpportunity as UnicodeLineBreakOpportunity, linebreaks};
+use unicode_segmentation::UnicodeSegmentation;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineBreakOpportunity {
+    Mandatory,
+    Allowed,
+    #[default]
+    Prohibited,
+    InsideCharacter,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WordBreakOpportunity {
+    Break,
+    #[default]
+    NoBreak,
+    InsideCharacter,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BreakAnalysis {
+    pub line_breaks: Vec<LineBreakOpportunity>,
+    pub word_breaks: Vec<WordBreakOpportunity>,
+}
+
+pub fn analyze_breaks(text: &str, language: Option<&str>) -> RassaResult<BreakAnalysis> {
+    Ok(BreakAnalysis {
+        line_breaks: classify_line_breaks(text, language)?,
+        word_breaks: classify_word_breaks(text, language)?,
+    })
+}
+
+pub fn classify_line_breaks(
+    text: &str,
+    _language: Option<&str>,
+) -> RassaResult<Vec<LineBreakOpportunity>> {
+    Ok(unicode_line_breaks(text))
+}
+
+pub fn classify_word_breaks(
+    text: &str,
+    _language: Option<&str>,
+) -> RassaResult<Vec<WordBreakOpportunity>> {
+    Ok(unicode_word_breaks(text))
+}
+
+fn unicode_line_breaks(text: &str) -> Vec<LineBreakOpportunity> {
+    let mut breaks = vec![LineBreakOpportunity::Prohibited; text.chars().count()];
+    if breaks.is_empty() {
+        return breaks;
+    }
+
+    let mut character_ends = CharacterEndLookup::new(text);
+    for (byte_index, opportunity) in linebreaks(text) {
+        if let Some(char_index) = character_ends.find(byte_index) {
+            breaks[char_index] = match opportunity {
+                UnicodeLineBreakOpportunity::Mandatory if byte_index == text.len() => {
+                    LineBreakOpportunity::Indeterminate
+                }
+                UnicodeLineBreakOpportunity::Mandatory => LineBreakOpportunity::Mandatory,
+                UnicodeLineBreakOpportunity::Allowed => LineBreakOpportunity::Allowed,
+            };
+        }
+    }
+
+    breaks
+}
+
+fn unicode_word_breaks(text: &str) -> Vec<WordBreakOpportunity> {
+    let mut breaks = vec![WordBreakOpportunity::NoBreak; text.chars().count()];
+    if breaks.is_empty() {
+        return breaks;
+    }
+
+    let mut character_ends = CharacterEndLookup::new(text);
+    for (start, segment) in text.split_word_bound_indices() {
+        if let Some(char_index) = character_ends.find(start + segment.len()) {
+            breaks[char_index] = WordBreakOpportunity::Break;
+        }
+    }
+
+    breaks
+}
+
+struct CharacterEndLookup {
+    ends: Vec<(usize, usize)>,
+    cursor: usize,
+}
+
+impl CharacterEndLookup {
+    fn new(text: &str) -> Self {
+        Self {
+            ends: text
+                .char_indices()
+                .enumerate()
+                .map(|(char_index, (start, character))| (start + character.len_utf8(), char_index))
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    fn find(&mut self, byte_index: usize) -> Option<usize> {
+        while self
+            .ends
+            .get(self.cursor)
+            .is_some_and(|(end, _)| *end < byte_index)
+        {
+            self.cursor += 1;
+        }
+        self.ends
+            .get(self.cursor)
+            .filter(|(end, _)| *end == byte_index)
+            .map(|(_, char_index)| *char_index)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BidiDirection {
@@ -45,8 +161,30 @@ pub struct UnicodePipeline;
 
 impl UnicodePipeline {
     pub fn analyze_text(&self, text: &str, language: Option<&str>) -> RassaResult<UnicodeAnalysis> {
+        self.analyze_text_with_base(text, language, BidiDirection::Neutral)
+    }
+
+    /// Analyze with a base direction; `\fe-1` auto-detects, anything else is LTR.
+    pub fn analyze_text_with_base(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        base_direction: BidiDirection,
+    ) -> RassaResult<UnicodeAnalysis> {
+        self.analyze_text_with_base_and_brackets(text, language, base_direction, true)
+    }
+
+    /// Analyze with independently selectable paired-bracket resolution.
+    pub fn analyze_text_with_base_and_brackets(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        base_direction: BidiDirection,
+        bidi_brackets: bool,
+    ) -> RassaResult<UnicodeAnalysis> {
         let break_analysis = analyze_breaks(text, language)?;
-        let bidi_analysis = analyze_bidi(text)?;
+        let bidi_analysis =
+            analyze_bidi_with_base_and_brackets(text, base_direction, bidi_brackets)?;
         let segments = segment_by_mandatory_breaks(text, &break_analysis);
 
         Ok(UnicodeAnalysis {
@@ -67,15 +205,69 @@ impl UnicodePipeline {
 }
 
 pub fn analyze_bidi(text: &str) -> RassaResult<BidiAnalysis> {
+    analyze_bidi_with_base(text, BidiDirection::Neutral)
+}
+
+pub fn analyze_bidi_with_base(
+    text: &str,
+    base_direction: BidiDirection,
+) -> RassaResult<BidiAnalysis> {
+    analyze_bidi_with_base_and_brackets(text, base_direction, true)
+}
+
+pub fn analyze_bidi_with_base_and_brackets(
+    text: &str,
+    base_direction: BidiDirection,
+    bidi_brackets: bool,
+) -> RassaResult<BidiAnalysis> {
     if text.is_empty() {
         return Ok(BidiAnalysis::default());
     }
 
-    Ok(analyze_bidi_with_unicode_bidi(text))
+    Ok(analyze_bidi_with_unicode_bidi(
+        text,
+        base_direction,
+        bidi_brackets,
+    ))
 }
 
-fn analyze_bidi_with_unicode_bidi(text: &str) -> BidiAnalysis {
-    let bidi_info = BidiInfo::new(text, None);
+#[derive(Clone, Copy)]
+struct AssBidiData {
+    match_brackets: bool,
+}
+
+impl BidiDataSource for AssBidiData {
+    fn bidi_class(&self, character: char) -> BidiClass {
+        unicode_bidi::bidi_class(character)
+    }
+
+    fn bidi_matched_opening_bracket(
+        &self,
+        character: char,
+    ) -> Option<unicode_bidi::data_source::BidiMatchedOpeningBracket> {
+        self.match_brackets
+            .then(|| HardcodedBidiData.bidi_matched_opening_bracket(character))
+            .flatten()
+    }
+}
+
+fn analyze_bidi_with_unicode_bidi(
+    text: &str,
+    base_direction: BidiDirection,
+    bidi_brackets: bool,
+) -> BidiAnalysis {
+    let base_level = match base_direction {
+        BidiDirection::LeftToRight => Some(unicode_bidi::Level::ltr()),
+        BidiDirection::RightToLeft => Some(unicode_bidi::Level::rtl()),
+        _ => None,
+    };
+    let bidi_info = BidiInfo::new_with_data_source(
+        &AssBidiData {
+            match_brackets: bidi_brackets,
+        },
+        text,
+        base_level,
+    );
     let Some(paragraph) = bidi_info.paragraphs.first() else {
         return BidiAnalysis::default();
     };
@@ -177,6 +369,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn break_analysis_matches_character_count() {
+        let analysis = analyze_breaks("hello world", Some("en")).expect("analysis should succeed");
+        assert_eq!(analysis.line_breaks.len(), 11);
+        assert_eq!(analysis.word_breaks.len(), 11);
+    }
+
+    #[test]
+    fn newline_is_always_mandatory_break() {
+        let breaks =
+            classify_line_breaks("a\nb", Some("en")).expect("line break analysis should succeed");
+        assert_eq!(breaks[1], LineBreakOpportunity::Mandatory);
+    }
+
+    #[test]
+    fn unicode_line_breaks_keep_cjk_break_opportunities() {
+        let breaks = unicode_line_breaks("日本語");
+
+        assert_eq!(breaks.len(), 3);
+        assert_eq!(breaks[0], LineBreakOpportunity::Allowed);
+        assert_eq!(breaks[1], LineBreakOpportunity::Allowed);
+    }
+
+    #[test]
+    fn unicode_word_breaks_keep_apostrophe_words_together() {
+        let breaks = unicode_word_breaks("can't stop");
+        let chars = "can't stop".chars().collect::<Vec<_>>();
+        let apostrophe = chars
+            .iter()
+            .position(|character| *character == '\'')
+            .expect("fixture has apostrophe");
+
+        assert_eq!(breaks[apostrophe], WordBreakOpportunity::NoBreak);
+    }
+
+    #[test]
     fn splits_text_on_mandatory_breaks() {
         let pipeline = UnicodePipeline;
         let segments = pipeline
@@ -200,7 +427,7 @@ mod tests {
 
     #[test]
     fn bidi_fallback_reorders_rtl_runs() {
-        let analysis = analyze_bidi_with_unicode_bidi("abc אבג");
+        let analysis = analyze_bidi_with_unicode_bidi("abc אבג", BidiDirection::Neutral, true);
 
         assert_eq!(analysis.direction, BidiDirection::LeftToRight);
         assert_eq!(analysis.visual_text, "abc גבא");
@@ -210,7 +437,7 @@ mod tests {
 
     #[test]
     fn bidi_fallback_detects_rtl_paragraph_direction() {
-        let analysis = analyze_bidi_with_unicode_bidi("אבג abc");
+        let analysis = analyze_bidi_with_unicode_bidi("אבג abc", BidiDirection::Neutral, true);
 
         assert_eq!(analysis.direction, BidiDirection::RightToLeft);
         assert_ne!(analysis.visual_text, "אבג abc");
@@ -219,6 +446,31 @@ mod tests {
                 .embedding_levels
                 .iter()
                 .any(|level| *level % 2 == 1)
+        );
+    }
+
+    #[test]
+    fn bidi_bracket_feature_changes_paired_neutral_resolution() {
+        let candidates = [
+            "a(א)b",
+            "א(a)ב",
+            "a א(b)c",
+            "א a(ב)c",
+            "a [א] ב",
+            "א [a] b",
+            "a (א 1) b",
+            "א (a 1) ב",
+        ];
+        let differing = candidates.into_iter().find(|text| {
+            let disabled = analyze_bidi_with_unicode_bidi(text, BidiDirection::Neutral, false);
+            let enabled = analyze_bidi_with_unicode_bidi(text, BidiDirection::Neutral, true);
+            disabled.embedding_levels != enabled.embedding_levels
+                || disabled.visual_to_logical != enabled.visual_to_logical
+        });
+
+        assert!(
+            differing.is_some(),
+            "paired-bracket data must affect at least one mixed-direction case"
         );
     }
 }

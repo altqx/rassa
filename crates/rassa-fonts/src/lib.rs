@@ -1,14 +1,30 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
-    fs,
+    fmt, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
-static FONT_CHAR_SUPPORT_CACHE: OnceLock<Mutex<HashMap<(PathBuf, char), bool>>> = OnceLock::new();
+mod legacy_arabic_charmap;
+mod legacy_charmap;
 
-fn font_char_support_cache() -> &'static Mutex<HashMap<(PathBuf, char), bool>> {
+pub use legacy_charmap::{
+    FontCharmap, font_data_glyph_index, font_face_charmap, font_face_glyph_index,
+    font_face_uses_legacy_charmap,
+};
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum FontFaceScope {
+    Any,
+    Face(u32),
+}
+
+type FontCharSupportCache = HashMap<(PathBuf, FontFaceScope, char), bool>;
+
+static FONT_CHAR_SUPPORT_CACHE: OnceLock<Mutex<FontCharSupportCache>> = OnceLock::new();
+
+fn font_char_support_cache() -> &'static Mutex<FontCharSupportCache> {
     FONT_CHAR_SUPPORT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -48,7 +64,7 @@ impl FontQuery {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub enum FontProviderKind {
     #[default]
     Null,
@@ -89,6 +105,15 @@ impl FontMatch {
 pub trait FontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch;
 
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        let resolved = self.resolve(query);
+        if resolved.path.is_some() && font_match_supports_text(&resolved, text) {
+            resolved
+        } else {
+            FontMatch::unresolved(query.family.clone(), query.style.clone(), resolved.provider)
+        }
+    }
+
     fn resolve_family(&self, family: &str) -> FontMatch {
         self.resolve(&FontQuery::new(family))
     }
@@ -98,11 +123,19 @@ impl<T: FontProvider + ?Sized> FontProvider for Box<T> {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
         (**self).resolve(query)
     }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        (**self).resolve_for_text(query, text)
+    }
 }
 
 impl<T: FontProvider + ?Sized> FontProvider for &T {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
         (**self).resolve(query)
+    }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        (**self).resolve_for_text(query, text)
     }
 }
 
@@ -121,6 +154,7 @@ impl FontProvider for NullFontProvider {
 
 pub struct CrossfontProvider {
     fallback_family: Option<String>,
+    config_path: Option<PathBuf>,
     resolve_cache: Mutex<HashMap<FontResolveKey, FontMatch>>,
 }
 
@@ -153,6 +187,7 @@ impl CrossfontProvider {
     pub fn new() -> Self {
         Self {
             fallback_family: Some("Arial".to_string()),
+            config_path: None,
             resolve_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -160,6 +195,27 @@ impl CrossfontProvider {
     pub fn with_fallback_family(fallback_family: impl Into<String>) -> Self {
         Self {
             fallback_family: Some(fallback_family.into()),
+            config_path: None,
+            resolve_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Use a host fc-match config; fall back to fontdb if it fails.
+    pub fn with_config(config_path: impl Into<PathBuf>) -> Self {
+        Self {
+            fallback_family: Some("Arial".to_string()),
+            config_path: Some(config_path.into()),
+            resolve_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_config_and_fallback_family(
+        config_path: impl Into<PathBuf>,
+        fallback_family: impl Into<String>,
+    ) -> Self {
+        Self {
+            fallback_family: Some(fallback_family.into()),
+            config_path: Some(config_path.into()),
             resolve_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -179,25 +235,29 @@ impl CrossfontProvider {
         style: Option<String>,
         weight: Option<i32>,
     ) -> Option<FontMatch> {
-        resolve_system_font(&family, style.as_deref(), weight).map(
-            |(resolved_family, resolved_path, face_index)| {
-                let resolved_style = resolved_path
-                    .as_deref()
-                    .and_then(|path| load_face_metadata(path).and_then(|(_, style)| style));
-                let (synthetic_bold, synthetic_italic) =
-                    synthetic_style_flags(style.as_deref(), weight, resolved_style.as_deref());
-
-                FontMatch {
-                    family: resolved_family,
-                    path: resolved_path,
-                    face_index,
-                    style,
-                    synthetic_bold,
-                    synthetic_italic,
-                    provider: FontProviderKind::Fontconfig,
-                }
-            },
+        resolve_system_font(
+            &family,
+            style.as_deref(),
+            weight,
+            self.config_path.as_deref(),
         )
+        .map(|(resolved_family, resolved_path, face_index)| {
+            let resolved_style = resolved_path
+                .as_deref()
+                .and_then(|path| load_face_metadata(path).and_then(|(_, style)| style));
+            let (synthetic_bold, synthetic_italic) =
+                synthetic_style_flags(style.as_deref(), weight, resolved_style.as_deref());
+
+            FontMatch {
+                family: resolved_family,
+                path: resolved_path,
+                face_index,
+                style,
+                synthetic_bold,
+                synthetic_italic,
+                provider: FontProviderKind::Fontconfig,
+            }
+        })
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -207,6 +267,7 @@ impl CrossfontProvider {
         _style: Option<String>,
         _weight: Option<i32>,
     ) -> Option<FontMatch> {
+        let _ = &self.config_path;
         None
     }
 }
@@ -258,16 +319,22 @@ fn resolve_system_font(
     family: &str,
     style: Option<&str>,
     weight: Option<i32>,
+    config_path: Option<&Path>,
 ) -> Option<(String, Option<PathBuf>, Option<u32>)> {
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = config_path;
+
     let mut database = Database::new();
     database.load_system_fonts();
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some((path, face_index)) = fontconfig_match_path(family, style, weight, None) {
+    if let Some((path, face_index)) =
+        fontconfig_match_path(family, style, weight, None, config_path)
+    {
         let resolved_family = load_face_metadata(&path)
             .map(|(family, _)| family)
             .unwrap_or_else(|| family.to_owned());
-        if fontconfig_match_is_acceptable(family, &resolved_family) {
+        if config_path.is_some() || fontconfig_match_is_acceptable(family, &resolved_family) {
             return Some((resolved_family, Some(path), face_index));
         }
     }
@@ -348,8 +415,8 @@ pub fn resolve_system_font_for_char(
     style: Option<&str>,
     character: char,
 ) -> Option<(String, Option<PathBuf>, Option<u32>)> {
-    let (path, face_index) = fontconfig_match_path(family, style, None, Some(character))?;
-    if !font_file_supports_char(&path, character) {
+    let (path, face_index) = fontconfig_match_path(family, style, None, Some(character), None)?;
+    if !font_file_face_supports_char(&path, face_index.unwrap_or(0), character) {
         return None;
     }
     let resolved_family = load_face_metadata(&path)
@@ -373,11 +440,21 @@ pub fn font_match_supports_text(font: &FontMatch, text: &str) -> bool {
     };
     text.chars()
         .filter(|character| !character.is_whitespace() && !character.is_control())
-        .all(|character| font_file_supports_char(path, character))
+        .all(|character| {
+            font_file_face_supports_char(path, font.face_index.unwrap_or(0), character)
+        })
 }
 
 pub fn font_file_supports_char(path: &Path, character: char) -> bool {
-    let cache_key = (path.to_path_buf(), character);
+    font_file_supports_char_in_scope(path, FontFaceScope::Any, character)
+}
+
+pub fn font_file_face_supports_char(path: &Path, face_index: u32, character: char) -> bool {
+    font_file_supports_char_in_scope(path, FontFaceScope::Face(face_index), character)
+}
+
+fn font_file_supports_char_in_scope(path: &Path, scope: FontFaceScope, character: char) -> bool {
+    let cache_key = (path.to_path_buf(), scope, character);
     if let Some(supports_char) = font_char_support_cache()
         .lock()
         .expect("font char support cache mutex poisoned")
@@ -387,7 +464,7 @@ pub fn font_file_supports_char(path: &Path, character: char) -> bool {
         return supports_char;
     }
 
-    let supports_char = font_file_supports_char_uncached(path, character);
+    let supports_char = font_file_supports_char_uncached(path, scope, character);
     font_char_support_cache()
         .lock()
         .expect("font char support cache mutex poisoned")
@@ -395,17 +472,21 @@ pub fn font_file_supports_char(path: &Path, character: char) -> bool {
     supports_char
 }
 
-fn font_file_supports_char_uncached(path: &Path, character: char) -> bool {
+fn font_file_supports_char_uncached(path: &Path, scope: FontFaceScope, character: char) -> bool {
     let Ok(data) = fs::read(path) else {
         return false;
     };
-    let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
-    (0..face_count).any(|index| {
-        ttf_parser::Face::parse(&data, index)
-            .ok()
-            .and_then(|face| face.glyph_index(character))
-            .is_some_and(|glyph| glyph.0 != 0)
-    })
+    match scope {
+        FontFaceScope::Any => {
+            let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
+            (0..face_count).any(|index| {
+                font_data_glyph_index(&data, index, character).is_some_and(|glyph| glyph.0 != 0)
+            })
+        }
+        FontFaceScope::Face(index) => {
+            font_data_glyph_index(&data, index, character).is_some_and(|glyph| glyph.0 != 0)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -432,6 +513,7 @@ fn windows_known_font_path(_family: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn fontconfig_match_is_acceptable(requested_family: &str, resolved_family: &str) -> bool {
     let requested = normalize_font_key(requested_family);
     let resolved = normalize_font_key(resolved_family);
@@ -460,12 +542,15 @@ fn fontconfig_match_path(
     style: Option<&str>,
     weight: Option<i32>,
     character: Option<char>,
+    config_path: Option<&Path>,
 ) -> Option<(PathBuf, Option<u32>)> {
     let pattern = fontconfig_pattern(family, style, weight, character);
-    let output = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}\n%{index}", &pattern])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("fc-match");
+    command.args(["-f", "%{file}\n%{index}", &pattern]);
+    if let Some(config_path) = config_path {
+        command.env("FONTCONFIG_FILE", config_path);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
@@ -477,6 +562,34 @@ fn fontconfig_match_path(
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|index| *index > 0);
     path.exists().then_some((path, face_index))
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+pub fn validate_fontconfig_config(config_path: impl AsRef<Path>) -> Result<(), String> {
+    let output = std::process::Command::new("fc-match")
+        .env("FONTCONFIG_FILE", config_path.as_ref())
+        .args(["-f", "%{file}", "sans"])
+        .output()
+        .map_err(|error| format!("unable to run fc-match: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("fc-match exited with {}", output.status)
+        } else {
+            error
+        });
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err("fontconfig did not return a usable font path".to_string())
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"), not(target_arch = "wasm32"))))]
+pub fn validate_fontconfig_config(_config_path: impl AsRef<Path>) -> Result<(), String> {
+    Err("custom fontconfig configurations are unavailable on this target".to_string())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -537,8 +650,12 @@ fn fontconfig_pattern_preserves_numeric_weight() {
 struct AttachedFontRecord {
     family: String,
     path: PathBuf,
+    face_index: Option<u32>,
     style: Option<String>,
-    aliases: Vec<String>,
+    weight: i32,
+    italic: bool,
+    bold: bool,
+    aliases: FontRecordAliases,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -562,7 +679,7 @@ impl AttachedFontProvider {
         let _ = fs::create_dir_all(&root);
         let fonts = attachments
             .iter()
-            .filter_map(|attachment| AttachedFontRecord::from_attachment(attachment, &root))
+            .flat_map(|attachment| AttachedFontRecord::from_attachment(attachment, &root))
             .collect();
 
         Self { fonts }
@@ -571,27 +688,20 @@ impl AttachedFontProvider {
 
 impl FontProvider for AttachedFontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch {
-        let family_key = normalize_font_key(&query.family);
         let style_key = query.style.as_deref().map(normalize_font_key);
 
-        let exact = self.fonts.iter().find(|font| {
-            font.aliases.iter().any(|alias| alias == &family_key)
-                && style_key.as_ref().is_none_or(|style| {
-                    font.style.as_deref().map(normalize_font_key).as_ref() == Some(style)
-                })
-        });
-        let fallback = self
-            .fonts
-            .iter()
-            .find(|font| font.aliases.iter().any(|alias| alias == &family_key));
-
-        if let Some(font) = exact.or(fallback) {
+        if let Some(font) = select_local_font(
+            &self.fonts,
+            &query.family,
+            style_key.as_deref(),
+            query.weight,
+        ) {
             let (synthetic_bold, synthetic_italic) =
                 synthetic_style_flags(query.style.as_deref(), query.weight, font.style.as_deref());
             return FontMatch {
                 family: font.family.clone(),
                 path: Some(font.path.clone()),
-                face_index: None,
+                face_index: font.face_index,
                 style: font.style.clone(),
                 synthetic_bold,
                 synthetic_italic,
@@ -605,6 +715,354 @@ impl FontProvider for AttachedFontProvider {
             FontProviderKind::Attached,
         )
     }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        let style_key = query.style.as_deref().map(normalize_font_key);
+        let Some(font) = select_local_font_for_text(
+            &self.fonts,
+            &query.family,
+            style_key.as_deref(),
+            query.weight,
+            text,
+        ) else {
+            return FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::Attached,
+            );
+        };
+        let (synthetic_bold, synthetic_italic) =
+            synthetic_style_flags(query.style.as_deref(), query.weight, font.style.as_deref());
+        FontMatch {
+            family: font.family.clone(),
+            path: Some(font.path.clone()),
+            face_index: font.face_index,
+            style: font.style.clone(),
+            synthetic_bold,
+            synthetic_italic,
+            provider: FontProviderKind::Attached,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryFontRecord {
+    family: String,
+    path: PathBuf,
+    face_index: Option<u32>,
+    style: Option<String>,
+    weight: i32,
+    italic: bool,
+    bold: bool,
+    aliases: FontRecordAliases,
+}
+
+trait LocalFontRecord {
+    fn aliases(&self) -> &FontRecordAliases;
+    fn weight(&self) -> i32;
+    fn italic(&self) -> bool;
+    fn bold(&self) -> bool;
+    fn font_match(&self) -> FontMatch;
+}
+
+impl LocalFontRecord for AttachedFontRecord {
+    fn aliases(&self) -> &FontRecordAliases {
+        &self.aliases
+    }
+
+    fn weight(&self) -> i32 {
+        self.weight
+    }
+    fn italic(&self) -> bool {
+        self.italic
+    }
+    fn bold(&self) -> bool {
+        self.bold
+    }
+    fn font_match(&self) -> FontMatch {
+        FontMatch {
+            family: self.family.clone(),
+            path: Some(self.path.clone()),
+            face_index: self.face_index,
+            style: self.style.clone(),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        }
+    }
+}
+
+impl LocalFontRecord for DirectoryFontRecord {
+    fn aliases(&self) -> &FontRecordAliases {
+        &self.aliases
+    }
+
+    fn weight(&self) -> i32 {
+        self.weight
+    }
+    fn italic(&self) -> bool {
+        self.italic
+    }
+    fn bold(&self) -> bool {
+        self.bold
+    }
+    fn font_match(&self) -> FontMatch {
+        FontMatch {
+            family: self.family.clone(),
+            path: Some(self.path.clone()),
+            face_index: self.face_index,
+            style: self.style.clone(),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        }
+    }
+}
+
+fn select_local_font<'a, T: LocalFontRecord>(
+    fonts: &'a [T],
+    requested_name: &str,
+    style_key: Option<&str>,
+    requested_weight: Option<i32>,
+) -> Option<&'a T> {
+    select_local_font_filtered(fonts, requested_name, style_key, requested_weight, |_| true)
+}
+
+fn select_local_font_for_text<'a, T: LocalFontRecord>(
+    fonts: &'a [T],
+    requested_name: &str,
+    style_key: Option<&str>,
+    requested_weight: Option<i32>,
+    text: &str,
+) -> Option<&'a T> {
+    select_local_font_filtered(fonts, requested_name, style_key, requested_weight, |font| {
+        font_match_supports_text(&font.font_match(), text)
+    })
+}
+
+fn select_local_font_filtered<'a, T: LocalFontRecord>(
+    fonts: &'a [T],
+    requested_name: &str,
+    style_key: Option<&str>,
+    requested_weight: Option<i32>,
+    supports_text: impl Fn(&T) -> bool,
+) -> Option<&'a T> {
+    let family_key = font_name_match_key(requested_name);
+    let full_name_key = font_name_match_key(requested_name);
+    let wants_italic =
+        style_key.is_some_and(|style| style.contains("italic") || style.contains("oblique"));
+    let requested_weight = requested_weight.unwrap_or(400);
+    let mut selected = None;
+    let mut best_score = u32::MAX;
+    for font in fonts {
+        let family_match = font
+            .aliases()
+            .family
+            .iter()
+            .any(|name| name == family_key.as_str());
+        let full_name_match = font.aliases().matches_full_or_postscript(&full_name_key);
+        let score = if family_match {
+            font_attribute_score(font, wants_italic, requested_weight)
+        } else if full_name_match {
+            0
+        } else {
+            continue;
+        };
+        if !supports_text(font) {
+            continue;
+        }
+        if score < best_score {
+            selected = Some(font);
+            best_score = score;
+        }
+        if score == 0 {
+            break;
+        }
+    }
+    if selected.is_some() {
+        return selected;
+    }
+
+    None
+}
+
+fn font_attribute_score<T: LocalFontRecord>(
+    font: &T,
+    wants_italic: bool,
+    requested_weight: i32,
+) -> u32 {
+    let mut score = if wants_italic && !font.italic() {
+        1
+    } else if !wants_italic && font.italic() {
+        4
+    } else {
+        0
+    };
+    let mut effective_weight = font.weight();
+    if requested_weight > effective_weight + 150 && !font.bold() {
+        effective_weight += 120;
+    }
+    score += (73 * (effective_weight - requested_weight).unsigned_abs()) / 256;
+    score
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontDirectoryIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl fmt::Display for FontDirectoryIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.message)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectoryFontProvider {
+    fonts: Vec<DirectoryFontRecord>,
+}
+
+impl DirectoryFontProvider {
+    /// Scan a libass font dir: skip hidden/subdirs; accept files by contents, not extension.
+    pub fn scan(directory: impl AsRef<Path>) -> (Self, Vec<FontDirectoryIssue>) {
+        let directory = directory.as_ref();
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return (
+                    Self::default(),
+                    vec![FontDirectoryIssue {
+                        path: directory.to_path_buf(),
+                        message: format!("unable to read font directory: {error}"),
+                    }],
+                );
+            }
+        };
+
+        let mut fonts = Vec::new();
+        let mut issues = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    issues.push(FontDirectoryIssue {
+                        path: directory.to_path_buf(),
+                        message: format!("unable to read directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(error) => {
+                    issues.push(FontDirectoryIssue {
+                        path,
+                        message: format!("unable to read font file: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let records = directory_font_records(&path, &data);
+            if records.is_empty() {
+                issues.push(FontDirectoryIssue {
+                    path,
+                    message: "not a usable OpenType font".to_string(),
+                });
+            } else {
+                fonts.extend(records);
+            }
+        }
+
+        (Self { fonts }, issues)
+    }
+}
+
+impl FontProvider for DirectoryFontProvider {
+    fn resolve(&self, query: &FontQuery) -> FontMatch {
+        let style_key = query.style.as_deref().map(normalize_font_key);
+
+        if let Some(font) = select_local_font(
+            &self.fonts,
+            &query.family,
+            style_key.as_deref(),
+            query.weight,
+        ) {
+            let (synthetic_bold, synthetic_italic) =
+                synthetic_style_flags(query.style.as_deref(), query.weight, font.style.as_deref());
+            return FontMatch {
+                family: font.family.clone(),
+                path: Some(font.path.clone()),
+                face_index: font.face_index,
+                style: font.style.clone(),
+                synthetic_bold,
+                synthetic_italic,
+                provider: FontProviderKind::Attached,
+            };
+        }
+
+        FontMatch::unresolved(
+            query.family.clone(),
+            query.style.clone(),
+            FontProviderKind::Attached,
+        )
+    }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        let style_key = query.style.as_deref().map(normalize_font_key);
+        let Some(font) = select_local_font_for_text(
+            &self.fonts,
+            &query.family,
+            style_key.as_deref(),
+            query.weight,
+            text,
+        ) else {
+            return FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::Attached,
+            );
+        };
+        let (synthetic_bold, synthetic_italic) =
+            synthetic_style_flags(query.style.as_deref(), query.weight, font.style.as_deref());
+        FontMatch {
+            family: font.family.clone(),
+            path: Some(font.path.clone()),
+            face_index: font.face_index,
+            style: font.style.clone(),
+            synthetic_bold,
+            synthetic_italic,
+            provider: FontProviderKind::Attached,
+        }
+    }
+}
+
+fn directory_font_records(path: &Path, data: &[u8]) -> Vec<DirectoryFontRecord> {
+    let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    (0..face_count)
+        .filter_map(|index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let metadata = font_face_metadata(&face)?;
+            Some(DirectoryFontRecord {
+                family: metadata.family,
+                path: path.to_path_buf(),
+                face_index: Some(index).filter(|index| *index > 0),
+                style: metadata.style,
+                weight: metadata.weight,
+                italic: metadata.italic,
+                bold: metadata.bold,
+                aliases: metadata.aliases,
+            })
+        })
+        .collect()
 }
 
 pub struct MergedFontProvider<P, S> {
@@ -625,6 +1083,15 @@ impl<P: FontProvider, S: FontProvider> FontProvider for MergedFontProvider<P, S>
             primary
         } else {
             self.secondary.resolve(query)
+        }
+    }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        let primary = self.primary.resolve_for_text(query, text);
+        if primary.path.is_some() {
+            primary
+        } else {
+            self.secondary.resolve_for_text(query, text)
         }
     }
 }
@@ -667,6 +1134,31 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
             provider: FontProviderKind::DefaultFile,
         }
     }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        let primary = self.primary.resolve_for_text(query, text);
+        if primary.path.is_some() {
+            return primary;
+        }
+        let fallback = FontMatch {
+            family: self.family.clone().unwrap_or_else(|| query.family.clone()),
+            path: Some(self.path.clone()),
+            face_index: None,
+            style: query.style.clone(),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::DefaultFile,
+        };
+        if font_match_supports_text(&fallback, text) {
+            fallback
+        } else {
+            FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::DefaultFile,
+            )
+        }
+    }
 }
 
 fn synthetic_style_flags(
@@ -684,6 +1176,7 @@ fn synthetic_style_flags(
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_weight(weight: i32) -> i32 {
     weight.clamp(1, 1000)
 }
@@ -698,33 +1191,33 @@ fn bold_weight_is_active(weight: i32) -> bool {
 }
 
 impl AttachedFontRecord {
-    fn from_attachment(attachment: &FontAttachment, root: &Path) -> Option<Self> {
+    fn from_attachment(attachment: &FontAttachment, root: &Path) -> Vec<Self> {
         if attachment.data.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        let path = materialize_attachment(root, attachment)?;
-        let fallback_name = attachment_file_stem(attachment)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| attachment.name.clone());
-        let (family, style) =
-            load_face_metadata(&path).unwrap_or_else(|| (fallback_name.clone(), None));
-        let mut aliases = vec![normalize_font_key(&family)];
-        if let Some(stem) = attachment_file_stem(attachment) {
-            aliases.push(normalize_font_key(&stem));
-        }
-        if !attachment.name.is_empty() {
-            aliases.push(normalize_font_key(&attachment.name));
-        }
-        aliases.sort();
-        aliases.dedup();
-
-        Some(Self {
-            family,
-            path,
-            style,
-            aliases,
-        })
+        let Some(path) = materialize_attachment(root, attachment) else {
+            return Vec::new();
+        };
+        let face_count = ttf_parser::fonts_in_collection(&attachment.data)
+            .unwrap_or(1)
+            .max(1);
+        (0..face_count)
+            .filter_map(|index| {
+                let face = ttf_parser::Face::parse(&attachment.data, index).ok()?;
+                let metadata = font_face_metadata(&face)?;
+                Some(Self {
+                    family: metadata.family,
+                    path: path.clone(),
+                    face_index: Some(index).filter(|index| *index > 0),
+                    style: metadata.style,
+                    weight: metadata.weight,
+                    italic: metadata.italic,
+                    bold: metadata.bold,
+                    aliases: metadata.aliases,
+                })
+            })
+            .collect::<Vec<_>>()
     }
 }
 
@@ -741,28 +1234,158 @@ fn materialize_attachment(root: &Path, attachment: &FontAttachment) -> Option<Pa
     Some(path)
 }
 
-fn load_face_metadata(path: &Path) -> Option<(String, Option<String>)> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FontRecordAliases {
+    family: Vec<String>,
+    full_names: Vec<String>,
+    postscript_names: Vec<String>,
+    postscript_outlines: bool,
+}
+
+impl FontRecordAliases {
+    fn sort_and_dedup(&mut self) {
+        for names in [
+            &mut self.family,
+            &mut self.full_names,
+            &mut self.postscript_names,
+        ] {
+            names.sort();
+            names.dedup();
+        }
+    }
+
+    fn matches_full_or_postscript(&self, key: &str) -> bool {
+        let full_name = self.full_names.iter().any(|name| name == key);
+        let postscript_name = self.postscript_names.iter().any(|name| name == key);
+        if full_name == postscript_name {
+            full_name
+        } else if self.postscript_outlines {
+            postscript_name
+        } else {
+            full_name
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FontFaceMetadata {
+    family: String,
+    style: Option<String>,
+    weight: i32,
+    italic: bool,
+    bold: bool,
+    aliases: FontRecordAliases,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_font_face_metadata(path: &Path) -> Option<FontFaceMetadata> {
     let data = fs::read(path).ok()?;
     let face = ttf_parser::Face::parse(&data, 0).ok()?;
-    let family = font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
-        .or_else(|| font_name(&face, ttf_parser::name_id::FAMILY))?;
-    let style = font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
-        .or_else(|| font_name(&face, ttf_parser::name_id::SUBFAMILY));
-    Some((family, style))
+    font_face_metadata(&face)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_face_metadata(path: &Path) -> Option<(String, Option<String>)> {
+    load_font_face_metadata(path).map(|metadata| (metadata.family, metadata.style))
+}
+
+fn font_face_metadata(face: &ttf_parser::Face<'_>) -> Option<FontFaceMetadata> {
+    let typographic_families = font_names(face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY);
+    let legacy_families = windows_font_names(face, ttf_parser::name_id::FAMILY);
+    let selected_families = if !legacy_families.is_empty() {
+        &legacy_families
+    } else {
+        &typographic_families
+    };
+    let family = selected_families.first().cloned()?;
+    let style = font_name(face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
+        .or_else(|| font_name(face, ttf_parser::name_id::SUBFAMILY));
+    let mut aliases = FontRecordAliases {
+        family: selected_families
+            .iter()
+            .map(|name| font_name_match_key(name))
+            .collect(),
+        full_names: windows_font_names(face, ttf_parser::name_id::FULL_NAME)
+            .iter()
+            .map(|name| font_name_match_key(name))
+            .collect(),
+        postscript_names: font_names(face, ttf_parser::name_id::POST_SCRIPT_NAME)
+            .iter()
+            .map(|name| font_name_match_key(name))
+            .collect(),
+        postscript_outlines: face.tables().cff.is_some() || face.tables().cff2.is_some(),
+    };
+    aliases.sort_and_dedup();
+    Some(FontFaceMetadata {
+        family,
+        style,
+        weight: libass_face_weight(face),
+        italic: face.is_italic() || face.is_oblique(),
+        bold: face.is_bold(),
+        aliases,
+    })
+}
+
+fn libass_face_weight(face: &ttf_parser::Face<'_>) -> i32 {
+    let weight = face.weight().to_number();
+    match weight {
+        0 => 300 * i32::from(face.is_bold()) + 400,
+        1 => 100,
+        2 => 200,
+        3 => 300,
+        4 => 350,
+        5 => 400,
+        6 => 600,
+        7 => 700,
+        8 => 800,
+        9 => 900,
+        value => i32::from(value),
+    }
 }
 
 fn font_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
-    face.names()
-        .into_iter()
-        .find(|name| name.name_id == name_id && name.is_unicode())
-        .and_then(|name| name.to_string())
-        .filter(|name| !name.is_empty())
+    font_names(face, name_id).into_iter().next()
 }
 
-fn attachment_file_stem(attachment: &FontAttachment) -> Option<String> {
-    Path::new(&attachment.name)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
+fn font_names(face: &ttf_parser::Face<'_>, name_id: u16) -> Vec<String> {
+    // Decode every Microsoft SFNT name as UTF-16BE, including Windows encoding 2.
+    let mut names = windows_font_names(face, name_id);
+    names.extend(
+        face.names()
+            .into_iter()
+            .filter(|name| {
+                name.name_id == name_id
+                    && name.platform_id != ttf_parser::PlatformId::Windows
+                    && name.is_unicode()
+            })
+            .filter_map(|name| name.to_string())
+            .filter(|name| !name.is_empty()),
+    );
+    names.dedup();
+    names
+}
+
+fn windows_font_names(face: &ttf_parser::Face<'_>, name_id: u16) -> Vec<String> {
+    let mut names = face
+        .names()
+        .into_iter()
+        .filter(|name| {
+            name.name_id == name_id && name.platform_id == ttf_parser::PlatformId::Windows
+        })
+        .filter_map(|name| {
+            (name.name.len() % 2 == 0)
+                .then(|| {
+                    name.name
+                        .chunks_exact(2)
+                        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+                        .collect::<Vec<_>>()
+                })
+                .and_then(|units| String::from_utf16(&units).ok())
+                .filter(|name| !name.is_empty())
+        })
+        .collect::<Vec<_>>();
+    names.dedup();
+    names
 }
 
 fn sanitize_attachment_name(name: &str) -> String {
@@ -788,9 +1411,166 @@ fn normalize_font_key(value: &str) -> String {
         .collect()
 }
 
+fn font_name_match_key(value: &str) -> String {
+    String::from_utf8(
+        value
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect(),
+    )
+    .expect("ASCII case folding preserves UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_be_u16(data: &[u8], offset: usize) -> u16 {
+        u16::from_be_bytes([data[offset], data[offset + 1]])
+    }
+
+    fn read_be_u32(data: &[u8], offset: usize) -> usize {
+        u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize
+    }
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rassa-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    fn font_with_distinct_typographic_and_legacy_families() -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test/font2.otf");
+        let mut data = fs::read(path).expect("Aileron fixture should be readable");
+        let table_count = read_be_u16(&data, 4) as usize;
+        let name_offset = (0..table_count)
+            .map(|index| 12 + index * 16)
+            .find(|offset| &data[*offset..*offset + 4] == b"name")
+            .map(|offset| read_be_u32(&data, offset + 8))
+            .expect("fixture should contain an SFNT name table");
+        let name_count = read_be_u16(&data, name_offset + 2) as usize;
+        let mut changed = false;
+        for index in 0..name_count {
+            let record = name_offset + 6 + index * 12;
+            let platform = read_be_u16(&data, record);
+            let name_id = read_be_u16(&data, record + 6);
+            if platform == 3 && name_id == ttf_parser::name_id::POST_SCRIPT_NAME {
+                data[record + 6..record + 8]
+                    .copy_from_slice(&ttf_parser::name_id::TYPOGRAPHIC_FAMILY.to_be_bytes());
+                changed = true;
+            }
+        }
+        assert!(changed, "fixture should contain a Windows PostScript name");
+
+        let face = ttf_parser::Face::parse(&data, 0).expect("mutated font should remain valid");
+        assert_eq!(
+            font_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY).as_deref(),
+            Some("Aileron-Regular")
+        );
+        assert_eq!(
+            font_name(&face, ttf_parser::name_id::FAMILY).as_deref(),
+            Some("Aileron")
+        );
+        data
+    }
+
+    fn font_with_conflicting_unicode_family_alias() -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test/font2.otf");
+        let mut data = fs::read(path).expect("Aileron fixture should be readable");
+        let table_count = read_be_u16(&data, 4) as usize;
+        let name_offset = (0..table_count)
+            .map(|index| 12 + index * 16)
+            .find(|offset| &data[*offset..*offset + 4] == b"name")
+            .map(|offset| read_be_u32(&data, offset + 8))
+            .expect("fixture should contain an SFNT name table");
+        let name_count = read_be_u16(&data, name_offset + 2) as usize;
+        let mut changed = false;
+        for index in 0..name_count {
+            let record = name_offset + 6 + index * 12;
+            let platform = read_be_u16(&data, record);
+            let name_id = read_be_u16(&data, record + 6);
+            if platform == 1 && name_id == ttf_parser::name_id::FAMILY {
+                data[record..record + 2].copy_from_slice(&0_u16.to_be_bytes());
+                changed = true;
+            }
+        }
+        assert!(changed, "fixture should contain a Macintosh family name");
+        data
+    }
+
+    fn two_face_collection() -> Vec<u8> {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test");
+        let first = fs::read(fixture_root.join("font1.ttf")).expect("TTF fixture should read");
+        let second = fs::read(fixture_root.join("font2.otf")).expect("OTF fixture should read");
+        let header_len = 20_usize;
+        let first_offset = header_len.next_multiple_of(4);
+        let second_offset = (first_offset + first.len()).next_multiple_of(4);
+        let mut collection = vec![0_u8; second_offset + second.len()];
+        collection[0..4].copy_from_slice(b"ttcf");
+        collection[4..8].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+        collection[8..12].copy_from_slice(&2_u32.to_be_bytes());
+        collection[12..16].copy_from_slice(&(first_offset as u32).to_be_bytes());
+        collection[16..20].copy_from_slice(&(second_offset as u32).to_be_bytes());
+        collection[first_offset..first_offset + first.len()].copy_from_slice(&first);
+        collection[second_offset..second_offset + second.len()].copy_from_slice(&second);
+        for (font, base_offset) in [(&first, first_offset), (&second, second_offset)] {
+            let table_count = read_be_u16(font, 4) as usize;
+            for index in 0..table_count {
+                let table = base_offset + 12 + index * 16;
+                let original_offset = read_be_u32(&collection, table + 8);
+                let collection_offset = original_offset + base_offset;
+                collection[table + 8..table + 12]
+                    .copy_from_slice(&(collection_offset as u32).to_be_bytes());
+            }
+        }
+        assert_eq!(ttf_parser::fonts_in_collection(&collection), Some(2));
+        assert!(ttf_parser::Face::parse(&collection, 0).is_ok());
+        assert!(ttf_parser::Face::parse(&collection, 1).is_ok());
+        collection
+    }
+
+    fn synthetic_directory_record(
+        path: &str,
+        family: &[&str],
+        full_names: &[&str],
+        postscript_names: &[&str],
+        postscript_outlines: bool,
+    ) -> DirectoryFontRecord {
+        DirectoryFontRecord {
+            family: family.first().copied().unwrap_or("Fixture").to_string(),
+            path: PathBuf::from(path),
+            face_index: None,
+            style: None,
+            weight: 400,
+            italic: false,
+            bold: false,
+            aliases: FontRecordAliases {
+                family: family
+                    .iter()
+                    .map(|name| font_name_match_key(name))
+                    .collect(),
+                full_names: full_names
+                    .iter()
+                    .map(|name| font_name_match_key(name))
+                    .collect(),
+                postscript_names: postscript_names
+                    .iter()
+                    .map(|name| font_name_match_key(name))
+                    .collect(),
+                postscript_outlines,
+            },
+        }
+    }
 
     #[test]
     fn null_provider_returns_unresolved_match() {
@@ -944,6 +1724,323 @@ mod tests {
                 .as_ref()
                 .is_some_and(|materialized| materialized.exists())
         );
+    }
+
+    #[test]
+    fn attached_provider_uses_legacy_family_instead_of_typographic_family() {
+        let directory = unique_test_directory("attached-family-alias");
+        let provider = AttachedFontProvider::from_attachments_in_dir(
+            &[FontAttachment {
+                name: "unrelated-name.data".to_string(),
+                data: font_with_distinct_typographic_and_legacy_families(),
+            }],
+            Some(&directory),
+        );
+
+        let legacy = provider.resolve(&FontQuery::new("Aileron"));
+        let typographic = provider.resolve(&FontQuery::new("Aileron-Regular"));
+
+        assert_eq!(legacy.provider, FontProviderKind::Attached);
+        assert_eq!(legacy.family, "Aileron");
+        assert!(legacy.path.as_ref().is_some_and(|path| path.is_file()));
+        assert!(typographic.path.is_none());
+        fs::remove_dir_all(directory).expect("attachment fixture should clean up");
+    }
+
+    #[test]
+    fn attached_provider_indexes_every_face_in_font_collection() {
+        let directory = unique_test_directory("attached-font-collection");
+        let provider = AttachedFontProvider::from_attachments_in_dir(
+            &[FontAttachment {
+                name: "fixture.ttc".to_string(),
+                data: two_face_collection(),
+            }],
+            Some(&directory),
+        );
+
+        let first = provider.resolve_family("Pixel Operator Mono");
+        let second = provider.resolve_family("Aileron");
+
+        assert_eq!(first.provider, FontProviderKind::Attached);
+        assert_eq!(first.face_index, None);
+        assert_eq!(second.provider, FontProviderKind::Attached);
+        assert_eq!(second.face_index, Some(1));
+        assert_eq!(second.path, first.path);
+        fs::remove_dir_all(directory).expect("attachment fixture should clean up");
+    }
+
+    #[test]
+    fn attached_provider_selects_collection_face_with_required_glyphs() {
+        let directory = unique_test_directory("attached-font-collection-coverage");
+        let provider = AttachedFontProvider::from_attachments_in_dir(
+            &[FontAttachment {
+                name: "fixture.ttc".to_string(),
+                data: two_face_collection(),
+            }],
+            Some(&directory),
+        );
+
+        let query = FontQuery::new("Aileron");
+        let unsupported = provider.resolve_for_text(&query, "\u{1f600}");
+        let supported = provider.resolve_for_text(&query, "Hello");
+
+        assert!(unsupported.path.is_none());
+        assert_eq!(supported.face_index, Some(1));
+        fs::remove_dir_all(directory).expect("attachment fixture should clean up");
+    }
+
+    #[test]
+    fn directory_provider_indexes_only_usable_non_hidden_fonts() {
+        let system = FontconfigProvider::new().resolve(&FontQuery::new("sans"));
+        let source = system.path.expect("system font path should exist");
+        let directory = unique_test_directory("font-directory");
+        fs::create_dir_all(&directory).expect("font directory should be creatable");
+        let copied = directory.join("fixture-without-extension");
+        fs::copy(&source, &copied).expect("font fixture should copy");
+        fs::write(directory.join("not-a-font.txt"), b"not a font")
+            .expect("invalid fixture should write");
+        fs::write(directory.join(".hidden-invalid"), b"not a font")
+            .expect("hidden fixture should write");
+
+        let (provider, issues) = DirectoryFontProvider::scan(&directory);
+        let result = provider.resolve(&FontQuery::new(&system.family));
+
+        assert_eq!(result.provider, FontProviderKind::Attached);
+        assert_eq!(result.path, Some(copied));
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].path.ends_with("not-a-font.txt"));
+        fs::remove_dir_all(&directory).expect("font fixture should clean up");
+    }
+
+    #[test]
+    fn directory_provider_uses_legacy_family_instead_of_typographic_family() {
+        let directory = unique_test_directory("directory-family-alias");
+        fs::create_dir_all(&directory).expect("font directory should be creatable");
+        let copied = directory.join("unrelated-name.data");
+        fs::write(
+            &copied,
+            font_with_distinct_typographic_and_legacy_families(),
+        )
+        .expect("mutated font fixture should write");
+
+        let (provider, issues) = DirectoryFontProvider::scan(&directory);
+        let legacy = provider.resolve(&FontQuery::new("Aileron"));
+        let typographic = provider.resolve(&FontQuery::new("Aileron-Regular"));
+
+        assert!(issues.is_empty(), "font should be usable: {issues:?}");
+        assert_eq!(legacy.provider, FontProviderKind::Attached);
+        assert_eq!(legacy.family, "Aileron");
+        assert_eq!(legacy.path, Some(copied));
+        assert!(typographic.path.is_none());
+        fs::remove_dir_all(directory).expect("font fixture should clean up");
+    }
+
+    #[test]
+    fn windows_family_names_exclude_other_platform_aliases() {
+        let data = font_with_conflicting_unicode_family_alias();
+        let face = ttf_parser::Face::parse(&data, 0).expect("mutated font should parse");
+
+        let windows = windows_font_names(&face, ttf_parser::name_id::FAMILY);
+        assert_eq!(windows, vec!["Aileron"]);
+        let metadata = font_face_metadata(&face).expect("font metadata should parse");
+        assert_eq!(
+            metadata.aliases.family,
+            vec![font_name_match_key("Aileron")]
+        );
+    }
+
+    #[test]
+    fn local_family_matching_preserves_spaces_and_non_ascii_case() {
+        let fonts = [synthetic_directory_record(
+            "legacy.ttf",
+            &["Legacy Family"],
+            &[],
+            &[],
+            false,
+        )];
+
+        assert!(select_local_font(&fonts, "legacy family", None, None).is_some());
+        assert!(select_local_font(&fonts, "LegacyFamily", None, None).is_none());
+
+        let unicode_fonts = [synthetic_directory_record(
+            "unicode.ttf",
+            &["Ä Family"],
+            &[],
+            &[],
+            false,
+        )];
+        assert!(select_local_font(&unicode_fonts, "ä Family", None, None).is_none());
+    }
+
+    #[test]
+    fn local_font_selection_does_not_match_attachment_filename() {
+        let directory = unique_test_directory("attachment-filename-non-alias");
+        let provider = AttachedFontProvider::from_attachments_in_dir(
+            &[FontAttachment {
+                name: "FilenameAlias.ttf".to_string(),
+                data: fs::read(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+                )
+                .expect("font fixture should read"),
+            }],
+            Some(&directory),
+        );
+
+        assert!(provider.resolve_family("FilenameAlias").path.is_none());
+        assert!(provider.resolve_family("Aileron").path.is_some());
+        fs::remove_dir_all(directory).expect("attachment fixture should clean up");
+    }
+
+    #[test]
+    fn local_font_selection_honors_provider_order_for_full_name_score_zero() {
+        let fonts = [
+            synthetic_directory_record(
+                "full-name-first.otf",
+                &["Other"],
+                &["Requested"],
+                &[],
+                false,
+            ),
+            synthetic_directory_record("family-second.otf", &["Requested"], &[], &[], false),
+        ];
+
+        let selected =
+            select_local_font(&fonts, "Requested", None, None).expect("font should resolve");
+
+        assert_eq!(selected.path, PathBuf::from("full-name-first.otf"));
+    }
+
+    #[test]
+    fn full_and_postscript_fallback_respects_outline_type_like_libass() {
+        let truetype = synthetic_directory_record(
+            "truetype.ttf",
+            &["TrueType Family"],
+            &["TrueType Full"],
+            &["TrueType-PostScript"],
+            false,
+        );
+        let postscript = synthetic_directory_record(
+            "postscript.otf",
+            &["PostScript Family"],
+            &["PostScript Full"],
+            &["PostScript-Name"],
+            true,
+        );
+
+        assert!(
+            select_local_font(std::slice::from_ref(&truetype), "TrueType Full", None, None,)
+                .is_some()
+        );
+        assert!(
+            select_local_font(
+                std::slice::from_ref(&truetype),
+                "TrueType-PostScript",
+                None,
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            select_local_font(
+                std::slice::from_ref(&postscript),
+                "PostScript-Name",
+                None,
+                None,
+            )
+            .is_some()
+        );
+        assert!(
+            select_local_font(
+                std::slice::from_ref(&postscript),
+                "PostScript Full",
+                None,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn directory_provider_resolves_full_and_postscript_names_like_libass() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rassa-test/fixtures/libass/compare/test");
+        let directory = unique_test_directory("directory-full-postscript");
+        fs::create_dir_all(&directory).expect("font directory should be creatable");
+        let truetype = directory.join("truetype.data");
+        let postscript = directory.join("postscript.data");
+        fs::copy(fixture_root.join("font1.ttf"), &truetype).expect("TrueType fixture should copy");
+        fs::copy(fixture_root.join("font2.otf"), &postscript)
+            .expect("PostScript fixture should copy");
+
+        let (provider, issues) = DirectoryFontProvider::scan(&directory);
+        let truetype_full = provider.resolve_family("Pixel Operator Mono Bold");
+        let truetype_postscript = provider.resolve_family("PixelOperatorMono-Bold");
+        let postscript_name = provider.resolve_family("Aileron-Regular");
+
+        assert!(issues.is_empty(), "fonts should be usable: {issues:?}");
+        assert_eq!(truetype_full.path, Some(truetype));
+        assert!(truetype_postscript.path.is_none());
+        assert_eq!(postscript_name.path, Some(postscript));
+        fs::remove_dir_all(directory).expect("font fixtures should clean up");
+    }
+
+    #[test]
+    fn directory_provider_decodes_legacy_windows_family_names_as_utf16be() {
+        let source =
+            Path::new("/tmp/rassa-libass-tests/regression/.fonts/shiftjis_Reishoreiryu.ttf");
+        if !source.is_file() {
+            eprintln!("skipping: compatible_0.17.5 Shift-JIS fixture is unavailable");
+            return;
+        }
+        let directory = unique_test_directory("legacy-windows-name");
+        fs::create_dir_all(&directory).expect("font directory should be creatable");
+        let copied = directory.join("shiftjis.ttf");
+        fs::copy(source, &copied).expect("legacy font fixture should copy");
+
+        let (provider, issues) = DirectoryFontProvider::scan(&directory);
+        let result = provider.resolve(&FontQuery::new("麗流隷書"));
+
+        assert!(
+            issues.is_empty(),
+            "legacy face should be usable: {issues:?}"
+        );
+        assert_eq!(result.path, Some(copied));
+        fs::remove_dir_all(&directory).expect("font fixture should clean up");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn fontconfig_provider_scopes_queries_to_custom_config() {
+        let system = FontconfigProvider::new().resolve(&FontQuery::new("sans"));
+        let source = system.path.expect("system font path should exist");
+        let directory = unique_test_directory("fontconfig");
+        let font_directory = directory.join("fonts");
+        fs::create_dir_all(&font_directory).expect("font directory should be creatable");
+        let copied = font_directory.join("configured-font.ttf");
+        fs::copy(&source, &copied).expect("font fixture should copy");
+        let config = directory.join("fonts.conf");
+        fs::write(
+            &config,
+            format!(
+                "<?xml version=\"1.0\"?><!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\"><fontconfig><dir>{}</dir></fontconfig>",
+                font_directory.display()
+            ),
+        )
+        .expect("fontconfig fixture should write");
+
+        validate_fontconfig_config(&config).expect("custom fontconfig should be usable");
+        let provider = FontconfigProvider::with_config(config.clone());
+        let result = provider.resolve(&FontQuery::new(&system.family));
+
+        assert_eq!(
+            result
+                .path
+                .as_deref()
+                .and_then(|path| path.canonicalize().ok()),
+            copied.canonicalize().ok()
+        );
+        fs::remove_dir_all(&directory).expect("fontconfig fixture should clean up");
     }
 
     #[test]

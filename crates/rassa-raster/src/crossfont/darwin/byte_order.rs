@@ -1,5 +1,3 @@
-//! Constants for bitmap byte order.
-
 #![allow(non_upper_case_globals)]
 pub const kCGBitmapByteOrder32Little: u32 = 2 << 12;
 pub const kCGBitmapByteOrder32Big: u32 = 4 << 12;

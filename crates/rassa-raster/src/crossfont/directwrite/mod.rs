@@ -1,4 +1,3 @@
-//! Rasterization powered by DirectWrite.
 #![allow(deprecated)]
 
 use std::borrow::Cow;
@@ -25,11 +24,9 @@ use super::{
     Weight,
 };
 
-/// DirectWrite uses 0 for missing glyph symbols.
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/recom#glyph-0-the-notdef-glyph
+/// Missing-glyph index is 0: https://docs.microsoft.com/en-us/typography/opentype/spec/recom#glyph-0-the-notdef-glyph
 const MISSING_GLYPH_INDEX: u16 = 0;
 
-/// Cached DirectWrite font.
 struct Font {
     face: FontFace,
     family_name: String,
@@ -102,10 +99,7 @@ impl DirectWriteRasterizer {
             }
         }
 
-        // Headless Windows runners can report a ClearType rendering mode but return an
-        // empty ClearType alpha texture. Build a fresh aliased analysis instead of
-        // reusing the ClearType analysis, then require real non-zero coverage before
-        // treating the glyph as rendered.
+        // Headless ClearType can return an empty texture; rebuild aliased analysis and require coverage.
         let aliased_analysis = GlyphRunAnalysis::create(
             &glyph_run,
             1.,
@@ -137,10 +131,7 @@ impl DirectWriteRasterizer {
             }
         }
 
-        // Some valid spacing glyphs (for example U+0020 shaped by glyph id) have no
-        // outline coverage. Return an empty glyph so one space does not make the
-        // whole run fail; higher-level smoke tests still catch runs where every
-        // printable glyph has zero coverage.
+        // Spacing glyphs (e.g. U+0020) can have no coverage; return empty instead of failing the run.
         Ok(RasterizedGlyph {
             character,
             width: 0,
@@ -269,7 +260,6 @@ impl crate::crossfont::Rasterize for DirectWriteRasterizer {
     }
 
     fn load_font(&mut self, desc: &FontDesc, _size: Size) -> Result<FontKey, Error> {
-        // Fast path if face is already loaded.
         if let Some(key) = self.keys.get(desc) {
             return Ok(*key);
         }
@@ -282,8 +272,7 @@ impl crate::crossfont::Rasterize for DirectWriteRasterizer {
         let font =
             match desc.style {
                 Style::Description { weight, slant } => {
-                    // This searches for the "best" font - should mean we don't have to worry about
-                    // fallbacks if our exact desired weight/style isn't available.
+                    // Best-match font; exact weight/style may not exist.
                     Ok(family.get_first_matching_font(
                         weight.into(),
                         FontStretch::Normal,
@@ -428,13 +417,12 @@ fn get_current_locale() -> String {
     let len =
         unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), buffer.len() as i32) as usize };
 
-    // `len` includes null byte, which we don't need in Rust.
+    // GetUserDefaultLocaleName length includes the trailing NUL.
     OsString::from_wide(&buffer[..len - 1])
         .into_string()
         .expect("Locale not valid unicode")
 }
 
-/// Font fallback information for dwrote's TextAnalysisSource.
 struct TextAnalysisSourceData<'a> {
     locale: &'a str,
     length: u32,
@@ -464,9 +452,7 @@ enum SubpixelLayout {
 }
 
 fn normalize_cleartype_layout(mut bytes: Vec<u8>) -> Vec<u8> {
-    // DirectWrite returns ClearType samples in RGB order by default. Some LCD panels
-    // use BGR subpixel geometry; normalize the texture to the user's configured or
-    // auto-detected physical layout before handing it to the renderer.
+    // ClearType samples are RGB; swap to BGR when that is the configured layout.
     if configured_subpixel_layout() == SubpixelLayout::Bgr {
         for pixel in bytes.chunks_exact_mut(3) {
             pixel.swap(0, 2);
@@ -476,8 +462,7 @@ fn normalize_cleartype_layout(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 fn configured_subpixel_layout() -> SubpixelLayout {
-    // Keep the existing explicit override for embedders and tests. `auto` (and an
-    // unset value) uses Windows' per-display ClearType registry keys.
+    // RASSA_CROSSFONT_WINDOWS_SUBPIXEL overrides; auto/unset reads the ClearType registry.
     if let Some(layout) = std::env::var_os("RASSA_CROSSFONT_WINDOWS_SUBPIXEL")
         .and_then(|value| value.into_string().ok())
         .and_then(|value| match value.to_ascii_lowercase().as_str() {
@@ -494,11 +479,7 @@ fn configured_subpixel_layout() -> SubpixelLayout {
 }
 
 fn registry_subpixel_layout() -> Option<SubpixelLayout> {
-    // WPF/DirectWrite stores ClearType tuning under one key per display, for
-    // example `DISPLAY1` and `DISPLAY2`. The rasterizer has no window or monitor
-    // handle, so choose BGR if any configured display reports BGR; otherwise RGB
-    // if at least one display reports RGB. Unknown/flat/missing values fall back
-    // to DirectWrite's default RGB order.
+    // No monitor handle: BGR if any display is BGR, else RGB if any is RGB.
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let graphics = hkcu
         .open_subkey("Software\\Microsoft\\Avalon.Graphics")
@@ -524,7 +505,7 @@ fn registry_subpixel_layout() -> Option<SubpixelLayout> {
 
 fn layout_from_registry_pixel_structure(value: u32) -> Option<SubpixelLayout> {
     match value {
-        // Windows stores `0` for flat/no subpixel AA, `1` for RGB, and `2` for BGR.
+        // Registry PixelStructure: 0 flat, 1 RGB, 2 BGR.
         1 => Some(SubpixelLayout::Rgb),
         2 => Some(SubpixelLayout::Bgr),
         _ => None,
