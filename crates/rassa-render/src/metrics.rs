@@ -279,6 +279,64 @@ pub(crate) fn rendered_text_alignment_width(
     width
 }
 
+/// Unrounded device-space line advance used by positioned text rasterization.
+///
+/// Collision/layout compatibility still uses the integer helper above.  The
+/// exact companion prevents a centred `\an5` line from changing its origin by
+/// a whole pixel when a slowly animated `\fscx` crosses a bitmap-size rounding
+/// threshold.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rendered_text_alignment_width_exact(
+    line: &rassa_layout::LayoutLine,
+    source_event: Option<&ParsedEvent>,
+    now_ms: i64,
+    track: &ParsedTrack,
+    config: &RendererConfig,
+    render_scale: RenderScale,
+    font_scale: f64,
+) -> f64 {
+    let mut width = 0.0_f64;
+    for run in &line.runs {
+        if run.drawing.is_some() {
+            width += f64::from(run.width) * style_scale(render_scale.x);
+            continue;
+        }
+        if run.glyphs.is_empty() {
+            continue;
+        }
+        let effective_style = apply_renderer_style_scale(
+            resolve_run_style(run, source_event, now_ms),
+            track,
+            config,
+            font_scale,
+            render_scale,
+        );
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: (effective_style.font_size.max(1.0) * 64.0).round() as i32,
+            hinting: config.hinting,
+        });
+        let position_scale = shaped_position_render_scale(run, &effective_style, render_scale);
+        let glyph_infos = scale_glyph_infos(&run.glyphs, position_scale.0, position_scale.1);
+        let Ok(raster_glyphs) = rasterizer.rasterize_glyphs(&run.font, &glyph_infos) else {
+            width += f64::from(run.width) * font_scale * style_scale(render_scale.x);
+            continue;
+        };
+        let raster_glyphs = apply_vertical_font_raster_advances(
+            raster_glyphs,
+            &glyph_infos,
+            &effective_style,
+            &run.font,
+        );
+        let scale_x = style_scale(effective_style.scale_x * effective_pixel_aspect(track, config));
+        let spacing = f64::from(text_spacing_advance_26_6(&effective_style)) / 64.0;
+        width += raster_glyphs
+            .iter()
+            .map(|glyph| f64::from(glyph.advance_x_26_6) / 64.0 * scale_x + spacing)
+            .sum::<f64>();
+    }
+    if width.is_finite() { width } else { 0.0 }
+}
+
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 pub(crate) fn font_vertical_metrics(
     font: &FontMatch,

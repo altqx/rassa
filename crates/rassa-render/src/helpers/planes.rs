@@ -667,3 +667,75 @@ pub(crate) fn combined_image_plane_from_glyphs_xy(
         bitmap,
     })
 }
+
+/// Composite glyphs whose outline-space rasterization already resolved their
+/// absolute libass-style Q8 position. Blur is intentionally applied only
+/// after the run is combined, matching `render_and_combine_glyphs`.
+pub(crate) fn combined_image_plane_from_positioned_glyphs(
+    glyphs: &[PositionedRasterGlyph],
+    color: u32,
+    kind: ass::ImageType,
+    blur: BitmapBlur,
+) -> Option<ImagePlane> {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for positioned in glyphs {
+        let glyph = &positioned.glyph;
+        if glyph.width <= 0 || glyph.height <= 0 || glyph.bitmap.is_empty() {
+            continue;
+        }
+        min_x = min_x.min(positioned.destination.x);
+        min_y = min_y.min(positioned.destination.y);
+        max_x = max_x.max(positioned.destination.x.saturating_add(glyph.width));
+        max_y = max_y.max(positioned.destination.y.saturating_add(glyph.height));
+    }
+    if min_x == i32::MAX || min_y == i32::MAX || max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    let width = usize::try_from(max_x - min_x).ok()?;
+    let height = usize::try_from(max_y - min_y).ok()?;
+    let mut bitmap = vec![0_u8; width.checked_mul(height)?];
+    for positioned in glyphs {
+        let glyph = &positioned.glyph;
+        if glyph.width <= 0 || glyph.height <= 0 || glyph.stride <= 0 || glyph.bitmap.is_empty() {
+            continue;
+        }
+        let x0 = usize::try_from(positioned.destination.x - min_x).ok()?;
+        let y0 = usize::try_from(positioned.destination.y - min_y).ok()?;
+        let glyph_width = usize::try_from(glyph.width).ok()?;
+        let glyph_height = usize::try_from(glyph.height).ok()?;
+        let glyph_stride = usize::try_from(glyph.stride).ok()?;
+        for y in 0..glyph_height {
+            for x in 0..glyph_width {
+                let source = glyph
+                    .bitmap
+                    .get(y.checked_mul(glyph_stride)?.checked_add(x)?)?;
+                let target = bitmap.get_mut(
+                    (y0 + y)
+                        .checked_mul(width)?
+                        .checked_add(x0.checked_add(x)?)?,
+                )?;
+                *target = target.saturating_add(*source);
+            }
+        }
+    }
+
+    let (bitmap, width, height, pad_x, pad_y) = blur_bitmap_xy(bitmap, width, height, blur);
+    Some(ImagePlane {
+        size: Size {
+            width: i32::try_from(width).ok()?,
+            height: i32::try_from(height).ok()?,
+        },
+        stride: i32::try_from(width).ok()?,
+        color: rgba_color_from_ass(color),
+        destination: Point {
+            x: min_x.saturating_sub(i32::try_from(pad_x).ok()?),
+            y: min_y.saturating_sub(i32::try_from(pad_y).ok()?),
+        },
+        kind,
+        bitmap,
+    })
+}

@@ -18,7 +18,7 @@ use freetype::{
 };
 
 use crate::crossfont::{BitmapBuffer, FontDesc, GlyphIdKey, Rasterize, Size, Style};
-use rassa_core::{RassaError, RassaResult, ass};
+use rassa_core::{Point, RassaError, RassaResult, ass};
 use rassa_fonts::{FontMatch, FontProviderKind};
 use rassa_shape::{GlyphInfo, GlyphPositioning, ShapedRun, font_bytes_identity};
 
@@ -66,6 +66,49 @@ pub struct RasterGlyph {
 pub struct RasterOptions {
     pub size_26_6: i32,
     pub hinting: ass::Hinting,
+}
+
+/// Quantized affine transform applied to a glyph outline before rasterization.
+///
+/// ASS text animation needs the scale and the subpixel translation to be part
+/// of the raster-cache identity.  Keeping the representation integral also
+/// makes cache hits deterministic across platforms and floating-point modes.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct RasterOutlineTransform {
+    /// Horizontal outline scale in signed 16.16 fixed point.
+    pub scale_x_16_16: i32,
+    /// Vertical outline scale in signed 16.16 fixed point.
+    pub scale_y_16_16: i32,
+    /// Horizontal translation in FreeType 26.6 outline coordinates.
+    pub translate_x_26_6: i32,
+    /// Vertical translation in FreeType 26.6 outline coordinates (y up).
+    pub translate_y_26_6: i32,
+}
+
+impl RasterOutlineTransform {
+    pub const IDENTITY_SCALE_16_16: i32 = 1 << 16;
+}
+
+impl Default for RasterOutlineTransform {
+    fn default() -> Self {
+        Self {
+            scale_x_16_16: Self::IDENTITY_SCALE_16_16,
+            scale_y_16_16: Self::IDENTITY_SCALE_16_16,
+            translate_x_26_6: 0,
+            translate_y_26_6: 0,
+        }
+    }
+}
+
+/// A transformed glyph bitmap together with its absolute output destination.
+///
+/// The integer destination is deliberately kept out of the glyph-cache key.
+/// Only the restored outline matrix and its 1/8-pixel phase affect coverage;
+/// moving the same bitmap by whole pixels must remain a cache hit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PositionedRasterGlyph {
+    pub glyph: RasterGlyph,
+    pub destination: Point,
 }
 
 impl Default for RasterOptions {
@@ -161,6 +204,7 @@ struct GlyphCacheKey {
     glyph_id: u32,
     size_26_6: i32,
     hinting: ass::Hinting,
+    outline_transform: Option<RasterOutlineTransform>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -236,6 +280,58 @@ impl Rasterizer {
         glyphs: &[GlyphInfo],
     ) -> RassaResult<Vec<RasterGlyph>> {
         rasterize_system_glyphs(font, glyphs, self.options)
+    }
+
+    /// Rasterize a positioned identity-transform ASS run in outline space.
+    ///
+    /// `baseline_positions` are absolute output-space glyph origins after
+    /// shaped offsets have been applied.  The implementation mirrors
+    /// libass's `quantize_transform`: it restores a cbox-dependent scale,
+    /// quantizes the transformed cbox centre to 1/8 pixel, and carries the
+    /// first glyph's residual through the rest of this composite/style run.
+    /// This keeps slow `\pos` + `\fscx/\fscy` animation smooth without
+    /// resampling an already rasterized (and possibly blurred) bitmap.
+    pub fn rasterize_positioned_identity_glyphs(
+        &self,
+        _font: &FontMatch,
+        glyphs: &[GlyphInfo],
+        baseline_positions: &[(f64, f64)],
+        scale_x: f64,
+        scale_y: f64,
+    ) -> RassaResult<Vec<PositionedRasterGlyph>> {
+        if glyphs.len() != baseline_positions.len() {
+            return Err(RassaError::new(
+                "glyph and positioned-origin counts do not match",
+            ));
+        }
+        if !(scale_x.is_finite() && scale_x > 0.0 && scale_y.is_finite() && scale_y > 0.0) {
+            return Err(RassaError::new("invalid outline transform scale"));
+        }
+        // The exact path below mirrors libass's unhinted `fix_glyph_scaling`
+        // pipeline. Hinted rendering loads the face at a scale-dependent size
+        // and needs a different matrix normalization, so reject it explicitly
+        // instead of exposing subtly incorrect public behavior.
+        if self.options.hinting != ass::Hinting::None {
+            return Err(RassaError::new(
+                "outline-space positioned rasterization requires unhinted glyphs",
+            ));
+        }
+
+        #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+        if _font.path.is_some() {
+            return rasterize_freetype_positioned_identity_glyphs(
+                _font,
+                glyphs,
+                baseline_positions,
+                scale_x,
+                scale_y,
+                self.options,
+            );
+        }
+
+        Err(RassaError::new(
+            "outline-space glyph transforms are unavailable on this raster backend",
+        ))
     }
 
     pub fn rasterize_run(&self, run: &ShapedRun) -> RassaResult<Vec<RasterGlyph>> {
@@ -528,6 +624,7 @@ fn glyph_cache_key(
     font_identity: &FontCacheIdentity,
     glyph_id: u32,
     options: RasterOptions,
+    outline_transform: Option<RasterOutlineTransform>,
 ) -> GlyphCacheKey {
     let context = current_raster_cache_context();
     GlyphCacheKey {
@@ -541,6 +638,7 @@ fn glyph_cache_key(
         glyph_id,
         size_26_6: options.size_26_6,
         hinting: options.hinting,
+        outline_transform,
     }
 }
 
@@ -617,7 +715,7 @@ fn rasterize_freetype_glyphs(
     let font_identity = FontCacheIdentity::from(font);
     let cache_keys = glyphs
         .iter()
-        .map(|glyph| glyph_cache_key(font, &font_identity, glyph.glyph_id, options))
+        .map(|glyph| glyph_cache_key(font, &font_identity, glyph.glyph_id, options, None))
         .collect::<Vec<_>>();
     let mut cached_glyphs = {
         let mut cache = lock_glyph_cache();
@@ -694,6 +792,232 @@ fn rasterize_freetype_glyphs(
         let context = current_raster_cache_context();
         lock_glyph_cache().insert(cache_key, cache_entry.clone(), context.limits);
         rasterized.push(glyph_from_cache(glyph, cache_entry));
+    }
+
+    Ok(rasterized)
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn rasterize_freetype_positioned_identity_glyphs(
+    font: &FontMatch,
+    glyphs: &[GlyphInfo],
+    baseline_positions: &[(f64, f64)],
+    requested_scale_x: f64,
+    requested_scale_y: f64,
+    options: RasterOptions,
+) -> RassaResult<Vec<PositionedRasterGlyph>> {
+    let font_identity = FontCacheIdentity::from(font);
+    let font_path = font
+        .path
+        .as_ref()
+        .ok_or_else(|| RassaError::new(format!("font '{}' is unresolved", font.family)))?;
+    let library = Library::init()
+        .map_err(|error| RassaError::new(format!("freetype init failed: {error:?}")))?;
+    let mut face = library
+        .new_face(font_path, font.face_index.unwrap_or(0) as isize)
+        .map_err(|error| {
+            RassaError::new(format!(
+                "failed to load font '{}': {error:?}",
+                font_path.display()
+            ))
+        })?;
+    // libass's unhinted path shapes/rasterizes a 256px outline and folds the
+    // requested font size into the bitmap transform (`fix_glyph_scaling`).
+    // Loading directly at the final 50–60px size changes cbox-dependent matrix
+    // buckets and causes visible mass pops during tiny scale animation.
+    let outline_size_26_6 = 256 * 64;
+    request_real_dim_size(&mut face, outline_size_26_6)?;
+    apply_synthetic_style_transform(&face, font.synthetic_italic);
+
+    let size_factor = f64::from(options.size_26_6.max(64)) / f64::from(256 * 64);
+    let requested_scale_x = requested_scale_x * size_factor;
+    let requested_scale_y = requested_scale_y * size_factor;
+    let cache_options = RasterOptions {
+        size_26_6: outline_size_26_6,
+        hinting: options.hinting,
+    };
+
+    let mut rasterized = Vec::with_capacity(glyphs.len());
+    let mut load_flags = load_flags_for_hinting(options.hinting);
+    load_flags.remove(LoadFlag::RENDER);
+    let mut run_offset_q8 = None::<(f64, f64)>;
+    for (glyph, &(baseline_x, baseline_y)) in glyphs.iter().zip(baseline_positions) {
+        face.load_glyph(glyph.glyph_id, load_flags)
+            .map_err(|error| {
+                RassaError::new(format!(
+                    "failed to load glyph {}: {error:?}",
+                    glyph.glyph_id
+                ))
+            })?;
+        let slot = face.glyph();
+        maybe_embolden_slot(slot, font.synthetic_bold);
+        let advance = slot.advance();
+        let vert_advance = slot.metrics().vertAdvance as i32;
+        let raw_slot = slot.raw() as *const ffi::FT_GlyphSlotRec as *mut ffi::FT_GlyphSlotRec;
+        if unsafe { (*raw_slot).format } != ffi::FT_GLYPH_FORMAT_OUTLINE {
+            return Err(RassaError::new(format!(
+                "glyph {} does not expose a transformable outline",
+                glyph.glyph_id
+            )));
+        }
+        if unsafe { (*raw_slot).outline.n_points } <= 0
+            || unsafe { (*raw_slot).outline.n_contours } <= 0
+        {
+            continue;
+        }
+
+        let mut cbox = ffi::FT_BBox {
+            xMin: 0,
+            yMin: 0,
+            xMax: 0,
+            yMax: 0,
+        };
+        unsafe {
+            // libass's bitmap key uses the constructed outline control box,
+            // not the raster ink box. FreeType's CBox is the equivalent for
+            // the loaded, synthetic-style-adjusted outline.
+            ffi::FT_Outline_Get_CBox(&(*raw_slot).outline, &mut cbox);
+        }
+        let centre_x = (cbox.xMin as f64 + cbox.xMax as f64) * 0.5;
+        let centre_y = (cbox.yMin as f64 + cbox.yMax as f64) * 0.5;
+        let radius_x = (cbox.xMax as f64 - cbox.xMin as f64) * 0.5 + 64.0;
+        let radius_y = (cbox.yMax as f64 - cbox.yMin as f64) * 0.5 + 64.0;
+        if !(radius_x.is_finite() && radius_x > 0.0 && radius_y.is_finite() && radius_y > 0.0) {
+            return Err(RassaError::new(format!(
+                "glyph {} has an invalid outline cbox",
+                glyph.glyph_id
+            )));
+        }
+
+        // POSITION_PRECISION is 8 D6 units in libass. Quantize each diagonal
+        // matrix coefficient relative to this glyph's cbox radius, then
+        // restore the canonical scale stored by the bitmap cache.
+        let qm_x = (requested_scale_x * radius_x / 8.0).round_ties_even();
+        let qm_y = (requested_scale_y * radius_y / 8.0).round_ties_even();
+        let restored_scale_x = qm_x * 8.0 / radius_x;
+        let restored_scale_y = qm_y * 8.0 / radius_y;
+        if !(restored_scale_x.is_finite()
+            && restored_scale_x > 0.0
+            && restored_scale_y.is_finite()
+            && restored_scale_y > 0.0)
+        {
+            return Err(RassaError::new(format!(
+                "glyph {} has an invalid restored outline scale",
+                glyph.glyph_id
+            )));
+        }
+
+        // FreeType uses y-up outlines while output positions use screen y
+        // down, hence the subtraction on the transformed vertical centre.
+        // render_and_combine_glyphs first applies double_to_d6 to the global
+        // glyph position, before the outline cbox centre enters the matrix.
+        let baseline_x_d6 = (baseline_x * 64.0).round_ties_even();
+        let baseline_y_d6 = (baseline_y * 64.0).round_ties_even();
+        let centre_global_x_d6 = baseline_x_d6 + requested_scale_x * centre_x;
+        let centre_global_y_d6 = baseline_y_d6 - requested_scale_y * centre_y;
+        let centre_q8 = (centre_global_x_d6 / 8.0, centre_global_y_d6 / 8.0);
+        let offset = run_offset_q8.unwrap_or((0.0, 0.0));
+        let qr_x_f = (centre_q8.0 - offset.0).round_ties_even();
+        let qr_y_f = (centre_q8.1 - offset.1).round_ties_even();
+        if !(qr_x_f.is_finite()
+            && qr_y_f.is_finite()
+            && qr_x_f >= f64::from(i32::MIN)
+            && qr_x_f <= f64::from(i32::MAX)
+            && qr_y_f >= f64::from(i32::MIN)
+            && qr_y_f <= f64::from(i32::MAX))
+        {
+            return Err(RassaError::new("positioned glyph centre is out of range"));
+        }
+        let qr_x = qr_x_f as i32;
+        let qr_y = qr_y_f as i32;
+        if run_offset_q8.is_none() {
+            run_offset_q8 = Some((centre_q8.0 - qr_x_f, centre_q8.1 - qr_y_f));
+        }
+        let phase_x_d6 = qr_x.rem_euclid(8) * 8;
+        let phase_y_d6 = qr_y.rem_euclid(8) * 8;
+
+        let to_fixed_16_16 = |value: f64| -> Option<i32> {
+            let fixed = (value * 65536.0).round_ties_even();
+            (fixed.is_finite() && fixed >= f64::from(i32::MIN) && fixed <= f64::from(i32::MAX))
+                .then_some(fixed as i32)
+        };
+        let to_d6 = |value: f64| -> Option<i32> {
+            let fixed = value.round_ties_even();
+            (fixed.is_finite() && fixed >= f64::from(i32::MIN) && fixed <= f64::from(i32::MAX))
+                .then_some(fixed as i32)
+        };
+        let transform = RasterOutlineTransform {
+            scale_x_16_16: to_fixed_16_16(restored_scale_x)
+                .ok_or_else(|| RassaError::new("horizontal outline scale is out of range"))?,
+            scale_y_16_16: to_fixed_16_16(restored_scale_y)
+                .ok_or_else(|| RassaError::new("vertical outline scale is out of range"))?,
+            translate_x_26_6: to_d6(f64::from(phase_x_d6) - restored_scale_x * centre_x)
+                .ok_or_else(|| RassaError::new("horizontal outline phase is out of range"))?,
+            // Put the y-up outline centre at the negative screen-space phase.
+            translate_y_26_6: to_d6(-f64::from(phase_y_d6) - restored_scale_y * centre_y)
+                .ok_or_else(|| RassaError::new("vertical outline phase is out of range"))?,
+        };
+        let cache_key = glyph_cache_key(
+            font,
+            &font_identity,
+            glyph.glyph_id,
+            cache_options,
+            Some(transform),
+        );
+        if let Some(cached) = lock_glyph_cache().get(&cache_key) {
+            let destination = Point {
+                x: qr_x.div_euclid(8).saturating_add(cached.left),
+                y: qr_y.div_euclid(8).saturating_sub(cached.top),
+            };
+            rasterized.push(PositionedRasterGlyph {
+                glyph: cached,
+                destination,
+            });
+            continue;
+        }
+
+        let matrix = ffi::FT_Matrix {
+            xx: transform.scale_x_16_16.into(),
+            xy: 0,
+            yx: 0,
+            yy: transform.scale_y_16_16.into(),
+        };
+        unsafe {
+            ffi::FT_Outline_Transform(&(*raw_slot).outline, &matrix);
+            ffi::FT_Outline_Translate(
+                &(*raw_slot).outline,
+                transform.translate_x_26_6.into(),
+                transform.translate_y_26_6.into(),
+            );
+        }
+        let rendered = render_slot_to_gray_bitmap(slot, glyph.glyph_id)?;
+        let cache_entry = RasterGlyph {
+            glyph_id: glyph.glyph_id,
+            width: rendered.width,
+            height: rendered.height,
+            stride: rendered.stride,
+            left: rendered.left,
+            top: rendered.top,
+            offset_y: rendered.offset_y,
+            offset_y_26_6: rendered.offset_y * 64,
+            advance_x: (advance.x >> 6) as i32,
+            advance_y: (advance.y >> 6) as i32,
+            advance_x_26_6: advance.x as i32,
+            advance_y_26_6: advance.y as i32,
+            vert_advance_26_6: vert_advance,
+            pixel_mode: RasterPixelMode::Gray,
+            bitmap: rendered.bitmap,
+            ..RasterGlyph::default()
+        };
+        let context = current_raster_cache_context();
+        lock_glyph_cache().insert(cache_key, cache_entry.clone(), context.limits);
+        rasterized.push(PositionedRasterGlyph {
+            destination: Point {
+                x: qr_x.div_euclid(8).saturating_add(cache_entry.left),
+                y: qr_y.div_euclid(8).saturating_sub(cache_entry.top),
+            },
+            glyph: cache_entry,
+        });
     }
 
     Ok(rasterized)
@@ -780,7 +1104,7 @@ fn rasterize_system_glyphs(
     let font_identity = FontCacheIdentity::from(font);
     let mut rasterized = Vec::with_capacity(glyphs.len());
     for glyph in glyphs {
-        let cache_key = glyph_cache_key(font, &font_identity, glyph.glyph_id, options);
+        let cache_key = glyph_cache_key(font, &font_identity, glyph.glyph_id, options, None);
         if let Some(cached) = lock_glyph_cache().get(&cache_key) {
             rasterized.push(glyph_from_cache(glyph, cached));
             continue;
@@ -1803,6 +2127,7 @@ mod tests {
             glyph_id,
             size_26_6: 16 * 64,
             hinting: ass::Hinting::None,
+            outline_transform: None,
         }
     }
 
@@ -1944,6 +2269,156 @@ mod tests {
         assert_eq!(
             glyph_cache_entries_for_run(namespace, &shaped.runs[0], rasterizer.options),
             entries_after_first
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    fn positioned_coverage_metrics(glyphs: &[PositionedRasterGlyph]) -> (f64, f64, u64) {
+        let mut mass = 0_u64;
+        let mut weighted_x = 0.0_f64;
+        let mut weighted_y = 0.0_f64;
+        for positioned in glyphs {
+            let glyph = &positioned.glyph;
+            let width = usize::try_from(glyph.width).expect("nonnegative positioned width");
+            let height = usize::try_from(glyph.height).expect("nonnegative positioned height");
+            let stride = usize::try_from(glyph.stride).expect("nonnegative positioned stride");
+            for y in 0..height {
+                for x in 0..width {
+                    let coverage = u64::from(glyph.bitmap[y * stride + x]);
+                    mass += coverage;
+                    weighted_x +=
+                        (f64::from(positioned.destination.x) + x as f64 + 0.5) * coverage as f64;
+                    weighted_y +=
+                        (f64::from(positioned.destination.y) + y as f64 + 0.5) * coverage as f64;
+                }
+            }
+        }
+        assert!(mass > 0, "positioned glyph probe must retain coverage");
+        (weighted_x / mass as f64, weighted_y / mass as f64, mass)
+    }
+
+    #[test]
+    fn positioned_identity_rejects_hinted_rasterization() {
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: 60 * 64,
+            hinting: ass::Hinting::Normal,
+        });
+        let font = FontMatch {
+            family: "hinted-positioned-probe".to_owned(),
+            path: None,
+            face_index: None,
+            style: None,
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Null,
+        };
+        let error = rasterizer
+            .rasterize_positioned_identity_glyphs(&font, &[], &[], 1.0, 1.0)
+            .expect_err("the public outline-space API must reject hinted glyphs");
+        assert!(error.message().contains("requires unhinted glyphs"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    #[test]
+    fn positioned_identity_q8_motion_reuses_integer_translated_cache_entries() {
+        let (namespace, _cache_scope) = isolated_cache_scope();
+        let font = FontMatch {
+            family: "positioned-q8-cache".to_owned(),
+            path: Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare/test/font2.otf"),
+            ),
+            face_index: Some(0),
+            style: Some("Regular".to_owned()),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            provider: FontProviderKind::Attached,
+        };
+        let shaped = ShapeEngine::new()
+            .shape_text_with_font(
+                &ShapeRequest::new("AV", &font.family)
+                    .with_font_size(60.0)
+                    .with_mode(ShapingMode::Complex),
+                &font,
+            )
+            .expect("positioned fixture should shape");
+        let glyphs = shaped
+            .runs
+            .first()
+            .expect("fixture should produce one shaping run")
+            .glyphs
+            .clone();
+        assert_eq!(glyphs.len(), 2);
+
+        let rasterizer = Rasterizer::with_options(RasterOptions {
+            size_26_6: 60 * 64,
+            hinting: ass::Hinting::None,
+        });
+        let first_advance = f64::from(glyphs[0].x_advance);
+        let mut samples = Vec::new();
+        let mut last_positions = Vec::new();
+        let mut last_scale = 1.0_f64;
+        let mut last_rasterized = Vec::new();
+        for step in 0..=16 {
+            let anchor_x = 320.25 + f64::from(step) * 0.125;
+            let anchor_y = 180.375 + f64::from(step) * 0.03125;
+            let scale = 1.0 + f64::from(step) * 0.0005;
+            let positions = vec![
+                (anchor_x, anchor_y),
+                (anchor_x + first_advance * scale, anchor_y),
+            ];
+            let rasterized = rasterizer
+                .rasterize_positioned_identity_glyphs(&font, &glyphs, &positions, scale, scale)
+                .expect("positioned outline rasterization should succeed");
+            assert_eq!(rasterized.len(), glyphs.len());
+            samples.push(positioned_coverage_metrics(&rasterized));
+            last_positions = positions;
+            last_scale = scale;
+            last_rasterized = rasterized;
+        }
+
+        for pair in samples.windows(2) {
+            let dx = pair[1].0 - pair[0].0;
+            let dy = pair[1].1 - pair[0].1;
+            let mass_step = pair[1].2 as f64 / pair[0].2 as f64 - 1.0;
+            assert!(
+                (-0.25..=0.5).contains(&dx),
+                "tiny Q8 x motion must not jump by a whole pixel: {pair:?}"
+            );
+            assert!(
+                (-0.25..=0.5).contains(&dy),
+                "tiny Q8 y motion must not jump by a whole pixel: {pair:?}"
+            );
+            assert!(
+                mass_step.abs() <= 0.01,
+                "tiny outline-scale steps must not pulse coverage mass: {pair:?}"
+            );
+        }
+
+        let entries_before_integer_shift = Rasterizer::cache_stats_for_namespace(namespace);
+        let integer_shifted_positions = last_positions
+            .iter()
+            .map(|&(x, y)| (x + 2.0, y - 1.0))
+            .collect::<Vec<_>>();
+        let integer_shifted = rasterizer
+            .rasterize_positioned_identity_glyphs(
+                &font,
+                &glyphs,
+                &integer_shifted_positions,
+                last_scale,
+                last_scale,
+            )
+            .expect("integer-translated positioned glyphs should rasterize");
+        assert_eq!(integer_shifted.len(), last_rasterized.len());
+        for (before, after) in last_rasterized.iter().zip(&integer_shifted) {
+            assert_eq!(after.glyph.bitmap, before.glyph.bitmap);
+            assert_eq!(after.destination.x, before.destination.x + 2);
+            assert_eq!(after.destination.y, before.destination.y - 1);
+        }
+        assert_eq!(
+            Rasterizer::cache_stats_for_namespace(namespace),
+            entries_before_integer_shift,
+            "whole-pixel placement must stay outside the transformed bitmap cache key"
         );
     }
 

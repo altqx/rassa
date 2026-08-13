@@ -14,7 +14,7 @@ use rassa_parse::{
     parse_dialogue_vector_clip_d6, parse_drawing_bbox_d6, parse_drawing_outline_cbox_d6,
     parse_drawing_polygons_d6,
 };
-use rassa_raster::{RasterGlyph, RasterOptions, Rasterizer};
+use rassa_raster::{PositionedRasterGlyph, RasterGlyph, RasterOptions, Rasterizer};
 use rassa_shape::{GlyphInfo, ShapingMode};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -278,6 +278,78 @@ impl RenderEngine {
             // libass's align_lines starts max_width at zero, so pathological
             // negative line advances never make the alignment block negative.
             let block_width = line_widths.iter().copied().max().unwrap_or(0).max(0);
+            // A narrowly scoped outline-space path keeps positioned, plain
+            // identity text on libass's continuous line geometry.  The
+            // legacy integer layout remains authoritative for collision and
+            // every feature the exact path does not yet model (outlines,
+            // shadows, karaoke, decoration, drawings, or 3D transforms).
+            let exact_positioned_text_layout = mapped_position_exact.and_then(|(x, y)| {
+                let [line] = event.lines.as_slice() else {
+                    return None;
+                };
+                let eligible = !line.runs.is_empty()
+                    && config.hinting == ass::Hinting::None
+                    && source_event.is_some_and(|source| {
+                        source.text.contains("\\fscx") || source.text.contains("\\fscy")
+                    })
+                    // The positioned raster API owns one libass Q8 residual
+                    // per call. Adjacent layout partitions with identical
+                    // style (for example bidi or fallback-font chunks) belong
+                    // to one composite run upstream, so leave those on the
+                    // legacy path until residual state is carried across
+                    // calls. Real style/color splits intentionally reset it.
+                    && line
+                        .runs
+                        .windows(2)
+                        .all(|pair| pair[0].style != pair[1].style)
+                    && line.runs.iter().all(|run| {
+                        if run.drawing.is_some() || run.glyphs.is_empty() || run.karaoke.is_some() {
+                            return false;
+                        }
+                        let effective_style = apply_renderer_style_scale(
+                            resolve_run_style(run, source_event, now_ms),
+                            track,
+                            config,
+                            event_font_scale,
+                            render_scale_all,
+                        );
+                        style_transform(&effective_style, effective_pixel_aspect(track, config))
+                            .is_identity()
+                            && style.border_style == 1
+                            && effective_style.border_x.abs() < f64::EPSILON
+                            && effective_style.border_y.abs() < f64::EPSILON
+                            && effective_style.shadow_x.abs() < f64::EPSILON
+                            && effective_style.shadow_y.abs() < f64::EPSILON
+                            && !effective_style.underline
+                            && !effective_style.strike_out
+                            && !effective_style.font_name.starts_with('@')
+                    });
+                if !eligible {
+                    return None;
+                }
+                let line_width = rendered_text_alignment_width_exact(
+                    line,
+                    source_event,
+                    now_ms,
+                    track,
+                    config,
+                    render_scale_all,
+                    event_font_scale,
+                )
+                .max(0.0);
+                let metric = *line_metrics.first()?;
+                let origin_x = match event.alignment & 0x3 {
+                    ass::HALIGN_LEFT => x,
+                    ass::HALIGN_RIGHT => x - line_width,
+                    _ => x - line_width * 0.5,
+                };
+                let baseline_y = match event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER) {
+                    ass::VALIGN_TOP => y + metric.asc,
+                    ass::VALIGN_CENTER => y + (metric.asc - metric.desc) * 0.5,
+                    _ => y - metric.desc,
+                };
+                (origin_x.is_finite() && baseline_y.is_finite()).then_some((origin_x, baseline_y))
+            });
             let horizontal_scroll = source_event.is_some_and(|event| {
                 event.effect.starts_with("Banner;") && transition_effect_disables_collision(event)
             });
@@ -341,6 +413,7 @@ impl RenderEngine {
                 event_right = event_right.max(origin_x + scaled_line_width);
                 let origin_x_26_6 = origin_x * 64;
                 let mut line_pen_x_26_6 = 0;
+                let mut exact_line_pen_x = 0.0_f64;
                 let mut line_border_y = 0_i32;
                 let line_is_trimmed_empty = line
                     .runs
@@ -666,6 +739,68 @@ impl RenderEngine {
                         &effective_style,
                         &run.font,
                     );
+                    if let Some((exact_line_origin_x, exact_baseline_y)) =
+                        exact_positioned_text_layout
+                    {
+                        let scale_x = style_scale(
+                            effective_style.scale_x * effective_pixel_aspect(track, config),
+                        );
+                        let scale_y = style_scale(effective_style.scale_y);
+                        let spacing = f64::from(text_spacing_advance_26_6(&effective_style)) / 64.0;
+                        let mut pen_x = 0.0_f64;
+                        let mut pen_y = 0.0_f64;
+                        let mut baseline_positions = Vec::with_capacity(raster_glyphs.len());
+                        for glyph in &raster_glyphs {
+                            let offset_x_26_6 = if glyph.offset_x_26_6 == 0 && glyph.offset_x != 0 {
+                                glyph.offset_x.saturating_mul(64)
+                            } else {
+                                glyph.offset_x_26_6
+                            };
+                            let offset_y_26_6 = if glyph.offset_y_26_6 == 0 && glyph.offset_y != 0 {
+                                glyph.offset_y.saturating_mul(64)
+                            } else {
+                                glyph.offset_y_26_6
+                            };
+                            baseline_positions.push((
+                                exact_line_origin_x
+                                    + exact_line_pen_x
+                                    + pen_x
+                                    + f64::from(offset_x_26_6) / 64.0 * scale_x,
+                                exact_baseline_y - pen_y
+                                    + f64::from(offset_y_26_6) / 64.0 * scale_y,
+                            ));
+                            pen_x += f64::from(glyph.advance_x_26_6) / 64.0 * scale_x + spacing;
+                            pen_y += f64::from(glyph.advance_y_26_6) / 64.0 * scale_y;
+                        }
+                        if let Ok(positioned_glyphs) = rasterizer
+                            .rasterize_positioned_identity_glyphs(
+                                &run.font,
+                                &glyph_infos,
+                                &baseline_positions,
+                                scale_x,
+                                scale_y,
+                            )
+                        {
+                            let fill_color =
+                                resolve_run_fill_color(run, &effective_style, source_event, now_ms);
+                            if let Some(plane) = combined_image_plane_from_positioned_glyphs(
+                                &positioned_glyphs,
+                                fill_color,
+                                ass::ImageType::Character,
+                                bitmap_blur,
+                            ) {
+                                character_planes.push(plane);
+                            }
+                            exact_line_pen_x += pen_x;
+                            line_pen_x_26_6 = line_pen_x_26_6
+                                .saturating_add((pen_x * 64.0).round_ties_even() as i32);
+                            continue;
+                        }
+                        // Keep subsequent exact runs on the whole-line pen even
+                        // when this backend has to use the legacy bitmap path
+                        // for one unsupported glyph.
+                        exact_line_pen_x += pen_x;
+                    }
                     let raster_glyphs = scale_raster_glyphs(
                         raster_glyphs,
                         effective_style.scale_x * effective_pixel_aspect(track, config),

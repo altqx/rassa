@@ -1671,6 +1671,116 @@ fn positioned_and_scaled_offset_drawing_has_no_whole_pixel_centroid_shocks() {
 }
 
 #[test]
+fn centered_positioned_inline_color_runs_keep_frame_baked_fsc_motion_smooth() {
+    const HEADER: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Aileron,50,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+    let mut script = String::from(HEADER);
+    let mut no_op_transform_script = String::from(HEADER);
+    let timestamp = |centiseconds: i32| {
+        let seconds = centiseconds / 100;
+        let fraction = centiseconds % 100;
+        format!("0:00:{seconds:02}.{fraction:02}")
+    };
+    const FRAME_COUNT: i32 = 65;
+    for frame in 0..FRAME_COUNT {
+        let progress = f64::from(frame) / f64::from(FRAME_COUNT - 1);
+        let start = timestamp(frame * 4);
+        let end = timestamp((frame + 1) * 4);
+        let position_x = 320.25 + 2.0 * progress;
+        let position_y = 180.375 - 1.5 * progress;
+        let scale_x = 90.0 + 3.6 * progress;
+        let scale_y = 100.0 + 4.0 * progress;
+        script.push_str(&format!(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an5\\pos({position_x:.4},{position_y:.4})\\fs50\\fscx{scale_x:.4}\\fscy{scale_y:.4}\\blur0.9\\c&HDFD9FC&}}AVATAR {{\\c&HB3B0BC&}}VECTOR\n"
+        ));
+        no_op_transform_script.push_str(&format!(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an5\\pos({position_x:.4},{position_y:.4})\\fs50\\fscx{scale_x:.4}\\fscy{scale_y:.4}\\t(0,1,\\fscx{scale_x:.4}\\fscy{scale_y:.4})\\blur0.9\\c&HDFD9FC&}}AVATAR {{\\c&HB3B0BC&}}VECTOR\n"
+        ));
+    }
+
+    let track = parse_script_text(&script).expect("frame-baked positioned text script parses");
+    let no_op_transform_track = parse_script_text(&no_op_transform_script)
+        .expect("no-op transform positioned text script parses");
+    let engine = RenderEngine::new();
+    let provider = BundledFontProvider::aileron_regular();
+    let mut group_samples = Vec::with_capacity(FRAME_COUNT as usize);
+    let mut per_plane_masses = Vec::with_capacity(FRAME_COUNT as usize);
+    for frame in 0..FRAME_COUNT {
+        let now_ms = i64::from(frame * 40 + 20);
+        let planes = engine.render_frame_with_provider(&track, &provider, now_ms);
+        let no_op_transform_planes =
+            engine.render_frame_with_provider(&no_op_transform_track, &provider, now_ms);
+        assert_eq!(
+            planes, no_op_transform_planes,
+            "a no-op timed fsc marker must not change frame-baked static fsc rasterization"
+        );
+        let character = planes
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            character.len(),
+            2,
+            "the inline color split must remain two independent composite runs"
+        );
+
+        let mut group_mass = 0_u64;
+        let mut group_x = 0.0_f64;
+        let mut group_y = 0.0_f64;
+        let mut masses = Vec::with_capacity(character.len());
+        for plane in character {
+            let width = usize::try_from(plane.size.width).expect("nonnegative plane width");
+            let height = usize::try_from(plane.size.height).expect("nonnegative plane height");
+            let stride = usize::try_from(plane.stride).expect("nonnegative plane stride");
+            let mut mass = 0_u64;
+            let mut weighted_x = 0.0_f64;
+            let mut weighted_y = 0.0_f64;
+            for y in 0..height {
+                for x in 0..width {
+                    let coverage = u64::from(plane.bitmap[y * stride + x]);
+                    mass += coverage;
+                    weighted_x +=
+                        (f64::from(plane.destination.x) + x as f64 + 0.5) * coverage as f64;
+                    weighted_y +=
+                        (f64::from(plane.destination.y) + y as f64 + 0.5) * coverage as f64;
+                }
+            }
+            assert!(mass > 0, "each inline color run must retain coverage");
+            group_mass += mass;
+            group_x += weighted_x;
+            group_y += weighted_y;
+            masses.push(mass);
+        }
+        group_samples.push((
+            group_x / group_mass as f64,
+            group_y / group_mass as f64,
+            group_mass,
+        ));
+        per_plane_masses.push(masses);
+    }
+
+    for (sample_pair, mass_pair) in group_samples.windows(2).zip(per_plane_masses.windows(2)) {
+        let dx = sample_pair[1].0 - sample_pair[0].0;
+        let dy = sample_pair[1].1 - sample_pair[0].1;
+        let group_mass_step = sample_pair[1].2 as f64 / sample_pair[0].2 as f64 - 1.0;
+        assert!(
+            dx.abs() <= 0.5 && dy.abs() <= 0.5,
+            "slow centered pos+fsc motion must not contain whole-pixel shocks: {sample_pair:?}"
+        );
+        assert!(
+            group_mass_step.abs() <= 0.01,
+            "outline-space fsc must not pulse the combined text mass: {sample_pair:?}"
+        );
+        for (before, after) in mass_pair[0].iter().zip(&mass_pair[1]) {
+            let step = *after as f64 / *before as f64 - 1.0;
+            assert!(
+                step.abs() <= 0.015,
+                "each inline color run must scale smoothly: {mass_pair:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn downscaled_positioned_text_scales_font_and_anchor_like_libass() {
     let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an5\\pos(320,180)}POS\n";
     let config = RendererConfig {
