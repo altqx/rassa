@@ -1488,6 +1488,129 @@ fn libass_subpixel_quantization_uses_nearest_even_for_positive_and_negative_ties
 }
 
 #[test]
+fn episode_sign_id1403_uses_libass_center_and_one_pixel_qscale_bucket() {
+    let text = "m -236.96 90.02 l -237.96 90.02 -237.96 40.22 -236.96 40.22";
+    let drawing = ParsedDrawing {
+        scale: 1,
+        polygons: Vec::new(),
+    };
+    let baseline = quantized_identity_drawing(
+        &drawing,
+        text,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        Point {
+            x: 43_953,
+            y: 5_976,
+        },
+        0.0,
+    )
+    .expect("episode ID1403 baseline drawing");
+    assert_eq!(baseline.origin, Point { x: 449, y: 158 });
+    assert_eq!(baseline.phase_d6, Point { x: 16, y: 32 });
+    assert_eq!(baseline.restored_scale.0, 1.0);
+    assert!((baseline.restored_scale.1 - 0.999_095_022_624_434_4).abs() < 1e-12);
+
+    let end = quantized_identity_drawing(
+        &drawing,
+        text,
+        1.0381,
+        1.0381,
+        1.0,
+        1.0,
+        Point {
+            x: 43_291,
+            y: 4_860,
+        },
+        0.0,
+    )
+    .expect("episode ID1403 end drawing");
+    assert_eq!(end.restored_scale.0, 1.0);
+    assert!((end.restored_scale.1 - 1.037_707_390_648_567).abs() < 1e-12);
+}
+
+#[test]
+fn episode_sign_id850_two_pixel_strip_changes_qscale_only_at_libass_bucket() {
+    let text = "m 316.541 90.02 l 314.541 90.02 314.541 40.22 316.541 40.22";
+    let drawing = ParsedDrawing {
+        scale: 1,
+        polygons: Vec::new(),
+    };
+    let render = |scale: f64| {
+        quantized_identity_drawing(
+            &drawing,
+            text,
+            scale,
+            scale,
+            1.0,
+            1.0,
+            Point {
+                x: 43_953,
+                y: 5_976,
+            },
+            0.0,
+        )
+        .expect("episode ID850 drawing")
+    };
+    assert_eq!(render(1.03).restored_scale.0, 1.0);
+    assert_eq!(render(1.032).restored_scale.0, 1.0625);
+}
+
+#[test]
+fn identity_drawing_center_includes_libass_ascender_rounding_residual() {
+    let text = "m 0 0 l 10 0 10 50 0 50";
+    let drawing = ParsedDrawing {
+        scale: 1,
+        polygons: Vec::new(),
+    };
+    let scale = 1.002_375;
+    let quantized = quantized_identity_drawing(
+        &drawing,
+        text,
+        1.0,
+        scale,
+        1.0,
+        1.0,
+        Point {
+            x: 19_200,
+            y: 6_400,
+        },
+        0.0,
+    )
+    .expect("fractional ascender drawing");
+    assert_eq!(quantized.origin.y, 125);
+    assert_eq!(quantized.phase_d6.y, 8);
+}
+
+#[test]
+fn identity_drawing_negative_ascender_is_clamped_only_for_line_base() {
+    let text = "m 0 0 l 18 0 18 8 0 8";
+    let drawing = ParsedDrawing {
+        scale: 1,
+        polygons: Vec::new(),
+    };
+    let quantized = quantized_identity_drawing(
+        &drawing,
+        text,
+        1.0,
+        1.0,
+        8.0,
+        8.0,
+        Point { x: 1_280, y: 3_840 },
+        12.0,
+    )
+    .expect("negative-ascent drawing");
+
+    // At 8x, asc=(8-12)*8=-32px. measure_text clamps the line ascent to
+    // zero, while the drawing transform retains the signed asc and shifts
+    // the outline down by 32px.
+    assert_eq!(quantized.origin.y, 124);
+    assert_eq!(quantized.phase_d6.y, 0);
+}
+
+#[test]
 fn decimal_move_interpolates_from_exact_coordinates() {
     let decimal = drawing_alignment_script(7, "\\move(10.5,20.5,110.5,120.5,0,1000)", "0,0,0");
     let fixed = drawing_alignment_script(7, "\\pos(60.5,70.5)", "0,0,0");
@@ -1519,6 +1642,31 @@ fn positioned_drawing_coverage_moves_monotonically_on_libass_subpixel_grid() {
     assert!(
         ((last.0 - first.0) - 1.0).abs() < 0.02 && ((last.1 - first.1) - 1.0).abs() < 0.02,
         "eight subpixel steps should make one output-pixel move: {first:?} -> {last:?}"
+    );
+}
+
+#[test]
+fn positioned_and_scaled_offset_drawing_has_no_whole_pixel_centroid_shocks() {
+    let centroids = (0..=24)
+        .map(|step| {
+            let position_x = 286.76 - f64::from(step) * 0.105;
+            let position_y = 50.38 - f64::from(step) * 0.19;
+            let scale = 100.0 + f64::from(step) * 0.04;
+            let tags = format!("\\an7\\pos({position_x},{position_y})\\fscx{scale}\\fscy{scale}");
+            let script = drawing_alignment_script(7, &tags, "0,0,0").replace(
+                "m 0 0 l 40 0 40 20 0 20",
+                "m -237.96 90.02 l -236.96 90.02 -236.96 40.22 -237.96 40.22",
+            );
+            render_drawing_coverage_centroid(&script)
+        })
+        .collect::<Vec<_>>();
+    let steps = centroids
+        .windows(2)
+        .map(|pair| (pair[1].0 - pair[0].0, pair[1].1 - pair[0].1))
+        .collect::<Vec<_>>();
+    assert!(
+        steps.iter().all(|(x, y)| x.abs() < 0.35 && y.abs() < 0.35),
+        "slow pos+fsc motion must not contain whole-pixel shocks: {steps:?}"
     );
 }
 

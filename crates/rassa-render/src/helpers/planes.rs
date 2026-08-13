@@ -127,6 +127,7 @@ pub(crate) fn scale_position_exact(
 /// `quantize_transform` uses `SUBPIXEL_ORDER == 3`, retaining one eighth of
 /// an output pixel in the rasterized bitmap while exposing an integer image
 /// destination through the public API.
+#[cfg(test)]
 pub(crate) fn quantize_libass_subpixel_point((x, y): (f64, f64)) -> (f64, f64) {
     let quantize = |value: f64| {
         if value.is_finite() {
@@ -138,29 +139,6 @@ pub(crate) fn quantize_libass_subpixel_point((x, y): (f64, f64)) -> (f64, f64) {
         }
     };
     (quantize(x), quantize(y))
-}
-
-/// Return the retained anchor phase in 26.6 output-pixel units relative to
-/// the integer coordinates used by Rassa's existing layout/collision path.
-pub(crate) fn event_anchor_phase_d6(
-    exact: Option<(f64, f64)>,
-    integer: Option<(i32, i32)>,
-) -> Point {
-    let Some(((x, y), (ix, iy))) = exact.zip(integer) else {
-        return Point::default();
-    };
-    let phase = |value: f64, integer: i32| {
-        let value = ((value - f64::from(integer)) * 64.0).round();
-        if value.is_finite() {
-            value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        } else {
-            0
-        }
-    };
-    Point {
-        x: phase(x, ix),
-        y: phase(y, iy),
-    }
 }
 
 /// Resolve `\\pos` / `\\move` in script coordinates while retaining the
@@ -567,7 +545,7 @@ pub(crate) fn combined_image_plane_from_glyphs(
     ascender: Option<i32>,
     color: u32,
     kind: ass::ImageType,
-    blur_radius: u32,
+    qblur: u32,
 ) -> Option<ImagePlane> {
     combined_image_plane_from_glyphs_xy(
         glyphs,
@@ -577,8 +555,8 @@ pub(crate) fn combined_image_plane_from_glyphs(
         color,
         kind,
         BitmapBlur {
-            radius_x: blur_radius,
-            radius_y: blur_radius,
+            qblur_x: qblur,
+            qblur_y: qblur,
             be: 0,
         },
     )

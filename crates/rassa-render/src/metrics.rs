@@ -448,18 +448,12 @@ pub(crate) fn font_vertical_metrics_from_data(
     })
 }
 
-pub(crate) fn renderer_blur_radius(blur: f64) -> u32 {
-    if !(blur.is_finite() && blur > 0.0) {
-        return 0;
-    }
-    (blur * 4.0).ceil().max(1.0) as u32
-}
-
 pub(crate) fn effective_bitmap_blur(
     style: &ParsedSpanStyle,
     track: &ParsedTrack,
     config: &RendererConfig,
     font_scale: f64,
+    mapping: &EventMapping,
 ) -> BitmapBlur {
     let blur = if style.blur.is_finite() && style.blur > 0.0 {
         style.blur
@@ -471,12 +465,8 @@ pub(crate) fn effective_bitmap_blur(
     } else {
         0
     };
-    let (scale_x, scale_y) = renderer_blur_scales(track, config, font_scale);
-    BitmapBlur {
-        radius_x: renderer_blur_radius(blur * scale_x),
-        radius_y: renderer_blur_radius(blur * scale_y),
-        be,
-    }
+    let (scale_x, scale_y) = renderer_blur_scales(track, config, font_scale, mapping);
+    BitmapBlur::from_scaled_blur(blur * scale_x, blur * scale_y, be)
 }
 
 pub(crate) fn expand_rect_xy(rect: Rect, amount_x: i32, amount_y: i32) -> Rect {

@@ -44,8 +44,8 @@ pub(crate) struct DrawingPlaneParams {
     pub(crate) color: u32,
     pub(crate) render_scale_y: f64,
     pub(crate) baseline_offset: f64,
-    /// Fractional event-anchor translation in 26.6 output-pixel units.
-    /// This is applied to coverage before outline, blur, and shadow filters.
+    /// Fractional drawing translation in 26.6 output-pixel units.  Quantized
+    /// identity drawings use libass's bitmap-cache remainder here.
     pub(crate) anchor_phase_d6: Point,
 }
 
@@ -99,6 +99,137 @@ pub(crate) fn image_plane_from_drawing(
         kind: ass::ImageType::Character,
         bitmap,
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QuantizedIdentityDrawing {
+    pub(crate) polygons: Vec<Vec<Point>>,
+    pub(crate) origin: Point,
+    pub(crate) phase_d6: Point,
+    pub(crate) restored_scale: (f64, f64),
+}
+
+/// Port the identity-transform specialization of libass
+/// `quantize_transform` + `restore_transform` for a positioned `\an7`
+/// drawing.  Layout metrics deliberately continue to use the exact-scale
+/// polygons; only raster geometry receives the bitmap-cache matrix buckets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantized_identity_drawing(
+    drawing: &ParsedDrawing,
+    drawing_text: &str,
+    scale_x: f64,
+    scale_y: f64,
+    render_scale_x: f64,
+    render_scale_y: f64,
+    anchor_d6: Point,
+    drawing_pbo: f64,
+) -> Option<QuantizedIdentityDrawing> {
+    let scale_base = libass_drawing_scale_base(drawing.scale);
+    if scale_base <= 0 {
+        return None;
+    }
+    let source = parse_drawing_polygons_d6(drawing_text, drawing.scale)?;
+    let layout_bbox = parse_drawing_bbox_d6(drawing_text, drawing.scale)?;
+    let outline_cbox = parse_drawing_outline_cbox_d6(drawing_text, drawing.scale)?;
+    if !scale_x.is_finite()
+        || !scale_y.is_finite()
+        || scale_x <= 0.0
+        || scale_y <= 0.0
+        || !render_scale_x.is_finite()
+        || !render_scale_y.is_finite()
+        || render_scale_x <= 0.0
+        || render_scale_y <= 0.0
+    {
+        return None;
+    }
+    let coordinate_scale = 1.0 / f64::from(scale_base);
+    let scale_x = style_scale(scale_x) * render_scale_x * coordinate_scale;
+    let scale_y = style_scale(scale_y) * render_scale_y * coordinate_scale;
+    if !scale_x.is_finite() || !scale_y.is_finite() || scale_x <= 0.0 || scale_y <= 0.0 {
+        return None;
+    }
+
+    let cbox_center_x = (f64::from(outline_cbox.x_min) + f64::from(outline_cbox.x_max)) / 2.0;
+    let cbox_center_y = (f64::from(outline_cbox.y_min) + f64::from(outline_cbox.y_max)) / 2.0;
+    let cbox_radius_x =
+        (f64::from(outline_cbox.x_max) - f64::from(outline_cbox.x_min)) / 2.0 + 64.0;
+    let cbox_radius_y =
+        (f64::from(outline_cbox.y_max) - f64::from(outline_cbox.y_min)) / 2.0 + 64.0;
+    if cbox_radius_x <= 0.0 || cbox_radius_y <= 0.0 {
+        return None;
+    }
+
+    // GlyphInfo::drawing_pbo is an int even though the parser state is a
+    // double, so the assignment truncates toward zero before the 64x scale.
+    let pbo = if drawing_pbo.is_finite() {
+        drawing_pbo
+            .trunc()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+    } else {
+        0.0
+    };
+    let layout_height_d6 = f64::from(layout_bbox.y_max) - f64::from(layout_bbox.y_min);
+    let asc_exact_d6 = (layout_height_d6 - 64.0 * pbo) * scale_y;
+    let asc_d6 = checked_round_ties_even_i32(asc_exact_d6)?;
+    // measure_text initializes the line ascent at zero and takes the maximum
+    // over runs. A drawing whose positive \pbo makes its ascent negative
+    // therefore contributes zero to the top-aligned line base, while its
+    // outline offset still uses the signed exact ascent.
+    let line_asc_d6 = asc_d6.max(0);
+    let exact_center_x = f64::from(anchor_d6.x) + cbox_center_x * scale_x;
+    let exact_center_y =
+        f64::from(anchor_d6.y) + f64::from(line_asc_d6) - asc_exact_d6 + cbox_center_y * scale_y;
+    let qr_x = checked_round_ties_even_i32(exact_center_x / 8.0)?;
+    let qr_y = checked_round_ties_even_i32(exact_center_y / 8.0)?;
+
+    let quantized_scale = |scale: f64, radius: f64| {
+        let coefficient = checked_round_ties_even_i32(scale * radius / 8.0)?;
+        Some(f64::from(coefficient) * 8.0 / radius)
+    };
+    let restored_scale_x = quantized_scale(scale_x, cbox_radius_x)?;
+    let restored_scale_y = quantized_scale(scale_y, cbox_radius_y)?;
+    let mut polygons = Vec::new();
+    polygons.try_reserve_exact(source.len()).ok()?;
+    for polygon in source {
+        let mut transformed = Vec::new();
+        transformed.try_reserve_exact(polygon.len()).ok()?;
+        for point in polygon {
+            let point = Point {
+                x: checked_round_ties_even_i32(
+                    restored_scale_x * (f64::from(point.x) - cbox_center_x),
+                )?,
+                y: checked_round_ties_even_i32(
+                    restored_scale_y * (f64::from(point.y) - cbox_center_y),
+                )?,
+            };
+            if !fixed_d6_point_is_valid(point) {
+                return None;
+            }
+            transformed.push(point);
+        }
+        polygons.push(transformed);
+    }
+
+    Some(QuantizedIdentityDrawing {
+        polygons,
+        origin: Point {
+            x: qr_x.div_euclid(8),
+            y: qr_y.div_euclid(8),
+        },
+        phase_d6: Point {
+            x: qr_x.rem_euclid(8) * 8,
+            y: qr_y.rem_euclid(8) * 8,
+        },
+        restored_scale: (restored_scale_x, restored_scale_y),
+    })
+}
+
+fn checked_round_ties_even_i32(value: f64) -> Option<i32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = value.round_ties_even();
+    (rounded >= f64::from(i32::MIN) && rounded <= f64::from(i32::MAX)).then_some(rounded as i32)
 }
 
 pub(crate) fn scaled_drawing_polygons(
@@ -243,7 +374,7 @@ fn drawing_sample_grid_d6(polygons: &[Vec<Point>]) -> u32 {
     }
 }
 
-fn drawing_d6_bounds(polygons: &[Vec<Point>]) -> Option<Rect> {
+pub(crate) fn drawing_d6_bounds(polygons: &[Vec<Point>]) -> Option<Rect> {
     let mut points = polygons.iter().flatten().copied();
     let first = points.next()?;
     let mut bounds = Rect {

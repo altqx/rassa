@@ -486,7 +486,9 @@ pub fn libass_drawing_coordinate_to_d6(value: f64) -> Option<i32> {
     if !scaled.is_finite() {
         return None;
     }
-    let rounded = scaled.round();
+    // libass's double_to_d6 uses ass_lrint under FE_TONEAREST: exact
+    // half-D6 coordinates select the even integer, including negatives.
+    let rounded = scaled.round_ties_even();
     if rounded < -f64::from(LIBASS_OUTLINE_MAX_D6) || rounded > f64::from(LIBASS_OUTLINE_MAX_D6) {
         return None;
     }
@@ -4204,6 +4206,371 @@ pub fn parse_drawing_polygons_d6(drawing: &str, scale: i32) -> Option<Vec<Vec<Po
     }
 }
 
+/// Return the raw 26.6 tokenizer box used by libass for drawing metrics.
+///
+/// This intentionally differs from the bounds of [`parse_drawing_polygons_d6`]:
+/// cubic and B-spline input points contribute to libass's drawing bbox even
+/// when the evaluated curve never reaches them. Drawing ascent, descent, and
+/// advance derive from this exact box. Transform quantization instead uses
+/// [`parse_drawing_outline_cbox_d6`].
+pub fn parse_drawing_bbox_d6(drawing: &str, scale: i32) -> Option<Rect> {
+    if drawing.is_empty() || libass_drawing_scale_base(scale) <= 0 {
+        return None;
+    }
+    // Reuse the full parser as the validity oracle.  In particular, a point
+    // outside libass's outline domain only invalidates a drawing once a
+    // visible segment actually consumes it.
+    match parse_drawing_polygons_checked_with_mode(drawing, DrawingCoordinateMode::FixedD6) {
+        DrawingParseOutcome::InvalidOutline => return None,
+        DrawingParseOutcome::Parsed(_) => {}
+    }
+
+    let mode = DrawingCoordinateMode::FixedD6;
+    let mut cursor = DrawingCursor::new(drawing);
+    let mut bounds: Option<Rect> = None;
+    let mut points = 0_usize;
+    let mut root_seen = false;
+    let mut move_seen = false;
+    let mut spline_start: Option<[Point; 3]> = None;
+
+    let add = |bounds: &mut Option<Rect>, point: Point| {
+        if !mode.point_is_valid(point) {
+            return;
+        }
+        if let Some(bounds) = bounds {
+            bounds.x_min = bounds.x_min.min(point.x);
+            bounds.y_min = bounds.y_min.min(point.y);
+            bounds.x_max = bounds.x_max.max(point.x);
+            bounds.y_max = bounds.y_max.max(point.y);
+        } else {
+            *bounds = Some(Rect {
+                x_min: point.x,
+                y_min: point.y,
+                x_max: point.x,
+                y_max: point.y,
+            });
+        }
+    };
+
+    while let Some(command) = cursor.next_char() {
+        match command {
+            'm' => {
+                move_seen = true;
+                if !root_seen {
+                    let Some(point) = cursor.parse_point(mode) else {
+                        continue;
+                    };
+                    root_seen = true;
+                    points = 1;
+                    add(&mut bounds, point);
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    add(&mut bounds, batch[0]);
+                    points += 1;
+                });
+            }
+            'n' => {
+                if !root_seen {
+                    let Some(point) = cursor.parse_point(mode) else {
+                        continue;
+                    };
+                    if !move_seen {
+                        return None;
+                    }
+                    root_seen = true;
+                    points = 1;
+                    add(&mut bounds, point);
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    add(&mut bounds, batch[0]);
+                    points += 1;
+                });
+            }
+            'l' => {
+                if !root_seen {
+                    continue;
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    add(&mut bounds, batch[0]);
+                    points += 1;
+                });
+            }
+            'b' => {
+                if !root_seen {
+                    continue;
+                }
+                cursor.parse_many_points(mode, 3, |batch| {
+                    for &point in batch {
+                        add(&mut bounds, point);
+                    }
+                    points += 3;
+                });
+            }
+            's' => {
+                if !root_seen {
+                    continue;
+                }
+                let Some(batch) = cursor.parse_exact_points::<3>(mode) else {
+                    spline_start = None;
+                    continue;
+                };
+                for point in batch {
+                    add(&mut bounds, point);
+                }
+                spline_start = Some(batch);
+                points += 3;
+                cursor.parse_many_points(mode, 1, |batch| {
+                    add(&mut bounds, batch[0]);
+                    points += 1;
+                });
+            }
+            'p' => {
+                if points < 3 {
+                    continue;
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    add(&mut bounds, batch[0]);
+                    points += 1;
+                });
+            }
+            'c' => {
+                // Closing a B-spline reuses its first three tokens, which are
+                // already present in the union box.
+                spline_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = spline_start;
+    bounds
+}
+
+/// Return the 26.6 control-point box of the constructed libass outline.
+///
+/// Unlike [`parse_drawing_bbox_d6`], this applies libass's B-spline to cubic
+/// conversion before measuring and ignores move-only points which never enter
+/// an outline.  `quantize_transform` uses this box to quantize matrix
+/// coefficients and bitmap phase.
+pub fn parse_drawing_outline_cbox_d6(drawing: &str, scale: i32) -> Option<Rect> {
+    if drawing.is_empty() || libass_drawing_scale_base(scale) <= 0 {
+        return None;
+    }
+    match parse_drawing_polygons_checked_with_mode(drawing, DrawingCoordinateMode::FixedD6) {
+        DrawingParseOutcome::InvalidOutline => return None,
+        DrawingParseOutcome::Parsed(_) => {}
+    }
+
+    let mode = DrawingCoordinateMode::FixedD6;
+    let mut cursor = DrawingCursor::new(drawing);
+    let mut bounds: Option<Rect> = None;
+    let mut history = Vec::new();
+    let mut spline_close_points: Option<[Point; 3]> = None;
+    let mut points = 0_usize;
+    let mut root_seen = false;
+    let mut move_seen = false;
+    let mut started = false;
+    let mut pen = Point { x: 0, y: 0 };
+
+    let add = |bounds: &mut Option<Rect>, point: Point| {
+        if let Some(bounds) = bounds {
+            bounds.x_min = bounds.x_min.min(point.x);
+            bounds.y_min = bounds.y_min.min(point.y);
+            bounds.x_max = bounds.x_max.max(point.x);
+            bounds.y_max = bounds.y_max.max(point.y);
+        } else {
+            *bounds = Some(Rect {
+                x_min: point.x,
+                y_min: point.y,
+                x_max: point.x,
+                y_max: point.y,
+            });
+        }
+    };
+    let add_line = |bounds: &mut Option<Rect>, started: &mut bool, from: Point, to: Point| {
+        if !*started {
+            add(bounds, from);
+        }
+        add(bounds, to);
+        *started = true;
+    };
+    let spline_controls = |p: [Point; 4]| -> Option<[Point; 4]> {
+        let x01 = (i64::from(p[1].x) - i64::from(p[0].x)) / 3;
+        let y01 = (i64::from(p[1].y) - i64::from(p[0].y)) / 3;
+        let x12 = (i64::from(p[2].x) - i64::from(p[1].x)) / 3;
+        let y12 = (i64::from(p[2].y) - i64::from(p[1].y)) / 3;
+        let x23 = (i64::from(p[3].x) - i64::from(p[2].x)) / 3;
+        let y23 = (i64::from(p[3].y) - i64::from(p[2].y)) / 3;
+        let point = |x: i64, y: i64| {
+            let point = Point {
+                x: i32::try_from(x).ok()?,
+                y: i32::try_from(y).ok()?,
+            };
+            mode.point_is_valid(point).then_some(point)
+        };
+        Some([
+            point(
+                i64::from(p[1].x) + ((x12 - x01) >> 1),
+                i64::from(p[1].y) + ((y12 - y01) >> 1),
+            )?,
+            point(i64::from(p[1].x) + x12, i64::from(p[1].y) + y12)?,
+            point(i64::from(p[2].x) - x12, i64::from(p[2].y) - y12)?,
+            point(
+                i64::from(p[2].x) + ((x23 - x12) >> 1),
+                i64::from(p[2].y) + ((y23 - y12) >> 1),
+            )?,
+        ])
+    };
+    let add_curve = |bounds: &mut Option<Rect>, started: &mut bool, controls: [Point; 4]| {
+        if !*started {
+            add(bounds, controls[0]);
+        }
+        for &point in &controls[1..] {
+            add(bounds, point);
+        }
+        *started = true;
+    };
+
+    while let Some(command) = cursor.next_char() {
+        match command {
+            'm' => {
+                move_seen = true;
+                if !root_seen {
+                    let Some(point) = cursor.parse_point(mode) else {
+                        continue;
+                    };
+                    root_seen = true;
+                    points = 1;
+                    pen = point;
+                    history.push(point);
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    started = false;
+                    pen = batch[0];
+                    history.push(pen);
+                    points += 1;
+                });
+            }
+            'n' => {
+                if !root_seen {
+                    let Some(point) = cursor.parse_point(mode) else {
+                        continue;
+                    };
+                    if !move_seen {
+                        return None;
+                    }
+                    root_seen = true;
+                    points = 1;
+                    pen = point;
+                    history.push(point);
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    pen = batch[0];
+                    history.push(pen);
+                    points += 1;
+                });
+            }
+            'l' => {
+                if !root_seen {
+                    continue;
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    add_line(&mut bounds, &mut started, pen, batch[0]);
+                    pen = batch[0];
+                    history.push(pen);
+                    points += 1;
+                });
+            }
+            'b' => {
+                if !root_seen {
+                    continue;
+                }
+                cursor.parse_many_points(mode, 3, |batch| {
+                    let controls = [pen, batch[0], batch[1], batch[2]];
+                    add_curve(&mut bounds, &mut started, controls);
+                    pen = batch[2];
+                    history.extend_from_slice(batch);
+                    points += 3;
+                });
+            }
+            's' => {
+                if !root_seen {
+                    continue;
+                }
+                let spline_start = pen;
+                let Some(batch) = cursor.parse_exact_points::<3>(mode) else {
+                    spline_close_points = None;
+                    continue;
+                };
+                let controls = spline_controls([spline_start, batch[0], batch[1], batch[2]])?;
+                add_curve(&mut bounds, &mut started, controls);
+                spline_close_points = Some([spline_start, batch[0], batch[1]]);
+                pen = batch[2];
+                history.extend_from_slice(&batch);
+                points += 3;
+                cursor.parse_many_points(mode, 1, |batch| {
+                    let len = history.len();
+                    if len >= 3 {
+                        if let Some(controls) = spline_controls([
+                            history[len - 3],
+                            history[len - 2],
+                            history[len - 1],
+                            batch[0],
+                        ]) {
+                            add_curve(&mut bounds, &mut started, controls);
+                        }
+                    }
+                    pen = batch[0];
+                    history.push(pen);
+                    points += 1;
+                });
+            }
+            'p' => {
+                if points < 3 {
+                    continue;
+                }
+                cursor.parse_many_points(mode, 1, |batch| {
+                    let len = history.len();
+                    if len >= 3 {
+                        if let Some(controls) = spline_controls([
+                            history[len - 3],
+                            history[len - 2],
+                            history[len - 1],
+                            batch[0],
+                        ]) {
+                            add_curve(&mut bounds, &mut started, controls);
+                        }
+                    }
+                    pen = batch[0];
+                    history.push(pen);
+                    points += 1;
+                });
+            }
+            'c' => {
+                if let Some(close_points) = spline_close_points.take() {
+                    for point in close_points {
+                        let len = history.len();
+                        if len >= 3 {
+                            if let Some(controls) = spline_controls([
+                                history[len - 3],
+                                history[len - 2],
+                                history[len - 1],
+                                point,
+                            ]) {
+                                add_curve(&mut bounds, &mut started, controls);
+                            }
+                        }
+                        pen = point;
+                        history.push(point);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    bounds
+}
+
 fn parse_drawing_polygons_checked(drawing: &str, scale: i32) -> DrawingParseOutcome {
     if drawing.is_empty() {
         return DrawingParseOutcome::Parsed(None);
@@ -7578,6 +7945,62 @@ Dialogue: 7,0:00:01.00,0:00:03.00,Ssa,Actor,21,22,23,fx,Text";
             drawing.polygons[0].last().copied(),
             Some(Point { x: 0, y: 10 })
         );
+    }
+
+    #[test]
+    fn drawing_bbox_retains_raw_curve_control_points_like_libass() {
+        let text = "m 0 0 b 0 100 10 100 10 0";
+        let cbox = parse_drawing_bbox_d6(text, 1).expect("raw drawing bbox");
+        assert_eq!(
+            cbox,
+            Rect {
+                x_min: 0,
+                y_min: 0,
+                x_max: 640,
+                y_max: 6_400,
+            }
+        );
+
+        let flattened = parse_drawing_polygons_d6(text, 1).expect("flattened drawing");
+        let flattened_y_max = flattened
+            .iter()
+            .flatten()
+            .map(|point| point.y)
+            .max()
+            .expect("curve samples");
+        assert_eq!(flattened_y_max, 4_800);
+        assert_ne!(flattened_y_max, cbox.y_max);
+    }
+
+    #[test]
+    fn drawing_outline_cbox_uses_converted_spline_controls_like_libass() {
+        let text = "m 0 0 s 0 100 10 100 10 0";
+        assert_eq!(
+            parse_drawing_bbox_d6(text, 1),
+            Some(Rect {
+                x_min: 0,
+                y_min: 0,
+                x_max: 640,
+                y_max: 6_400,
+            })
+        );
+        assert_eq!(
+            parse_drawing_outline_cbox_d6(text, 1),
+            Some(Rect {
+                x_min: 106,
+                y_min: 5_333,
+                x_max: 533,
+                y_max: 6_400,
+            })
+        );
+    }
+
+    #[test]
+    fn drawing_d6_conversion_uses_nearest_even_at_half_steps() {
+        assert_eq!(libass_drawing_coordinate_to_d6(1.0 / 128.0), Some(0));
+        assert_eq!(libass_drawing_coordinate_to_d6(3.0 / 128.0), Some(2));
+        assert_eq!(libass_drawing_coordinate_to_d6(-1.0 / 128.0), Some(0));
+        assert_eq!(libass_drawing_coordinate_to_d6(-3.0 / 128.0), Some(-2));
     }
 
     #[test]

@@ -2,14 +2,23 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BitmapBlur {
-    pub(crate) radius_x: u32,
-    pub(crate) radius_y: u32,
+    /// libass's logarithmically quantized Gaussian radius, not pixels.
+    pub(crate) qblur_x: u32,
+    pub(crate) qblur_y: u32,
     pub(crate) be: u32,
 }
 
 impl BitmapBlur {
+    pub(crate) fn from_scaled_blur(blur_x: f64, blur_y: f64, be: u32) -> Self {
+        Self {
+            qblur_x: libass_quantize_blur(blur_x),
+            qblur_y: libass_quantize_blur(blur_y),
+            be,
+        }
+    }
+
     pub(crate) fn is_zero(self) -> bool {
-        self.radius_x == 0 && self.radius_y == 0 && self.be == 0
+        self.qblur_x == 0 && self.qblur_y == 0 && self.be == 0
     }
 }
 
@@ -80,9 +89,9 @@ pub(crate) fn blur_bitmap_xy(
 
     let mut pad_x = be_pad;
     let mut pad_y = be_pad;
-    if blur.radius_x > 0 || blur.radius_y > 0 {
-        let r2x = libass_blur_r2_from_radius(blur.radius_x);
-        let r2y = libass_blur_r2_from_radius(blur.radius_y);
+    if blur.qblur_x > 0 || blur.qblur_y > 0 {
+        let r2x = libass_blur_r2_from_qblur(blur.qblur_x);
+        let r2y = libass_blur_r2_from_qblur(blur.qblur_y);
         let (bitmap, blurred_width, blurred_height, gaussian_pad_x, gaussian_pad_y) =
             libass_gaussian_blur(&source, width, height, r2x, r2y);
         source = bitmap;
@@ -166,6 +175,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gaussian_blur_uses_libass_logarithmic_buckets() {
+        let qblur_2 = libass_quantize_blur(2.0);
+        assert_eq!(qblur_2, 13);
+        assert_eq!(libass_quantize_blur(2.01), qblur_2);
+        assert_eq!(libass_quantize_blur(2.04), qblur_2);
+        assert_eq!(libass_quantize_blur(2.05), 14);
+
+        let r2 = libass_blur_r2_from_qblur(qblur_2);
+        assert!((r2 - 2.778_779_413_952_41).abs() < 1e-12, "r2={r2}");
+    }
+
+    #[test]
+    fn nearby_blur_values_in_one_bucket_produce_identical_bitmaps() {
+        let mut source = vec![0_u8; 9 * 9];
+        source[4 * 9 + 4] = 255;
+        let blur_2 = BitmapBlur::from_scaled_blur(2.0, 2.0, 0);
+        let blur_201 = BitmapBlur::from_scaled_blur(2.01, 2.01, 0);
+        assert_eq!(blur_2, blur_201);
+        assert_eq!(
+            blur_bitmap_xy(source.clone(), 9, 9, blur_2),
+            blur_bitmap_xy(source, 9, 9, blur_201)
+        );
+    }
+
+    #[test]
+    fn hostile_blur_quantization_cannot_overflow_filter_geometry() {
+        let source = vec![255_u8];
+        let result = blur_bitmap_xy(
+            source.clone(),
+            1,
+            1,
+            BitmapBlur {
+                qblur_x: u32::MAX,
+                qblur_y: u32::MAX,
+                be: 0,
+            },
+        );
+        assert_eq!(result, (source, 1, 1, 0, 0));
+        assert_eq!(
+            libass_gaussian_blur(&[255], 1, 1, f64::MAX, f64::MAX),
+            (vec![255], 1, 1, 0, 0)
+        );
+    }
+
+    #[test]
     fn anisotropic_gaussian_blur_expands_axes_independently() {
         let source = vec![255_u8; 9];
         let (horizontal, horizontal_width, horizontal_height, pad_x, pad_y) = blur_bitmap_xy(
@@ -173,8 +227,8 @@ mod tests {
             3,
             3,
             BitmapBlur {
-                radius_x: 32,
-                radius_y: 4,
+                qblur_x: libass_quantize_blur(8.0),
+                qblur_y: libass_quantize_blur(1.0),
                 be: 0,
             },
         );
@@ -188,8 +242,8 @@ mod tests {
                 3,
                 3,
                 BitmapBlur {
-                    radius_x: 4,
-                    radius_y: 32,
+                    qblur_x: libass_quantize_blur(1.0),
+                    qblur_y: libass_quantize_blur(8.0),
                     be: 0,
                 },
             );
@@ -207,8 +261,8 @@ mod tests {
             5,
             5,
             BitmapBlur {
-                radius_x: 0,
-                radius_y: 0,
+                qblur_x: 0,
+                qblur_y: 0,
                 be: 1,
             },
         );
@@ -233,14 +287,32 @@ pub(crate) struct LibassBlurMethod {
     pub(crate) coeff: [i16; 8],
 }
 
-pub(crate) fn libass_blur_r2_from_radius(radius: u32) -> f64 {
+/// Quantize an authored `\blur` value after applying libass's per-axis
+/// renderer scale.  libass stores this logarithmic index in the bitmap-cache
+/// key, so nearby animated values deliberately share one filter kernel.
+pub(crate) fn libass_quantize_blur(blur: f64) -> u32 {
     const POSITION_PRECISION: f64 = 8.0;
     const BLUR_PRECISION: f64 = 1.0 / 256.0;
-    let blur = f64::from(radius) / 4.0;
+    if !(blur.is_finite() && blur > 0.0) {
+        return 0;
+    }
     let blur_radius_scale = 2.0 / 256.0_f64.ln().sqrt();
     let scale = 64.0 * BLUR_PRECISION / POSITION_PRECISION;
-    let qblur = ((1.0 + blur * blur_radius_scale * scale).ln() / BLUR_PRECISION).round();
-    let sigma = (BLUR_PRECISION * qblur).exp_m1() / scale;
+    let qblur = (blur * blur_radius_scale * scale).ln_1p() / BLUR_PRECISION;
+    if !qblur.is_finite() {
+        return u32::MAX;
+    }
+    qblur.round_ties_even().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// Restore libass's squared Gaussian sigma from its cached quantization
+/// index.  Keeping the index intact avoids the old quarter-pixel ceiling,
+/// which made `\blur2.01` jump to the kernel for `\blur2.25`.
+pub(crate) fn libass_blur_r2_from_qblur(qblur: u32) -> f64 {
+    const POSITION_PRECISION: f64 = 8.0;
+    const BLUR_PRECISION: f64 = 1.0 / 256.0;
+    const SCALE: f64 = 64.0 * BLUR_PRECISION / POSITION_PRECISION;
+    let sigma = (BLUR_PRECISION * f64::from(qblur)).exp_m1() / SCALE;
     sigma * sigma
 }
 
@@ -251,6 +323,16 @@ pub(crate) fn libass_gaussian_blur(
     r2x: f64,
     r2y: f64,
 ) -> (Vec<u8>, usize, usize, usize, usize) {
+    let max_sigma = MAX_BLUR_BITMAP_BYTES as f64;
+    if !r2x.is_finite()
+        || !r2y.is_finite()
+        || r2x < 0.0
+        || r2y < 0.0
+        || r2x.sqrt() > max_sigma
+        || r2y.sqrt() > max_sigma
+    {
+        return (source.to_vec(), width, height, 0, 0);
+    }
     let blur_x = find_libass_blur_method(r2x);
     let blur_y = if (r2y - r2x).abs() < f64::EPSILON {
         blur_x.clone()
@@ -258,14 +340,60 @@ pub(crate) fn libass_gaussian_blur(
         find_libass_blur_method(r2y)
     };
 
-    let offset_x = ((2 * blur_x.radius + 9) << blur_x.level) - 5;
-    let offset_y = ((2 * blur_y.radius + 9) << blur_y.level) - 5;
-    let mask_x = (1_usize << blur_x.level) - 1;
-    let mask_y = (1_usize << blur_y.level) - 1;
-    let end_width = ((width + offset_x) & !mask_x).saturating_sub(4);
-    let end_height = ((height + offset_y) & !mask_y).saturating_sub(4);
-    let pad_x = ((blur_x.radius + 4) << blur_x.level) - 4;
-    let pad_y = ((blur_y.radius + 4) << blur_y.level) - 4;
+    let Some(factor_x) = u32::try_from(blur_x.level)
+        .ok()
+        .and_then(|level| 1_usize.checked_shl(level))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(factor_y) = u32::try_from(blur_y.level)
+        .ok()
+        .and_then(|level| 1_usize.checked_shl(level))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(offset_x) = (2 * blur_x.radius + 9)
+        .checked_mul(factor_x)
+        .and_then(|value| value.checked_sub(5))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(offset_y) = (2 * blur_y.radius + 9)
+        .checked_mul(factor_y)
+        .and_then(|value| value.checked_sub(5))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let mask_x = factor_x - 1;
+    let mask_y = factor_y - 1;
+    let Some(padded_width) = width.checked_add(offset_x) else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(padded_height) = height.checked_add(offset_y) else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let end_width = (padded_width & !mask_x).saturating_sub(4);
+    let end_height = (padded_height & !mask_y).saturating_sub(4);
+    let Some(pad_x) = (blur_x.radius + 4)
+        .checked_mul(factor_x)
+        .and_then(|value| value.checked_sub(4))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let Some(pad_y) = (blur_y.radius + 4)
+        .checked_mul(factor_y)
+        .and_then(|value| value.checked_sub(4))
+    else {
+        return (source.to_vec(), width, height, 0, 0);
+    };
+    let safe_bitmap = |w: usize, h: usize| {
+        w.checked_mul(h)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<i16>()))
+            .is_some_and(|bytes| bytes <= MAX_BLUR_BITMAP_BYTES)
+    };
+    if !safe_bitmap(width, height) || !safe_bitmap(end_width, end_height) {
+        return (source.to_vec(), width, height, 0, 0);
+    }
 
     let mut buffer = unpack_libass_blur(source);
     let mut w = width;

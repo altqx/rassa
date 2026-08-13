@@ -11,7 +11,8 @@ use rassa_parse::{
     ParsedMovementExact, ParsedRectF64, ParsedScaleTransform, ParsedSpanStyle, ParsedTrack,
     ParsedVectorClip, dialogue_has_libass_hard_override, libass_drawing_scale_base,
     libass_outline_coordinate_from_f64, libass_outline_point_is_valid,
-    parse_dialogue_vector_clip_d6, parse_drawing_polygons_d6,
+    parse_dialogue_vector_clip_d6, parse_drawing_bbox_d6, parse_drawing_outline_cbox_d6,
+    parse_drawing_polygons_d6,
 };
 use rassa_raster::{RasterGlyph, RasterOptions, Rasterizer};
 use rassa_shape::{GlyphInfo, ShapingMode};
@@ -199,8 +200,6 @@ impl RenderEngine {
                 renderer_projection_scale_y(track, config, event_font_scale, &mapping);
             let resolved_position_exact = resolve_event_position_exact(track, event, now_ms);
             let mapped_position_exact = scale_position_exact(resolved_position_exact, &mapping);
-            let effective_position_exact =
-                mapped_position_exact.map(quantize_libass_subpixel_point);
             // Keep the established integer layout/collision path: it rounded
             // in script space before x2scr/y2scr. The drawing residual then
             // corrects that compatibility anchor to libass's mapped 1/8 grid.
@@ -213,8 +212,6 @@ impl RenderEngine {
                             mapping.map_y_pos(f64::from(y)).round() as i32,
                         )
                     });
-            let drawing_anchor_phase_d6 =
-                event_anchor_phase_d6(effective_position_exact, effective_position);
             // Parsing and scaling a vector outline dominates small drawing
             // events. Share the exact D6 geometry between line metrics and
             // rasterization instead of constructing it twice.
@@ -357,8 +354,13 @@ impl RenderEngine {
                         event_font_scale,
                         render_scale_all,
                     );
-                    let bitmap_blur =
-                        effective_bitmap_blur(&effective_style, track, config, event_font_scale);
+                    let bitmap_blur = effective_bitmap_blur(
+                        &effective_style,
+                        track,
+                        config,
+                        event_font_scale,
+                        &mapping,
+                    );
                     if run.drawing.is_none() && (line_is_trimmed_empty || !run.glyphs.is_empty()) {
                         event_border_x =
                             event_border_x.max(effective_style.border_x.round().max(0.0) as i32);
@@ -381,17 +383,33 @@ impl RenderEngine {
                     // where the exact event anchor is the outline translation.
                     // This fixes the frame-baked sign without claiming cbox
                     // quantization parity for transforms or other alignments.
-                    let run_drawing_anchor_phase_d6 = if run_transform.is_identity() {
-                        let horizontal = event.alignment & 0x3;
-                        let vertical = event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER);
-                        if horizontal == ass::HALIGN_LEFT && vertical == ass::VALIGN_TOP {
-                            drawing_anchor_phase_d6
+                    let run_drawing_exact_anchor_d6 =
+                        if line_index == 0 && line.runs.len() == 1 && run_transform.is_identity() {
+                            let horizontal = event.alignment & 0x3;
+                            let vertical = event.alignment & (ass::VALIGN_TOP | ass::VALIGN_CENTER);
+                            if horizontal == ass::HALIGN_LEFT && vertical == ass::VALIGN_TOP {
+                                mapped_position_exact.and_then(|(x, y)| {
+                                    let fractional_advance =
+                                        f64::from(run_origin_x_26_6 - origin_x_26_6) / 64.0;
+                                    let x = ((x + fractional_advance) * 64.0).round_ties_even();
+                                    let y = (y * 64.0).round_ties_even();
+                                    (x.is_finite()
+                                        && y.is_finite()
+                                        && x >= f64::from(i32::MIN)
+                                        && x <= f64::from(i32::MAX)
+                                        && y >= f64::from(i32::MIN)
+                                        && y <= f64::from(i32::MAX))
+                                    .then_some(Point {
+                                        x: x as i32,
+                                        y: y as i32,
+                                    })
+                                })
+                            } else {
+                                None
+                            }
                         } else {
-                            Point::default()
-                        }
-                    } else {
-                        Point::default()
-                    };
+                            None
+                        };
                     if style.border_style == 3 && (run.drawing.is_some() || !run.glyphs.is_empty())
                     {
                         // OUTLINE_BOX is produced per style run in libass. In
@@ -491,26 +509,47 @@ impl RenderEngine {
                         let drawing_top = baseline.saturating_sub(drawing_height);
                         let pbo_script = drawing_pbo_script_pixels(&effective_style, drawing)
                             * style_scale(effective_style.scale_y);
-                        if let Some(mut plane) =
-                            drawing_polygons.map(Vec::as_slice).and_then(|polygons| {
-                                image_plane_from_drawing(
-                                    polygons,
-                                    DrawingPlaneParams {
-                                        origin_x: run_origin_x,
-                                        line_top: drawing_top,
-                                        color: resolve_run_fill_color(
-                                            run,
-                                            &effective_style,
-                                            source_event,
-                                            now_ms,
-                                        ),
-                                        render_scale_y: render_scale_all.y,
-                                        baseline_offset: pbo_script,
-                                        anchor_phase_d6: run_drawing_anchor_phase_d6,
+                        let quantized_drawing = run_drawing_exact_anchor_d6.and_then(|anchor_d6| {
+                            quantized_identity_drawing(
+                                drawing,
+                                &run.text,
+                                effective_style.scale_x,
+                                effective_style.scale_y,
+                                render_scale_all.x,
+                                render_scale_all.y,
+                                anchor_d6,
+                                effective_style.pbo,
+                            )
+                        });
+                        let raster_polygons = quantized_drawing
+                            .as_ref()
+                            .map(|drawing| drawing.polygons.as_slice())
+                            .or_else(|| drawing_polygons.map(Vec::as_slice));
+                        if let Some(mut plane) = raster_polygons.and_then(|polygons| {
+                            let (origin_x, line_top, baseline_offset, anchor_phase_d6) =
+                                quantized_drawing.as_ref().map_or(
+                                    (run_origin_x, drawing_top, pbo_script, Point::default()),
+                                    |drawing| {
+                                        (drawing.origin.x, drawing.origin.y, 0.0, drawing.phase_d6)
                                     },
-                                )
-                            })
-                        {
+                                );
+                            image_plane_from_drawing(
+                                polygons,
+                                DrawingPlaneParams {
+                                    origin_x,
+                                    line_top,
+                                    color: resolve_run_fill_color(
+                                        run,
+                                        &effective_style,
+                                        source_event,
+                                        now_ms,
+                                    ),
+                                    render_scale_y: render_scale_all.y,
+                                    baseline_offset,
+                                    anchor_phase_d6,
+                                },
+                            )
+                        }) {
                             let drawing_fill_blur = if effective_style.border_x > 0.0
                                 || effective_style.border_y > 0.0
                                 || effective_style.shadow_x.abs() > f64::EPSILON

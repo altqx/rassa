@@ -133,17 +133,26 @@ pub(crate) fn renderer_blur_scales(
     track: &ParsedTrack,
     config: &RendererConfig,
     font_scale: f64,
+    mapping: &EventMapping,
 ) -> (f64, f64) {
-    let frame = frame_content_size(track, config);
     let layout = filter_layout_resolution(track, config);
     let font_scale = if font_scale.is_finite() {
         font_scale.max(0.0)
     } else {
         1.0
     };
+    let (font_screen_width, font_screen_height) = if !mapping.explicit && mapping.use_margins {
+        (mapping.fit_w, mapping.fit_h)
+    } else {
+        let frame = frame_content_size(track, config);
+        (
+            f64::from(frame.width.max(1)),
+            f64::from(frame.height.max(1)),
+        )
+    };
     (
-        style_scale(f64::from(frame.width.max(1)) / f64::from(layout.width.max(1))) * font_scale,
-        style_scale(f64::from(frame.height.max(1)) / f64::from(layout.height.max(1))) * font_scale,
+        style_scale(font_screen_width / f64::from(layout.width.max(1))) * font_scale,
+        style_scale(font_screen_height / f64::from(layout.height.max(1))) * font_scale,
     )
 }
 
@@ -436,5 +445,37 @@ mod wrap_scale_tests {
         assert_eq!(explicit.spacing, 2.25);
         assert_eq!(explicit.drawing, 2.25);
         assert_eq!(explicit.available_width, 2.25);
+    }
+
+    #[test]
+    fn blur_scales_use_aspect_fitted_screen_for_normal_margin_events() {
+        let track = ParsedTrack {
+            play_res_x: 640,
+            play_res_y: 480,
+            ..ParsedTrack::default()
+        };
+        let config = RendererConfig {
+            frame: Size {
+                width: 1920,
+                height: 1080,
+            },
+            margins: rassa_core::Margins {
+                left: 240,
+                right: 240,
+                top: 140,
+                bottom: 140,
+            },
+            use_margins: true,
+            ..RendererConfig::default()
+        };
+        let normal_mapping = event_mapping(&track, &config, false);
+        let explicit_mapping = event_mapping(&track, &config, true);
+        let normal = renderer_blur_scales(&track, &config, 1.0, &normal_mapping);
+        let explicit = renderer_blur_scales(&track, &config, 1.0, &explicit_mapping);
+
+        assert!((normal.0 - normal_mapping.fit_w / 640.0).abs() < 1e-12);
+        assert!((normal.1 - normal_mapping.fit_h / 480.0).abs() < 1e-12);
+        assert_eq!(explicit, (2.25, 5.0 / 3.0));
+        assert_ne!(normal, explicit);
     }
 }
