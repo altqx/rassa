@@ -128,42 +128,80 @@ fn ass_be_padding(be: u32) -> usize {
 
 fn apply_ass_be_blur(bitmap: &mut [u8], width: usize, height: usize, be: u32) {
     let passes = be.min(127);
+    let mut scratch = vec![0_u16; bitmap.len()];
     if passes > 1 {
         for value in bitmap.iter_mut() {
             *value = ((*value >> 1) + 1) >> 1;
         }
         for _ in 1..passes {
-            ass_be_blur_pass(bitmap, width, height);
+            ass_be_blur_pass(bitmap, width, height, &mut scratch);
         }
         for value in bitmap.iter_mut() {
             let expanded = (u16::from(*value) << 2) - u16::from(*value > 32);
             *value = expanded.min(u16::from(u8::MAX)) as u8;
         }
     }
-    ass_be_blur_pass(bitmap, width, height);
+    ass_be_blur_pass(bitmap, width, height, &mut scratch);
 }
 
-fn ass_be_blur_pass(bitmap: &mut [u8], width: usize, height: usize) {
-    let source = bitmap.to_vec();
-    const WEIGHTS: [u32; 3] = [1, 2, 1];
+fn ass_be_blur_pass(bitmap: &mut [u8], width: usize, height: usize, scratch: &mut [u16]) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    // Horizontal [1, 2, 1] accumulation. Keep the unrounded sum for the vertical pass.
     for y in 0..height {
-        for x in 0..width {
-            let mut sum = 0_u32;
-            for (kernel_y, weight_y) in WEIGHTS.iter().copied().enumerate() {
-                let sample_y = y as isize + kernel_y as isize - 1;
-                if !(0..height as isize).contains(&sample_y) {
-                    continue;
-                }
-                for (kernel_x, weight_x) in WEIGHTS.iter().copied().enumerate() {
-                    let sample_x = x as isize + kernel_x as isize - 1;
-                    if (0..width as isize).contains(&sample_x) {
-                        sum += u32::from(source[sample_y as usize * width + sample_x as usize])
-                            * weight_x
-                            * weight_y;
-                    }
+        let row_start = y * width;
+        let source = &bitmap[row_start..row_start + width];
+        let target = &mut scratch[row_start..row_start + width];
+        if width == 1 {
+            target[0] = u16::from(source[0]) * 2;
+            continue;
+        }
+
+        target[0] = u16::from(source[0]) * 2 + u16::from(source[1]);
+        for x in 1..width - 1 {
+            target[x] =
+                u16::from(source[x - 1]) + u16::from(source[x]) * 2 + u16::from(source[x + 1]);
+        }
+        target[width - 1] = u16::from(source[width - 2]) + u16::from(source[width - 1]) * 2;
+    }
+
+    // Vertical [1, 2, 1] accumulation with zero-valued samples outside the bitmap.
+    for y in 0..height {
+        let row_start = y * width;
+        let target = &mut bitmap[row_start..row_start + width];
+        let current = &scratch[row_start..row_start + width];
+        match (y.checked_sub(1), (y + 1 < height).then_some(y + 1)) {
+            (Some(above_y), Some(below_y)) => {
+                let above = &scratch[above_y * width..(above_y + 1) * width];
+                let below = &scratch[below_y * width..(below_y + 1) * width];
+                for (((value, above), current), below) in
+                    target.iter_mut().zip(above).zip(current).zip(below)
+                {
+                    let sum = u32::from(*above) + u32::from(*current) * 2 + u32::from(*below);
+                    *value = (sum >> 4) as u8;
                 }
             }
-            bitmap[y * width + x] = (sum >> 4) as u8;
+            (Some(above_y), None) => {
+                let above = &scratch[above_y * width..(above_y + 1) * width];
+                for ((value, above), current) in target.iter_mut().zip(above).zip(current) {
+                    let sum = u32::from(*above) + u32::from(*current) * 2;
+                    *value = (sum >> 4) as u8;
+                }
+            }
+            (None, Some(below_y)) => {
+                let below = &scratch[below_y * width..(below_y + 1) * width];
+                for ((value, current), below) in target.iter_mut().zip(current).zip(below) {
+                    let sum = u32::from(*current) * 2 + u32::from(*below);
+                    *value = (sum >> 4) as u8;
+                }
+            }
+            (None, None) => {
+                for (value, current) in target.iter_mut().zip(current) {
+                    *value = ((u32::from(*current) * 2) >> 4) as u8;
+                }
+            }
         }
     }
 }
@@ -171,6 +209,84 @@ fn ass_be_blur_pass(bitmap: &mut [u8], width: usize, height: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_ass_be_blur_pass(bitmap: &mut [u8], width: usize, height: usize) {
+        let source = bitmap.to_vec();
+        const WEIGHTS: [u32; 3] = [1, 2, 1];
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0_u32;
+                for (kernel_y, weight_y) in WEIGHTS.iter().copied().enumerate() {
+                    let sample_y = y as isize + kernel_y as isize - 1;
+                    if !(0..height as isize).contains(&sample_y) {
+                        continue;
+                    }
+                    for (kernel_x, weight_x) in WEIGHTS.iter().copied().enumerate() {
+                        let sample_x = x as isize + kernel_x as isize - 1;
+                        if (0..width as isize).contains(&sample_x) {
+                            sum += u32::from(source[sample_y as usize * width + sample_x as usize])
+                                * weight_x
+                                * weight_y;
+                        }
+                    }
+                }
+                bitmap[y * width + x] = (sum >> 4) as u8;
+            }
+        }
+    }
+
+    fn reference_apply_ass_be_blur(bitmap: &mut [u8], width: usize, height: usize, be: u32) {
+        let passes = be.min(127);
+        if passes > 1 {
+            for value in bitmap.iter_mut() {
+                *value = ((*value >> 1) + 1) >> 1;
+            }
+            for _ in 1..passes {
+                reference_ass_be_blur_pass(bitmap, width, height);
+            }
+            for value in bitmap.iter_mut() {
+                let expanded = (u16::from(*value) << 2) - u16::from(*value > 32);
+                *value = expanded.min(u16::from(u8::MAX)) as u8;
+            }
+        }
+        reference_ass_be_blur_pass(bitmap, width, height);
+    }
+
+    fn random_byte(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 32) as u8
+    }
+
+    #[test]
+    fn separable_be_blur_matches_reference_for_edges_and_multiple_passes() {
+        let mut state = 0x7E57_D15C_A11C_E5E5;
+        for height in 1..=8 {
+            for width in 1..=9 {
+                for _ in 0..3 {
+                    let source = (0..width * height)
+                        .map(|_| random_byte(&mut state))
+                        .collect::<Vec<_>>();
+                    for be in [1, 2, 4, 8] {
+                        let mut expected = source.clone();
+                        reference_apply_ass_be_blur(&mut expected, width, height, be);
+                        let mut actual = source.clone();
+                        apply_ass_be_blur(&mut actual, width, height, be);
+                        assert_eq!(actual, expected, "{width}x{height}, be={be}");
+                    }
+                }
+            }
+        }
+
+        let mut corner_impulse = vec![0_u8; 5 * 4];
+        corner_impulse[0] = 255;
+        corner_impulse[5 * 4 - 1] = 193;
+        let mut expected = corner_impulse.clone();
+        reference_apply_ass_be_blur(&mut expected, 5, 4, 127);
+        apply_ass_be_blur(&mut corner_impulse, 5, 4, 127);
+        assert_eq!(corner_impulse, expected);
+    }
 
     #[test]
     fn gaussian_blur_uses_libass_logarithmic_buckets() {

@@ -1,13 +1,19 @@
 //! Safe Rust API and native `librassa.so` target for rassa.
 
+use std::fmt;
+
 pub use rassa_core::{
     ImagePlane, Margins, Point, RassaError, RassaResult, Rect, RendererConfig, RgbaColor, Size, ass,
 };
-pub use rassa_fonts::{AttachedFontProvider, FontAttachment, FontProvider, FontconfigProvider};
+pub use rassa_fonts::{
+    AttachedFontProvider, FontAttachment, FontProvider, FontProviderCacheKey, FontconfigProvider,
+};
 pub use rassa_parse::{
     ParsedAttachment, ParsedEvent, ParsedSpanStyle, ParsedStyle, ParsedTrack, parse_script_text,
 };
-pub use rassa_render::{PreparedFrame, RenderEngine, RenderSelection, default_renderer_config};
+pub use rassa_render::{
+    PreparedFrame, RenderEngine, RenderSelection, RenderTrackCacheKey, default_renderer_config,
+};
 
 /// C ABI symbols exported by `librassa.so`.
 pub mod capi {
@@ -15,20 +21,39 @@ pub mod capi {
 }
 
 /// Parsed ASS/SSA subtitle script for the safe Rust API.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct Script {
     track: ParsedTrack,
+    render_cache_key: RenderTrackCacheKey,
+}
+
+impl fmt::Debug for Script {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Script")
+            .field("track", &self.track)
+            .finish()
+    }
+}
+
+impl PartialEq for Script {
+    fn eq(&self, other: &Self) -> bool {
+        self.track == other.track
+    }
 }
 
 impl Script {
     /// Parse an ASS/SSA script from UTF-8 text.
     pub fn parse(text: &str) -> RassaResult<Self> {
-        parse_script_text(text).map(|track| Self { track })
+        parse_script_text(text).map(Self::from_track)
     }
 
     /// Wrap an already parsed track.
     pub fn from_track(track: ParsedTrack) -> Self {
-        Self { track }
+        Self {
+            track,
+            render_cache_key: RenderTrackCacheKey::new(),
+        }
     }
 
     /// Borrow the underlying parsed track for advanced users.
@@ -75,8 +100,14 @@ impl Renderer {
 
     /// Render using the default fontconfig-backed provider.
     pub fn render_frame(&self, script: &Script, now_ms: i64) -> RassaResult<Frame> {
-        let provider = FontconfigProvider::new();
-        self.render_frame_with_provider(script, &provider, now_ms)
+        Ok(Frame {
+            now_ms,
+            planes: self.engine.render_frame_cached(
+                script.track(),
+                now_ms,
+                &script.render_cache_key,
+            ),
+        })
     }
 
     /// Render using an explicit font provider.
@@ -88,9 +119,13 @@ impl Renderer {
     ) -> RassaResult<Frame> {
         Ok(Frame {
             now_ms,
-            planes: self
-                .engine
-                .render_frame_with_provider(script.track(), provider, now_ms),
+            planes: self.engine.render_frame_with_provider_and_config_cached(
+                script.track(),
+                provider,
+                now_ms,
+                &default_renderer_config(script.track()),
+                &script.render_cache_key,
+            ),
         })
     }
 
@@ -104,11 +139,12 @@ impl Renderer {
     ) -> RassaResult<Frame> {
         Ok(Frame {
             now_ms,
-            planes: self.engine.render_frame_with_provider_and_config(
+            planes: self.engine.render_frame_with_provider_and_config_cached(
                 script.track(),
                 provider,
                 now_ms,
                 config,
+                &script.render_cache_key,
             ),
         })
     }

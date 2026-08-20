@@ -243,7 +243,7 @@ Add the crate from crates.io:
 
 ```toml
 [dependencies]
-rassa = "0.7.0"
+rassa = "0.7.1"
 ```
 
 Or, inside this repository, use a path dependency while developing:
@@ -317,7 +317,7 @@ The Rust API is not the same as either shared-library package. Use the `rassa` c
 
 ## Published crates and docs
 
-The current published version is `0.7.0`.
+The current published version is `0.7.1`.
 
 | Crate | Purpose | Docs |
 | --- | --- | --- |
@@ -378,6 +378,20 @@ cargo test -q
 cargo clippy --all-targets -- -D warnings
 cargo build --release -p rassa-check -p rassa -p rassa-libass-capi
 ```
+
+Check that the safe Rust API and C API produce exactly the same image-plane
+metadata and bitmap bytes, then measure warmed dynamic rendering and repeated
+same-frame calls:
+
+```sh
+cargo run --release -p rassa-test --bin rassa-perf -- \
+  --iterations 1000 --samples 9 --warmup 200
+```
+
+The benchmark excludes parser/provider setup, emits diff-friendly key/value
+records, and fails before timing if any Rust/C output differs. For a quick
+correctness-only gate, pass `--verify-only`. Pinning the process to one CPU with
+`taskset -c <cpu>` can reduce scheduler noise on Linux.
 
 Non-pixel compatibility gates use pinned upstream revisions and fail on API or
 memory/layout invariants, not raster differences. Verify that the public C

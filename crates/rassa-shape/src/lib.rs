@@ -21,7 +21,25 @@ enum FontBytesSource {
 struct CachedFontBytes {
     bytes: Arc<Vec<u8>>,
     identity: u64,
+    revision: FontBytesRevision,
     source: FontBytesSource,
+}
+
+#[derive(Clone, Debug)]
+struct FontBytesRevision(Arc<()>);
+
+impl PartialEq for FontBytesRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FontBytesRevision {}
+
+impl Hash for FontBytesRevision {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
 }
 
 static FONT_BYTES_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFontBytes>>> = OnceLock::new();
@@ -55,6 +73,7 @@ pub fn register_virtual_font_bytes(path: impl Into<PathBuf>, bytes: impl Into<Ve
             CachedFontBytes {
                 identity: bytes_identity(bytes.as_slice()),
                 bytes,
+                revision: FontBytesRevision(Arc::new(())),
                 source: FontBytesSource::Virtual,
             },
         );
@@ -69,7 +88,7 @@ pub fn virtual_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
         .map(|entry| entry.bytes.clone())
 }
 
-fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+fn cached_font_entry(path: &Path) -> Option<(Arc<Vec<u8>>, u64, FontBytesRevision)> {
     let source = file_source(path);
     {
         let cache = font_bytes_cache()
@@ -78,7 +97,7 @@ fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
         if let Some(entry) = cache.get(path)
             && (entry.source == FontBytesSource::Virtual || source.as_ref() == Some(&entry.source))
         {
-            return Some(entry.bytes.clone());
+            return Some((entry.bytes.clone(), entry.identity, entry.revision.clone()));
         }
     }
 
@@ -91,35 +110,97 @@ fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
         .get(path)
         .filter(|entry| entry.source == FontBytesSource::Virtual)
     {
-        return Some(entry.bytes.clone());
+        return Some((entry.bytes.clone(), entry.identity, entry.revision.clone()));
     }
+    let identity = bytes_identity(bytes.as_slice());
+    let revision = FontBytesRevision(Arc::new(()));
     cache.insert(
         path.to_path_buf(),
         CachedFontBytes {
-            identity: bytes_identity(bytes.as_slice()),
+            identity,
             bytes: bytes.clone(),
+            revision: revision.clone(),
             source: source?,
         },
     );
-    Some(bytes)
+    Some((bytes, identity, revision))
+}
+
+fn cached_font_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+    cached_font_entry(path).map(|(bytes, _, _)| bytes)
 }
 
 /// Content identity for the font at `path`; raster caches must not reuse another payload.
 pub fn font_bytes_identity(path: &Path) -> Option<u64> {
-    cached_font_bytes(path)?;
-    font_bytes_cache()
-        .lock()
-        .expect("font bytes cache mutex poisoned")
-        .get(path)
-        .map(|entry| entry.identity)
+    cached_font_entry(path).map(|(_, identity, _)| identity)
 }
 
-use harfrust::{Direction, Feature, FontRef, Language, ShapeOptions, ShaperData, UnicodeBuffer};
+use harfrust::{
+    Direction, Feature, FontRef, Language, ShapeOptions, ShaperData, Tag, UnicodeBuffer,
+};
 use rassa_core::RassaResult;
 use rassa_fonts::{
     FontMatch, FontProvider, FontQuery, font_face_glyph_index, font_face_uses_legacy_charmap,
 };
 use rassa_unicode::{BidiDirection, TextSegment, UnicodeAnalysis, UnicodePipeline};
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ComplexFaceCacheKey {
+    revision: FontBytesRevision,
+    face_index: u32,
+}
+
+struct CachedComplexFace {
+    shaper_data: ShaperData,
+    gdi_height: Option<f32>,
+    uses_legacy_charmap: bool,
+}
+
+static COMPLEX_FACE_CACHE: OnceLock<Mutex<HashMap<ComplexFaceCacheKey, Arc<CachedComplexFace>>>> =
+    OnceLock::new();
+const COMPLEX_FACE_CACHE_MAX: usize = 256;
+
+fn complex_face_cache() -> &'static Mutex<HashMap<ComplexFaceCacheKey, Arc<CachedComplexFace>>> {
+    COMPLEX_FACE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_complex_face(
+    bytes: &[u8],
+    revision: FontBytesRevision,
+    face_index: u32,
+) -> Option<Arc<CachedComplexFace>> {
+    let key = ComplexFaceCacheKey {
+        revision,
+        face_index,
+    };
+    if let Some(face) = complex_face_cache()
+        .lock()
+        .expect("complex face cache mutex poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Some(face);
+    }
+
+    let parsed_face = ttf_parser::Face::parse(bytes, face_index).ok()?;
+    let font_ref = FontRef::from_index(bytes, face_index).ok()?;
+    let face = Arc::new(CachedComplexFace {
+        shaper_data: ShaperData::new(&font_ref),
+        gdi_height: gdi_font_height_face(&parsed_face),
+        uses_legacy_charmap: font_face_uses_legacy_charmap(&parsed_face),
+    });
+    let mut cache = complex_face_cache()
+        .lock()
+        .expect("complex face cache mutex poisoned");
+    if let Some(existing) = cache.get(&key) {
+        return Some(existing.clone());
+    }
+    if cache.len() >= COMPLEX_FACE_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(key, face.clone());
+    Some(face)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShapingMode {
@@ -460,15 +541,15 @@ impl ShapeEngine {
         horizontal_spacing: bool,
     ) -> Option<Vec<GlyphInfo>> {
         let font_path = font.path.as_ref()?;
-        let bytes = cached_font_bytes(font_path)?;
-        let face = ttf_parser::Face::parse(bytes.as_slice(), font.face_index.unwrap_or(0)).ok()?;
+        let (bytes, _, revision) = cached_font_entry(font_path)?;
+        let face_index = font.face_index.unwrap_or(0);
+        let cached_face = cached_complex_face(bytes.as_slice(), revision, face_index)?;
         // Legacy Microsoft cmaps cannot go through HarfBuzz; use the glyph-ID simple path.
-        if font_face_uses_legacy_charmap(&face) {
+        if cached_face.uses_legacy_charmap {
             return None;
         }
-        let font_ref = FontRef::from_index(bytes.as_slice(), font.face_index.unwrap_or(0)).ok()?;
-        let shaper_data = ShaperData::new(&font_ref);
-        let shaper = shaper_data.shaper(&font_ref).build();
+        let font_ref = FontRef::from_index(bytes.as_slice(), face_index).ok()?;
+        let shaper = cached_face.shaper_data.shaper(&font_ref).build();
 
         let mut buffer = UnicodeBuffer::new();
         buffer.push_str(&segment.text);
@@ -482,8 +563,7 @@ impl ShapeEngine {
         let glyph_buffer = shaper.shape(buffer, ShapeOptions::new().features(&features));
         // Scale by GDI font height, not units_per_em; ASS font size is line height.
         let units_per_em = shaper.units_per_em().max(1) as f32;
-        let gdi_height = gdi_font_height_units(bytes.as_slice(), font.face_index.unwrap_or(0))
-            .unwrap_or(units_per_em);
+        let gdi_height = cached_face.gdi_height.unwrap_or(units_per_em);
         let scale = font_size
             .filter(|size| size.is_finite() && *size > 0.0)
             .unwrap_or(1.0)
@@ -607,25 +687,17 @@ pub fn reorder_bidi_runs<T>(runs: &mut [(T, u8)]) {
 
 /// OpenType features from libass `set_run_features` and `ass_shaper_set_kerning`.
 fn libass_run_features(kerning: bool, vertical: bool, horizontal_spacing: bool) -> [Feature; 5] {
-    let feature = |tag: &str, enabled: bool| {
-        Feature::from_str(&format!("{tag}={}", u8::from(enabled)))
-            .expect("static OpenType feature tag is valid")
-    };
+    let feature = |tag, enabled| Feature::new(Tag::new(tag), u32::from(enabled), ..);
     [
-        feature("vert", vertical),
-        feature("vkna", vertical),
-        feature("kern", kerning),
-        feature("liga", !horizontal_spacing),
-        feature("clig", !horizontal_spacing),
+        feature(b"vert", vertical),
+        feature(b"vkna", vertical),
+        feature(b"kern", kerning),
+        feature(b"liga", !horizontal_spacing),
+        feature(b"clig", !horizontal_spacing),
     ]
 }
 
 /// GDI/libass font height: signed OS/2 win metrics, then hhea, typo, then head bbox.
-fn gdi_font_height_units(bytes: &[u8], face_index: u32) -> Option<f32> {
-    let face = ttf_parser::Face::parse(bytes, face_index).ok()?;
-    gdi_font_height_face(&face)
-}
-
 fn gdi_font_height_face(face: &ttf_parser::Face<'_>) -> Option<f32> {
     if let Some(os2) = face.tables().os2 {
         let win_height = i32::from(os2.windows_ascender()) - i32::from(os2.windows_descender());

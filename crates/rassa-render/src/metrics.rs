@@ -1,4 +1,10 @@
 use super::*;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+    time::SystemTime,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FontVerticalMetrics {
@@ -10,6 +16,50 @@ pub(crate) struct FontVerticalMetrics {
     pub(crate) strikeout_26_6: Option<(i32, i32)>,
     /// Scaled OS/2 sTypoDescender for DECO_ROTATE @font offset; 0 without OS/2.
     pub(crate) typo_descender_26_6: i32,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct FontVerticalMetricsCacheKey {
+    path: PathBuf,
+    face_index: u32,
+    size_26_6: i32,
+    file_len: u64,
+    modified: Option<SystemTime>,
+}
+
+static FONT_VERTICAL_METRICS_CACHE: OnceLock<
+    Mutex<HashMap<FontVerticalMetricsCacheKey, FontVerticalMetrics>>,
+> = OnceLock::new();
+const FONT_VERTICAL_METRICS_CACHE_MAX: usize = 4_096;
+
+fn font_vertical_metrics_cache()
+-> &'static Mutex<HashMap<FontVerticalMetricsCacheKey, FontVerticalMetrics>> {
+    FONT_VERTICAL_METRICS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn font_vertical_metrics_cache_key(
+    font: &FontMatch,
+    size_26_6: i32,
+) -> Option<FontVerticalMetricsCacheKey> {
+    let path = font.path.as_ref()?;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FontVerticalMetricsCacheKey {
+        path: path.clone(),
+        face_index: font.face_index.unwrap_or(0),
+        size_26_6: size_26_6.max(64),
+        file_len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn cache_font_vertical_metrics(key: FontVerticalMetricsCacheKey, metrics: FontVerticalMetrics) {
+    let mut cache = font_vertical_metrics_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= FONT_VERTICAL_METRICS_CACHE_MAX && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, metrics);
 }
 
 /// Line asc/desc is max win-metrics × \fscy; drawings use asc = height - pbo, desc = pbo.
@@ -313,6 +363,17 @@ pub(crate) fn font_vertical_metrics(
     font: &FontMatch,
     size_26_6: i32,
 ) -> Option<FontVerticalMetrics> {
+    let cache_key = font_vertical_metrics_cache_key(font, size_26_6);
+    if let Some(metrics) = cache_key.as_ref().and_then(|key| {
+        font_vertical_metrics_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }) {
+        return Some(metrics);
+    }
+
     let font_path = font.path.as_ref()?;
     let library = Library::init().ok()?;
     let mut face = library
@@ -355,13 +416,17 @@ pub(crate) fn font_vertical_metrics(
         .map(|os2| scale(os2.sTypoDescender.into()))
         .unwrap_or(0);
 
-    Some(FontVerticalMetrics {
+    let metrics = FontVerticalMetrics {
         ascender_26_6: ascender,
         descender_26_6: descender,
         underline_26_6: underline,
         strikeout_26_6: strikeout,
         typo_descender_26_6: typo_descender,
-    })
+    };
+    if let Some(cache_key) = cache_key {
+        cache_font_vertical_metrics(cache_key, metrics);
+    }
+    Some(metrics)
 }
 
 #[cfg(any(target_os = "macos", target_arch = "wasm32", not(unix)))]
@@ -369,9 +434,24 @@ pub(crate) fn font_vertical_metrics(
     font: &FontMatch,
     size_26_6: i32,
 ) -> Option<FontVerticalMetrics> {
+    let cache_key = font_vertical_metrics_cache_key(font, size_26_6);
+    if let Some(metrics) = cache_key.as_ref().and_then(|key| {
+        font_vertical_metrics_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }) {
+        return Some(metrics);
+    }
+
     let font_path = font.path.as_ref()?;
     let data = std::fs::read(font_path).ok()?;
-    font_vertical_metrics_from_data(&data, font.face_index.unwrap_or(0), size_26_6)
+    let metrics = font_vertical_metrics_from_data(&data, font.face_index.unwrap_or(0), size_26_6)?;
+    if let Some(cache_key) = cache_key {
+        cache_font_vertical_metrics(cache_key, metrics);
+    }
+    Some(metrics)
 }
 
 /// FreeType-free metrics: win → typo → bbox, then REAL_DIM via FT_DivFix/FT_MulFix rounding.

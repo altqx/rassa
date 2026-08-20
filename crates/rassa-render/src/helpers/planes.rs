@@ -598,11 +598,13 @@ pub(crate) fn combined_image_plane_from_glyphs_xy(
         let glyph_height = glyph.height as usize;
         let glyph_stride = glyph.stride as usize;
         for y in 0..glyph_height {
-            for x in 0..glyph_width {
-                let src = glyph.bitmap[y * glyph_stride + x];
-                let dst = &mut bitmap[(y0 + y) * width + x0 + x];
+            let source_start = y * glyph_stride;
+            let source_row = &glyph.bitmap[source_start..source_start + glyph_width];
+            let target_start = (y0 + y) * width + x0;
+            let target_row = &mut bitmap[target_start..target_start + glyph_width];
+            for (dst, src) in target_row.iter_mut().zip(source_row) {
                 // Overlapping glyph coverage adds and clips at 255.
-                *dst = dst.saturating_add(src);
+                *dst = dst.saturating_add(*src);
             }
         }
         pen_x += glyph.advance_x_26_6;
@@ -664,16 +666,23 @@ pub(crate) fn combined_image_plane_from_positioned_glyphs(
         let glyph_width = usize::try_from(glyph.width).ok()?;
         let glyph_height = usize::try_from(glyph.height).ok()?;
         let glyph_stride = usize::try_from(glyph.stride).ok()?;
+        let source_end = (glyph_height - 1)
+            .checked_mul(glyph_stride)?
+            .checked_add(glyph_width)?;
+        glyph.bitmap.get(..source_end)?;
+        let target_right = x0.checked_add(glyph_width)?;
+        let target_bottom = y0.checked_add(glyph_height)?;
+        if target_right > width || target_bottom > height {
+            return None;
+        }
         for y in 0..glyph_height {
-            for x in 0..glyph_width {
-                let source = glyph
-                    .bitmap
-                    .get(y.checked_mul(glyph_stride)?.checked_add(x)?)?;
-                let target = bitmap.get_mut(
-                    (y0 + y)
-                        .checked_mul(width)?
-                        .checked_add(x0.checked_add(x)?)?,
-                )?;
+            // The complete source and target extents were validated above, so the hot loop
+            // only takes one slice per row instead of checking both indices per pixel.
+            let source_start = y * glyph_stride;
+            let source_row = &glyph.bitmap[source_start..source_start + glyph_width];
+            let target_start = (y0 + y) * width + x0;
+            let target_row = &mut bitmap[target_start..target_start + glyph_width];
+            for (target, source) in target_row.iter_mut().zip(source_row) {
                 *target = target.saturating_add(*source);
             }
         }

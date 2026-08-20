@@ -107,7 +107,7 @@ pub(crate) fn apply_vector_clip_d6(
 }
 
 fn mask_plane_with_vector_clip_d6(
-    plane: ImagePlane,
+    mut plane: ImagePlane,
     clip: &ParsedVectorClip,
     inverse: bool,
 ) -> Option<ImagePlane> {
@@ -133,7 +133,6 @@ fn mask_plane_with_vector_clip_d6(
     }
 
     let sample_grid = clip_sample_grid_d6(&clip.polygons);
-    let mut bitmap = plane.bitmap.clone();
     let mut clip_min_x = width;
     let mut clip_min_y = height;
     let mut clip_max_x = 0_usize;
@@ -152,20 +151,19 @@ fn mask_plane_with_vector_clip_d6(
             }
             let mask = if inverse { 255 - coverage } else { coverage };
             let index = row.checked_mul(stride)?.checked_add(column)?;
-            let source = u16::from(*bitmap.get(index)?);
-            *bitmap.get_mut(index)? = ((source * u16::from(mask) + 127) / 255) as u8;
+            let source = u16::from(*plane.bitmap.get(index)?);
+            *plane.bitmap.get_mut(index)? = ((source * u16::from(mask) + 127) / 255) as u8;
         }
     }
 
-    let masked = ImagePlane { bitmap, ..plane };
     if inverse {
-        return Some(masked);
+        return Some(plane);
     }
     if clip_min_x >= clip_max_x || clip_min_y >= clip_max_y {
-        return Some(zero_size_plane(masked));
+        return Some(zero_size_plane(plane));
     }
     crop_plane_to_bitmap_bounds(
-        masked, clip_min_x, clip_min_y, clip_max_x, clip_max_y, 0, 0, 0, 0,
+        plane, clip_min_x, clip_min_y, clip_max_x, clip_max_y, 0, 0, 0, 0,
     )
 }
 
@@ -250,7 +248,7 @@ fn vector_clip_pixel_coverage_d6(x: i64, y: i64, polygons: &[Vec<Point>], sample
 }
 
 pub(crate) fn mask_plane_with_vector_clip(
-    plane: ImagePlane,
+    mut plane: ImagePlane,
     clip: &ParsedVectorClip,
     inverse: bool,
 ) -> Option<ImagePlane> {
@@ -275,9 +273,6 @@ pub(crate) fn mask_plane_with_vector_clip(
     if stride < width || required_len > plane.bitmap.len() {
         return None;
     }
-    let mut bitmap = Vec::new();
-    bitmap.try_reserve_exact(plane.bitmap.len()).ok()?;
-    bitmap.extend_from_slice(&plane.bitmap);
     let mut clip_min_x = width;
     let mut clip_min_y = height;
     let mut clip_max_x = 0_usize;
@@ -301,20 +296,19 @@ pub(crate) fn mask_plane_with_vector_clip(
             let keep = if inverse { !inside } else { inside };
             let index = row.checked_mul(stride)?.checked_add(column)?;
             if !keep {
-                *bitmap.get_mut(index)? = 0;
+                *plane.bitmap.get_mut(index)? = 0;
             }
         }
     }
 
-    let masked = ImagePlane { bitmap, ..plane };
     if inverse {
-        return Some(masked);
+        return Some(plane);
     }
     if clip_min_x >= clip_max_x || clip_min_y >= clip_max_y {
-        return Some(zero_size_plane(masked));
+        return Some(zero_size_plane(plane));
     }
     crop_plane_to_bitmap_bounds(
-        masked, clip_min_x, clip_min_y, clip_max_x, clip_max_y, 0, 0, 0, 0,
+        plane, clip_min_x, clip_min_y, clip_max_x, clip_max_y, 0, 0, 0, 0,
     )
 }
 

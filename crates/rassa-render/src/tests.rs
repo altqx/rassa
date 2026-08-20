@@ -1,6 +1,7 @@
 use super::*;
 use rassa_fonts::{
-    FontProvider, FontProviderKind, FontQuery, FontconfigProvider, NullFontProvider,
+    FontProvider, FontProviderCacheKey, FontProviderKind, FontQuery, FontconfigProvider,
+    NullFontProvider,
 };
 use rassa_layout::LayoutLine;
 use rassa_parse::{ParsedAnimatedStyle, ParsedKaraokeSpan, ParsedSpanTransform, parse_script_text};
@@ -51,6 +52,38 @@ impl FontProvider for BundledFontProvider {
     fn resolve_for_text(&self, query: &FontQuery, _text: &str) -> FontMatch {
         // One face for every request, including missing-glyph .notdef.
         self.resolve(query)
+    }
+}
+
+struct CacheableBundledFontProvider {
+    provider: BundledFontProvider,
+    key: FontProviderCacheKey,
+}
+
+impl CacheableBundledFontProvider {
+    fn from_fixture(path: &str) -> Self {
+        Self {
+            provider: BundledFontProvider {
+                path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rassa-test/fixtures/libass/compare")
+                    .join(path),
+            },
+            key: FontProviderCacheKey::new(),
+        }
+    }
+}
+
+impl FontProvider for CacheableBundledFontProvider {
+    fn resolve(&self, query: &FontQuery) -> FontMatch {
+        self.provider.resolve(query)
+    }
+
+    fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
+        self.provider.resolve_for_text(query, text)
+    }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        Some(self.key.clone())
     }
 }
 
@@ -122,6 +155,61 @@ fn glyph_compositing_applies_fixed_point_shaped_positions() {
         }
     );
     assert_eq!(plane.bitmap, vec![0, 0, 255, 255, 0, 0]);
+}
+
+#[test]
+fn positioned_glyph_compositing_preserves_overlapping_source_rows() {
+    let glyphs = [PositionedRasterGlyph {
+        glyph: RasterGlyph {
+            width: 2,
+            height: 2,
+            stride: 1,
+            bitmap: vec![10, 20, 30],
+            ..RasterGlyph::default()
+        },
+        destination: Point::default(),
+    }];
+
+    let plane = combined_image_plane_from_positioned_glyphs(
+        &glyphs,
+        0,
+        ass::ImageType::Character,
+        BitmapBlur::default(),
+    )
+    .expect("overlapping source rows are valid when all addressed bytes exist");
+
+    assert_eq!(
+        plane.size,
+        Size {
+            width: 2,
+            height: 2
+        }
+    );
+    assert_eq!(plane.bitmap, vec![10, 20, 20, 30]);
+}
+
+#[test]
+fn positioned_glyph_compositing_rejects_short_source_rows() {
+    let glyphs = [PositionedRasterGlyph {
+        glyph: RasterGlyph {
+            width: 2,
+            height: 2,
+            stride: 2,
+            bitmap: vec![10, 20, 30],
+            ..RasterGlyph::default()
+        },
+        destination: Point::default(),
+    }];
+
+    assert!(
+        combined_image_plane_from_positioned_glyphs(
+            &glyphs,
+            0,
+            ass::ImageType::Character,
+            BitmapBlur::default(),
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -4496,6 +4584,47 @@ fn collision_positions_stay_stable_across_frames_like_libass() {
         second_y(&first_gone),
         "an event keeps its collision-assigned position after the other event ends"
     );
+
+    let engine = RenderEngine::new();
+    let provider = BundledFontProvider::aileron_regular();
+    let both_active = engine.render_frame_with_provider(&track, &provider, 200);
+    let first_gone = engine.render_frame_with_provider(&track, &provider, 1000);
+    assert_eq!(
+        second_y(&both_active),
+        second_y(&first_gone),
+        "collision persistence must not depend on a provider opting into layout caching"
+    );
+
+    let engine = RenderEngine::new();
+    let cacheable = CacheableBundledFontProvider::from_fixture("test/font2.otf");
+    let uncacheable = BundledFontProvider::aileron_regular();
+    let config = default_renderer_config(&track);
+    let track_key = RenderTrackCacheKey::new();
+    let other_track_key = RenderTrackCacheKey::new();
+    let both_active = engine
+        .render_frame_with_provider_and_config_cached(&track, &cacheable, 200, &config, &track_key);
+    let _ = engine.render_frame_with_provider_and_config_cached(
+        &track,
+        &uncacheable,
+        200,
+        &config,
+        &other_track_key,
+    );
+    assert_eq!(
+        engine.render_frame_with_provider_and_config_cached(
+            &track, &cacheable, 200, &config, &track_key,
+        ),
+        both_active,
+        "returning to the cacheable renderer identity preserves the rendered frame"
+    );
+    let first_gone = engine.render_frame_with_provider_and_config_cached(
+        &track, &cacheable, 1000, &config, &track_key,
+    );
+    assert_eq!(
+        second_y(&both_active),
+        second_y(&first_gone),
+        "an intervening uncacheable provider must not let a stale frame hit desynchronize collision state"
+    );
 }
 
 #[test]
@@ -4521,6 +4650,45 @@ fn collision_cache_invalidates_after_in_place_track_mutation() {
         visible_y(&after),
         "in-place track changes must invalidate cached collision rectangles"
     );
+}
+
+#[test]
+fn collision_state_distinguishes_uncacheable_provider_instances() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 240\nPlayResY: 120\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,0,0,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,First\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Second")
+        .expect("script should parse");
+    let first = BundledFontProvider::aileron_regular();
+    let second = BundledFontProvider::aileron_regular();
+    let engine = RenderEngine::new();
+
+    let _ = engine.render_frame_with_provider(&track, &first, 500);
+    let first_key = engine
+        .collision_state
+        .lock()
+        .expect("collision state mutex poisoned")
+        .key
+        .clone()
+        .expect("first render establishes collision identity");
+
+    let _ = engine.render_frame_with_provider(&track, &second, 500);
+    let second_key = engine
+        .collision_state
+        .lock()
+        .expect("collision state mutex poisoned")
+        .key
+        .clone()
+        .expect("second render establishes collision identity");
+
+    assert_ne!(first_key.provider, second_key.provider);
+
+    let _ = engine.render_frame_with_provider(&track, &first, 500);
+    let returned_key = engine
+        .collision_state
+        .lock()
+        .expect("collision state mutex poisoned")
+        .key
+        .clone()
+        .expect("returning to the first provider establishes collision identity");
+    assert_eq!(returned_key.provider, first_key.provider);
 }
 
 #[test]
@@ -5549,6 +5717,134 @@ fn blurred_vector_drawing_expands_fill_plane_like_libass() {
         (plane.size.height - 372).abs() <= 4,
         "height={}",
         plane.size.height
+    );
+}
+
+#[test]
+fn direct_track_render_detects_in_place_style_mutation_after_frame_cache_fill() {
+    let mut track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an7\\pos(10,10)\\p1}m 0 0 l 8 0 8 8 0 8")
+        .expect("drawing track parses");
+    let engine = RenderEngine::new();
+    let before = engine.render_frame_with_provider(&track, &NullFontProvider, 500);
+    assert_eq!(
+        engine.render_frame_with_provider(&track, &NullFontProvider, 500),
+        before,
+        "second render fills the repeat-frame cache"
+    );
+
+    let style_index = usize::try_from(track.events[0].style).expect("nonnegative style index");
+    track.styles[style_index].primary_colour = 0x0044_5566;
+    let after = engine.render_frame_with_provider(&track, &NullFontProvider, 500);
+
+    assert_ne!(after, before);
+    assert!(after.iter().any(|plane| plane.color.0 == 0x6655_4400));
+}
+
+#[test]
+fn cache_identity_uses_exact_floating_point_bits() {
+    let mut track = ParsedTrack::default();
+    let snapshot = RenderTrackSnapshot::from(&track);
+    track.styles[0].spacing = -0.0;
+    assert!(!snapshot.matches(&track));
+
+    let positive_zero = RendererConfig {
+        line_spacing: 0.0,
+        ..RendererConfig::default()
+    };
+    let negative_zero = RendererConfig {
+        line_spacing: -0.0,
+        ..RendererConfig::default()
+    };
+    assert_ne!(
+        RendererCacheKey::from(&positive_zero),
+        RendererCacheKey::from(&negative_zero)
+    );
+}
+
+#[test]
+fn switching_cacheable_font_provider_never_reuses_stale_frame_or_layout() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 320\nPlayResY: 180\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,fixture,30,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Wide WWW\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Narrow iii")
+        .expect("provider-switch track parses");
+    let first_provider = CacheableBundledFontProvider::from_fixture("test/font1.ttf");
+    let second_provider = CacheableBundledFontProvider::from_fixture("test/font2.otf");
+    let engine = RenderEngine::new();
+    let first = engine.render_frame_with_provider(&track, &first_provider, 500);
+    assert_eq!(
+        engine.render_frame_with_provider(&track, &first_provider, 500),
+        first
+    );
+    assert_eq!(
+        engine.render_frame_with_provider(&track, &first_provider, 500),
+        first,
+        "third identical render is served by the repeat-frame cache"
+    );
+
+    let expected_second =
+        RenderEngine::new().render_frame_with_provider(&track, &second_provider, 500);
+    let actual_second = engine.render_frame_with_provider(&track, &second_provider, 500);
+
+    assert_ne!(
+        first, expected_second,
+        "fixtures must exercise distinct layouts"
+    );
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
+fn static_frames_cache_across_timestamps_without_crossing_active_sets() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an7\\pos(10,10)\\p1}m 0 0 l 8 0 8 8 0 8\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an7\\pos(30,30)\\p1}m 0 0 l 8 0 8 8 0 8")
+        .expect("static drawing track parses");
+    let engine = RenderEngine::new();
+
+    let first = engine.render_frame_with_provider(&track, &NullFontProvider, 100);
+    {
+        let cache = engine.frame_cache.lock().expect("frame cache lock");
+        let cached = cache.as_ref().expect("static frame cached eagerly");
+        assert_eq!(cached.key.active_event_indices, [0]);
+        assert_eq!(cached.key.time_key, 0);
+        assert!(cached.planes.is_some());
+    }
+    assert_eq!(
+        engine.render_frame_with_provider(&track, &NullFontProvider, 900),
+        first
+    );
+
+    let second = engine.render_frame_with_provider(&track, &NullFontProvider, 1_100);
+    assert_ne!(second, first);
+    let cache = engine.frame_cache.lock().expect("frame cache lock");
+    let cached = cache.as_ref().expect("second static frame cached");
+    assert_eq!(cached.key.active_event_indices, [1]);
+    assert_eq!(cached.key.time_key, 0);
+}
+
+#[test]
+fn trusted_selected_render_canonicalizes_layer_order_and_matches_public_path() {
+    let track = parse_script_text("[Script Info]\nPlayResX: 100\nPlayResY: 100\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,sans,24,&H00112233,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 2,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an7\\pos(30,30)\\p1}m 0 0 l 8 0 8 8 0 8\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\\an7\\pos(10,10)\\p1}m 0 0 l 8 0 8 8 0 8")
+        .expect("layered drawing track parses");
+    let config = default_renderer_config(&track);
+    let expected = RenderEngine::new().render_frame_with_provider_and_config(
+        &track,
+        &NullFontProvider,
+        500,
+        &config,
+    );
+    let actual = RenderEngine::new().render_frame_with_provider_and_config_cached_selection(
+        &track,
+        &NullFontProvider,
+        500,
+        &config,
+        &RenderTrackCacheKey::new(),
+        &[0, 1],
+    );
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|plane| plane.kind == ass::ImageType::Character)
+            .map(|plane| plane.destination)
+            .collect::<Vec<_>>(),
+        vec![Point { x: 10, y: 10 }, Point { x: 30, y: 30 }]
     );
 }
 

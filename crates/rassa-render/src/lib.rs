@@ -1,15 +1,21 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 use freetype::{Library, ffi};
 use rassa_core::{ImagePlane, Point, Rect, RendererConfig, RgbaColor, Size, ass};
-use rassa_fonts::{FontMatch, FontProvider, FontconfigProvider};
+use rassa_fonts::{
+    FontMatch, FontProvider, FontProviderCacheKey, FontProviderInstanceKey, FontconfigProvider,
+};
 use rassa_layout::{LayoutEngine, LayoutEvent, LayoutFeatures, LayoutGlyphRun, LayoutWrapScales};
 use rassa_parse::{
     LIBASS_OUTLINE_MAX_D6, ParsedAxisTransform, ParsedColourTransform, ParsedDrawing, ParsedEvent,
     ParsedFade, ParsedFontSizeTransform, ParsedKaraokeMode, ParsedLinearTransform, ParsedMovement,
-    ParsedMovementExact, ParsedRectF64, ParsedScaleTransform, ParsedSpanStyle, ParsedTrack,
-    ParsedVectorClip, dialogue_has_libass_hard_override, libass_drawing_scale_base,
+    ParsedMovementExact, ParsedRectF64, ParsedScaleTransform, ParsedSpanStyle, ParsedStyle,
+    ParsedTrack, ParsedVectorClip, dialogue_has_libass_hard_override, libass_drawing_scale_base,
     libass_outline_coordinate_from_f64, libass_outline_point_is_valid,
     parse_dialogue_vector_clip_d6, parse_drawing_bbox_d6, parse_drawing_outline_cbox_d6,
     parse_drawing_polygons_d6,
@@ -28,12 +34,134 @@ pub struct PreparedFrame {
     pub active_events: Vec<LayoutEvent>,
 }
 
+/// Collision-free identity for an immutable parsed track.
+///
+/// This is an internal optimization boundary for owners, such as the safe facade's `Script`, that can
+/// guarantee the referenced [`ParsedTrack`] will not change. Direct `ParsedTrack` render methods
+/// continue to compare an exact snapshot so in-place mutations are always detected.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct RenderTrackCacheKey(Arc<()>);
+
+impl RenderTrackCacheKey {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl Default for RenderTrackCacheKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for RenderTrackCacheKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RenderTrackCacheKey(..)")
+    }
+}
+
+impl PartialEq for RenderTrackCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RenderTrackCacheKey {}
+
 #[derive(Default)]
 pub struct RenderEngine {
     layout: LayoutEngine,
-    // Per-event collision rect stays while height is unchanged; invalidated when renderer settings change.
-    collision_cache: std::sync::Mutex<HashMap<usize, Rect>>,
-    collision_render_id: std::sync::Mutex<u64>,
+    default_provider: FontconfigProvider,
+    checked_track: Mutex<Option<CheckedTrack>>,
+    layout_cache: Mutex<Option<CachedLayout>>,
+    frame_cache: Mutex<Option<CachedFrame>>,
+    collision_state: Mutex<CollisionState>,
+}
+
+struct CheckedTrack {
+    snapshot: RenderTrackSnapshot,
+    key: RenderTrackCacheKey,
+}
+
+#[derive(Clone, Debug)]
+struct RenderTrackSnapshot {
+    styles: Vec<ParsedStyle>,
+    events: Vec<ParsedEvent>,
+    track_type: ass::TrackType,
+    play_res_x: i32,
+    play_res_y: i32,
+    timer: f64,
+    wrap_style: i32,
+    scaled_border_and_shadow: bool,
+    kerning: bool,
+    language: String,
+    ycbcr_matrix: ass::YCbCrMatrix,
+    default_style: i32,
+    layout_res_x: i32,
+    layout_res_y: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RendererCacheKey {
+    frame: Size,
+    storage: Size,
+    margins: rassa_core::Margins,
+    use_margins: bool,
+    pixel_aspect_bits: u64,
+    font_scale_bits: u64,
+    selective_font_scale: bool,
+    line_spacing_bits: u64,
+    line_position_bits: u64,
+    hinting: ass::Hinting,
+    shaping: ass::ShapingLevel,
+    wrap_unicode: bool,
+    bidi_brackets: bool,
+    whole_text_layout: bool,
+}
+
+struct CachedLayout {
+    track_key: RenderTrackCacheKey,
+    config: RendererCacheKey,
+    provider_key: FontProviderCacheKey,
+    active_event_indices: Vec<usize>,
+    events: Arc<[LayoutEvent]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameCacheKey {
+    track_key: RenderTrackCacheKey,
+    config: RendererCacheKey,
+    provider_key: FontProviderCacheKey,
+    active_event_indices: Vec<usize>,
+    time_key: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CollisionCacheKey {
+    track_key: RenderTrackCacheKey,
+    config: RendererCacheKey,
+    provider: CollisionProviderKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CollisionProviderKey {
+    Stable(FontProviderCacheKey),
+    Instance(FontProviderInstanceKey),
+}
+
+#[derive(Default)]
+struct CollisionState {
+    key: Option<CollisionCacheKey>,
+    // Per-event rect stays while height is unchanged; invalidated when render inputs change.
+    events: HashMap<usize, Rect>,
+}
+
+struct CachedFrame {
+    key: FrameCacheKey,
+    /// Populated only after the same key is rendered twice, avoiding a clone on sequential frames.
+    planes: Option<Vec<ImagePlane>>,
 }
 
 mod metrics;
@@ -46,6 +174,32 @@ impl RenderEngine {
         Self::default()
     }
 
+    /// Drop only the rendered-plane cache while retaining parsed layout and collision state.
+    #[doc(hidden)]
+    pub fn clear_frame_cache(&self) {
+        *self.frame_cache.lock().expect("frame cache mutex poisoned") = None;
+    }
+
+    fn checked_track_key(&self, track: &ParsedTrack) -> RenderTrackCacheKey {
+        let mut checked = self
+            .checked_track
+            .lock()
+            .expect("checked track mutex poisoned");
+        if let Some(cached) = checked
+            .as_ref()
+            .filter(|cached| cached.snapshot.matches(track))
+        {
+            return cached.key.clone();
+        }
+
+        let key = RenderTrackCacheKey::new();
+        *checked = Some(CheckedTrack {
+            snapshot: RenderTrackSnapshot::from(track),
+            key: key.clone(),
+        });
+        key
+    }
+
     pub fn select_active_events(&self, track: &ParsedTrack, now_ms: i64) -> RenderSelection {
         let mut active_event_indices = track
             .events
@@ -53,19 +207,28 @@ impl RenderEngine {
             .enumerate()
             .filter_map(|(index, event)| is_event_active(event, now_ms).then_some(index))
             .collect::<Vec<_>>();
-        active_event_indices.sort_by(|left, right| {
-            let left_event = &track.events[*left];
-            let right_event = &track.events[*right];
-            left_event
-                .layer
-                .cmp(&right_event.layer)
-                .then(left_event.read_order.cmp(&right_event.read_order))
-                .then(left.cmp(right))
-        });
+        Self::sort_event_indices(track, &mut active_event_indices);
 
         RenderSelection {
             active_event_indices,
         }
+    }
+
+    fn sort_event_indices(track: &ParsedTrack, active_event_indices: &mut [usize]) {
+        active_event_indices.sort_unstable_by(|left, right| {
+            track
+                .events
+                .get(*left)
+                .zip(track.events.get(*right))
+                .map(|(left_event, right_event)| {
+                    left_event
+                        .layer
+                        .cmp(&right_event.layer)
+                        .then(left_event.read_order.cmp(&right_event.read_order))
+                        .then(left.cmp(right))
+                })
+                .unwrap_or_else(|| left.cmp(right))
+        });
     }
 
     pub fn prepare_frame<P: FontProvider>(
@@ -85,13 +248,29 @@ impl RenderEngine {
         config: &RendererConfig,
     ) -> PreparedFrame {
         let selection = self.select_active_events(track, now_ms);
+        let active_events =
+            self.layout_selected_events(track, provider, config, &selection.active_event_indices);
+
+        PreparedFrame {
+            now_ms,
+            active_events,
+        }
+    }
+
+    fn layout_selected_events<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        provider: &P,
+        config: &RendererConfig,
+        active_event_indices: &[usize],
+    ) -> Vec<LayoutEvent> {
         let shaping_mode = match config.shaping {
             ass::ShapingLevel::Simple => ShapingMode::Simple,
             ass::ShapingLevel::Complex => ShapingMode::Complex,
         };
-        let active_events = selection
-            .active_event_indices
-            .into_iter()
+        active_event_indices
+            .iter()
+            .copied()
             .filter_map(|index| {
                 let event = track.events.get(index)?;
                 let event_is_explicit = transition_effect_disables_collision(event)
@@ -112,12 +291,55 @@ impl RenderEngine {
                     )
                     .ok()
             })
-            .collect();
+            .collect()
+    }
 
-        PreparedFrame {
-            now_ms,
-            active_events,
+    fn active_events_for_render<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        provider: &P,
+        config: &RendererConfig,
+        track_key: &RenderTrackCacheKey,
+        provider_key: Option<&FontProviderCacheKey>,
+        active_event_indices: &[usize],
+    ) -> Arc<[LayoutEvent]> {
+        let Some(provider_key) = provider_key else {
+            return self
+                .layout_selected_events(track, provider, config, active_event_indices)
+                .into();
+        };
+        let config_key = RendererCacheKey::from(config);
+
+        if let Some(events) = self
+            .layout_cache
+            .lock()
+            .expect("layout cache mutex poisoned")
+            .as_ref()
+            .filter(|cached| {
+                cached.track_key == *track_key
+                    && cached.config == config_key
+                    && cached.provider_key == *provider_key
+                    && cached.active_event_indices == active_event_indices
+            })
+            .map(|cached| Arc::clone(&cached.events))
+        {
+            return events;
         }
+
+        let events: Arc<[LayoutEvent]> = self
+            .layout_selected_events(track, provider, config, active_event_indices)
+            .into();
+        *self
+            .layout_cache
+            .lock()
+            .expect("layout cache mutex poisoned") = Some(CachedLayout {
+            track_key: track_key.clone(),
+            config: config_key,
+            provider_key: provider_key.clone(),
+            active_event_indices: active_event_indices.to_vec(),
+            events: Arc::clone(&events),
+        });
+        events
     }
 
     pub fn render_frame_with_provider<P: FontProvider>(
@@ -141,29 +363,120 @@ impl RenderEngine {
         now_ms: i64,
         config: &RendererConfig,
     ) -> Vec<ImagePlane> {
-        let prepared = self.prepare_frame_with_config(track, provider, now_ms, config);
-        {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            format!("{config:?}").hash(&mut hasher);
-            track.play_res_x.hash(&mut hasher);
-            track.play_res_y.hash(&mut hasher);
-            // Hash every render-observable field: event-count alone leaves stale collision rects after in-place C API edits.
-            format!("{track:?}").hash(&mut hasher);
-            let render_id = hasher.finish();
-            let mut current = self
-                .collision_render_id
-                .lock()
-                .expect("collision render id mutex poisoned");
-            if *current != render_id {
-                *current = render_id;
-                self.collision_cache
-                    .lock()
-                    .expect("collision cache mutex poisoned")
-                    .clear();
-            }
+        let track_key = self.checked_track_key(track);
+        let selection = self.select_active_events(track, now_ms);
+        self.render_frame_with_key_and_selection(
+            track,
+            provider,
+            now_ms,
+            config,
+            &track_key,
+            selection.active_event_indices,
+        )
+    }
+
+    /// Render an immutable track without rescanning it for in-place mutations.
+    #[doc(hidden)]
+    pub fn render_frame_with_provider_and_config_cached<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        provider: &P,
+        now_ms: i64,
+        config: &RendererConfig,
+        track_key: &RenderTrackCacheKey,
+    ) -> Vec<ImagePlane> {
+        let selection = self.select_active_events(track, now_ms);
+        self.render_frame_with_key_and_selection(
+            track,
+            provider,
+            now_ms,
+            config,
+            track_key,
+            selection.active_event_indices,
+        )
+    }
+
+    /// Render an immutable track using an already selected active-event set.
+    ///
+    /// The caller must supply every active event exactly once. The indices are sorted into the
+    /// renderer's canonical layer/read-order order, so callers can reuse a cheaper source-order
+    /// selection scan.
+    #[doc(hidden)]
+    pub fn render_frame_with_provider_and_config_cached_selection<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        provider: &P,
+        now_ms: i64,
+        config: &RendererConfig,
+        track_key: &RenderTrackCacheKey,
+        active_event_indices: &[usize],
+    ) -> Vec<ImagePlane> {
+        let mut active_event_indices = active_event_indices.to_vec();
+        Self::sort_event_indices(track, &mut active_event_indices);
+        self.render_frame_with_key_and_selection(
+            track,
+            provider,
+            now_ms,
+            config,
+            track_key,
+            active_event_indices,
+        )
+    }
+
+    fn render_frame_with_key_and_selection<P: FontProvider>(
+        &self,
+        track: &ParsedTrack,
+        provider: &P,
+        now_ms: i64,
+        config: &RendererConfig,
+        track_key: &RenderTrackCacheKey,
+        active_event_indices: Vec<usize>,
+    ) -> Vec<ImagePlane> {
+        let provider_key = provider.layout_cache_key();
+        if provider_key.is_none() {
+            // An uncacheable provider can still update persistent collision assignments. Do not
+            // leave an older cacheable frame available to bypass restoring that state afterward.
+            *self.frame_cache.lock().expect("frame cache mutex poisoned") = None;
         }
-        let mut rendered_events = Vec::new();
+        let config_key = RendererCacheKey::from(config);
+        let active_events = self.active_events_for_render(
+            track,
+            provider,
+            config,
+            track_key,
+            provider_key.as_ref(),
+            &active_event_indices,
+        );
+        let frame_is_static = active_events_are_static(track, &active_events);
+        let frame_time_key = if frame_is_static { 0 } else { now_ms };
+        if let Some(provider_key) = provider_key.as_ref()
+            && let Some(planes) = self
+                .frame_cache
+                .lock()
+                .expect("frame cache mutex poisoned")
+                .as_ref()
+                .filter(|cached| {
+                    cached.key.track_key == *track_key
+                        && cached.key.config == config_key
+                        && cached.key.provider_key == *provider_key
+                        && cached.key.active_event_indices == active_event_indices
+                        && cached.key.time_key == frame_time_key
+                })
+                .and_then(|cached| cached.planes.as_ref())
+                .cloned()
+        {
+            return planes;
+        }
+
+        let collision_cache_key = CollisionCacheKey {
+            track_key: track_key.clone(),
+            config: config_key.clone(),
+            provider: provider_key.as_ref().map_or_else(
+                || CollisionProviderKey::Instance(provider.instance_cache_key()),
+                |key| CollisionProviderKey::Stable(key.clone()),
+            ),
+        };
+        let mut rendered_events = Vec::with_capacity(active_events.len());
 
         let render_scale_x = output_scale_x(track, config);
         let render_scale_y = output_scale_y(track, config);
@@ -172,7 +485,7 @@ impl RenderEngine {
             y: render_scale_y,
         };
 
-        for event in &prepared.active_events {
+        for event in active_events.iter() {
             let source_event = track.events.get(event.event_index);
             let Some(style) = track.styles.get(event.style_index) else {
                 continue;
@@ -768,8 +1081,7 @@ impl RenderEngine {
                     } else {
                         bitmap_blur
                     };
-                    let mut outlined_shadow_source_glyphs = None;
-                    if has_outline {
+                    let outline_glyphs = if has_outline {
                         // Stroke with independent \xbord/\ybord radii; a zero radius leaves that axis unexpanded.
                         let radius_for = |border: f64| {
                             if border > 0.0 {
@@ -778,25 +1090,26 @@ impl RenderEngine {
                                 0
                             }
                         };
-                        let outline_glyphs = rasterizer.outline_glyphs_xy(
+                        Some(rasterizer.outline_glyphs_xy(
                             &raster_glyphs,
                             radius_for(effective_style.border_x),
                             radius_for(effective_style.border_y),
-                        );
-                        if has_shadow {
-                            outlined_shadow_source_glyphs = Some(outline_glyphs.clone());
-                        }
-                        if let Some(plane) = combined_image_plane_from_glyphs_xy(
-                            &outline_glyphs,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(outline_glyphs) = outline_glyphs.as_deref()
+                        && let Some(plane) = combined_image_plane_from_glyphs_xy(
+                            outline_glyphs,
                             run_origin_x_26_6,
                             line_top,
                             run_ascender,
                             effective_style.outline_colour,
                             ass::ImageType::Outline,
                             bitmap_blur,
-                        ) {
-                            outline_planes.push(plane);
-                        }
+                        )
+                    {
+                        outline_planes.push(plane);
                     }
                     let fill_color =
                         resolve_run_fill_color(run, &effective_style, source_event, now_ms);
@@ -899,9 +1212,7 @@ impl RenderEngine {
                         }
                     }
                     if has_shadow {
-                        let shadow_glyphs = outlined_shadow_source_glyphs
-                            .as_deref()
-                            .unwrap_or(&raster_glyphs);
+                        let shadow_glyphs = outline_glyphs.as_deref().unwrap_or(&raster_glyphs);
                         if let Some(plane) = combined_image_plane_from_glyphs_xy(
                             shadow_glyphs,
                             run_origin_x_26_6 + (effective_style.shadow_x * 64.0).round() as i32,
@@ -1074,11 +1385,15 @@ impl RenderEngine {
 
         // fix_collisions runs independently per same-layer group, then lists are concatenated and frame-clipped.
         {
-            let mut cache = self
-                .collision_cache
+            let mut state = self
+                .collision_state
                 .lock()
-                .expect("collision cache mutex poisoned");
-            fix_collisions_by_layer(&mut cache, &mut rendered_events, track);
+                .expect("collision state mutex poisoned");
+            if state.key.as_ref() != Some(&collision_cache_key) {
+                state.key = Some(collision_cache_key);
+                state.events.clear();
+            }
+            fix_collisions_by_layer(&mut state.events, &mut rendered_events, track);
         }
 
         let mut planes = Vec::new();
@@ -1087,12 +1402,162 @@ impl RenderEngine {
         }
         // Drop ASS alpha 0xFF planes only after render, collision, and clip (keep zero-sized clip nodes).
         planes.retain(|plane| plane.color.0 & 0xFF != 0xFF);
+        if let Some(provider_key) = provider_key {
+            let key = FrameCacheKey {
+                track_key: track_key.clone(),
+                config: config_key,
+                provider_key,
+                active_event_indices,
+                time_key: frame_time_key,
+            };
+            let mut cache = self.frame_cache.lock().expect("frame cache mutex poisoned");
+            if let Some(cached) = cache.as_mut().filter(|cached| cached.key == key) {
+                if cached.planes.is_none() {
+                    cached.planes = Some(planes.clone());
+                }
+            } else {
+                let cached_planes = frame_is_static.then(|| planes.clone());
+                *cache = Some(CachedFrame {
+                    key,
+                    planes: cached_planes,
+                });
+            }
+        }
         planes
     }
 
     pub fn render_frame(&self, track: &ParsedTrack, now_ms: i64) -> Vec<ImagePlane> {
-        let provider = FontconfigProvider::new();
-        self.render_frame_with_provider(track, &provider, now_ms)
+        self.render_frame_with_provider(track, &self.default_provider, now_ms)
+    }
+
+    /// Render an immutable track with the engine's persistent default provider.
+    #[doc(hidden)]
+    pub fn render_frame_cached(
+        &self,
+        track: &ParsedTrack,
+        now_ms: i64,
+        track_key: &RenderTrackCacheKey,
+    ) -> Vec<ImagePlane> {
+        self.render_frame_with_provider_and_config_cached(
+            track,
+            &self.default_provider,
+            now_ms,
+            &default_renderer_config(track),
+            track_key,
+        )
+    }
+}
+
+fn active_events_are_static(track: &ParsedTrack, events: &[LayoutEvent]) -> bool {
+    events.iter().all(|event| {
+        track
+            .events
+            .get(event.event_index)
+            .is_some_and(|source| source.effect.trim().is_empty())
+            && event.movement.is_none()
+            && event.movement_exact.is_none()
+            && event.fade.is_none()
+            && event.lines.iter().all(|line| {
+                line.runs
+                    .iter()
+                    .all(|run| run.transforms.is_empty() && run.karaoke.is_none())
+            })
+    })
+}
+
+impl From<&ParsedTrack> for RenderTrackSnapshot {
+    fn from(track: &ParsedTrack) -> Self {
+        Self {
+            styles: track.styles.clone(),
+            events: track.events.clone(),
+            track_type: track.track_type,
+            play_res_x: track.play_res_x,
+            play_res_y: track.play_res_y,
+            timer: track.timer,
+            wrap_style: track.wrap_style,
+            scaled_border_and_shadow: track.scaled_border_and_shadow,
+            kerning: track.kerning,
+            language: track.language.clone(),
+            ycbcr_matrix: track.ycbcr_matrix,
+            default_style: track.default_style,
+            layout_res_x: track.layout_res_x,
+            layout_res_y: track.layout_res_y,
+        }
+    }
+}
+
+impl RenderTrackSnapshot {
+    fn matches(&self, track: &ParsedTrack) -> bool {
+        self.styles.len() == track.styles.len()
+            && self
+                .styles
+                .iter()
+                .zip(&track.styles)
+                .all(|(left, right)| render_styles_equal(left, right))
+            && self.events == track.events
+            && self.track_type == track.track_type
+            && self.play_res_x == track.play_res_x
+            && self.play_res_y == track.play_res_y
+            && self.timer.to_bits() == track.timer.to_bits()
+            && self.wrap_style == track.wrap_style
+            && self.scaled_border_and_shadow == track.scaled_border_and_shadow
+            && self.kerning == track.kerning
+            && self.language == track.language
+            && self.ycbcr_matrix == track.ycbcr_matrix
+            && self.default_style == track.default_style
+            && self.layout_res_x == track.layout_res_x
+            && self.layout_res_y == track.layout_res_y
+    }
+}
+
+fn render_styles_equal(left: &ParsedStyle, right: &ParsedStyle) -> bool {
+    left.name == right.name
+        && left.font_name == right.font_name
+        && left.font_size.to_bits() == right.font_size.to_bits()
+        && left.primary_colour == right.primary_colour
+        && left.secondary_colour == right.secondary_colour
+        && left.outline_colour == right.outline_colour
+        && left.back_colour == right.back_colour
+        && left.bold == right.bold
+        && left.font_weight == right.font_weight
+        && left.italic == right.italic
+        && left.underline == right.underline
+        && left.strike_out == right.strike_out
+        && left.scale_x.to_bits() == right.scale_x.to_bits()
+        && left.scale_y.to_bits() == right.scale_y.to_bits()
+        && left.spacing.to_bits() == right.spacing.to_bits()
+        && left.angle.to_bits() == right.angle.to_bits()
+        && left.border_style == right.border_style
+        && left.outline.to_bits() == right.outline.to_bits()
+        && left.shadow.to_bits() == right.shadow.to_bits()
+        && left.alignment == right.alignment
+        && left.margin_l == right.margin_l
+        && left.margin_r == right.margin_r
+        && left.margin_v == right.margin_v
+        && left.encoding == right.encoding
+        && left.treat_fontname_as_pattern == right.treat_fontname_as_pattern
+        && left.blur.to_bits() == right.blur.to_bits()
+        && left.justify == right.justify
+}
+
+impl From<&RendererConfig> for RendererCacheKey {
+    fn from(config: &RendererConfig) -> Self {
+        Self {
+            frame: config.frame,
+            storage: config.storage,
+            margins: config.margins,
+            use_margins: config.use_margins,
+            pixel_aspect_bits: config.pixel_aspect.to_bits(),
+            font_scale_bits: config.font_scale.to_bits(),
+            selective_font_scale: config.selective_font_scale,
+            line_spacing_bits: config.line_spacing.to_bits(),
+            line_position_bits: config.line_position.to_bits(),
+            hinting: config.hinting,
+            shaping: config.shaping,
+            wrap_unicode: config.wrap_unicode,
+            bidi_brackets: config.bidi_brackets,
+            whole_text_layout: config.whole_text_layout,
+        }
     }
 }
 

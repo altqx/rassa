@@ -158,6 +158,12 @@ pub struct RasterCacheScope {
 impl RasterCacheScope {
     pub fn enter(namespace: u64, limits: RasterCacheLimits) -> Self {
         Rasterizer::set_cache_limits(namespace, limits);
+        Self::enter_preconfigured(namespace, limits)
+    }
+
+    /// Enter a namespace whose limits have already been applied by the owner.
+    #[doc(hidden)]
+    pub fn enter_preconfigured(namespace: u64, limits: RasterCacheLimits) -> Self {
         let previous = RASTER_CACHE_CONTEXT
             .with(|context| context.replace(RasterCacheContext { namespace, limits }));
         Self {
@@ -1805,6 +1811,39 @@ fn zeroed_bitmap(len: usize) -> Option<Vec<u8>> {
     Some(bitmap)
 }
 
+fn elliptical_outline_kernel(radius_x: usize, radius_y: usize) -> Option<Vec<(i32, i32)>> {
+    let diameter_x = radius_x.checked_mul(2)?.checked_add(1)?;
+    let diameter_y = radius_y.checked_mul(2)?.checked_add(1)?;
+    let candidate_count = diameter_x.checked_mul(diameter_y)?;
+    if candidate_count.checked_mul(std::mem::size_of::<(i32, i32)>())? > MAX_EAGER_BITMAP_BYTES {
+        return None;
+    }
+
+    let mut kernel = Vec::new();
+    kernel.try_reserve_exact(candidate_count).ok()?;
+    let radius_x_i32 = i32::try_from(radius_x).ok()?;
+    let radius_y_i32 = i32::try_from(radius_y).ok()?;
+    let rx2 = (radius_x as f64 * radius_x as f64).max(1.0);
+    let ry2 = (radius_y as f64 * radius_y as f64).max(1.0);
+    for dy in -radius_y_i32..=radius_y_i32 {
+        for dx in -radius_x_i32..=radius_x_i32 {
+            let dx_f64 = f64::from(dx);
+            let dy_f64 = f64::from(dy);
+            let inside = if radius_x == 0 {
+                dx_f64 == 0.0 && dy_f64 * dy_f64 <= ry2
+            } else if radius_y == 0 {
+                dy_f64 == 0.0 && dx_f64 * dx_f64 <= rx2
+            } else {
+                dx_f64 * dx_f64 / rx2 + dy_f64 * dy_f64 / ry2 <= 1.0 + f64::EPSILON
+            };
+            if inside {
+                kernel.push((dx, dy));
+            }
+        }
+    }
+    Some(kernel)
+}
+
 fn expand_outline_xy(glyph: &RasterGlyph, radius_x: i32, radius_y: i32) -> RasterGlyph {
     let radius_x = radius_x.max(0);
     let radius_y = radius_y.max(0);
@@ -1826,36 +1865,57 @@ fn expand_outline_xy(glyph: &RasterGlyph, radius_x: i32, radius_y: i32) -> Raste
     let Some(mut bitmap) = new_width.checked_mul(new_height).and_then(zeroed_bitmap) else {
         return empty_bitmap_glyph(glyph);
     };
-    let rx2 = (radius_x as f64 * radius_x as f64).max(1.0);
-    let ry2 = (radius_y as f64 * radius_y as f64).max(1.0);
-    for y in 0..height {
-        for x in 0..width {
-            let value = glyph.bitmap[y * stride + x];
-            if value == 0 {
-                continue;
-            }
-            let center_x = x + radius_x;
-            let center_y = y + radius_y;
-            for outline_y in
-                center_y.saturating_sub(radius_y)..=(center_y + radius_y).min(new_height - 1)
-            {
-                for outline_x in
-                    center_x.saturating_sub(radius_x)..=(center_x + radius_x).min(new_width - 1)
-                {
-                    let dx = (outline_x as i32 - center_x as i32) as f64;
-                    let dy = (outline_y as i32 - center_y as i32) as f64;
-                    let inside = if radius_x == 0 {
-                        dx == 0.0 && dy * dy <= ry2
-                    } else if radius_y == 0 {
-                        dy == 0.0 && dx * dx <= rx2
-                    } else {
-                        dx * dx / rx2 + dy * dy / ry2 <= 1.0 + f64::EPSILON
-                    };
-                    if !inside {
-                        continue;
-                    }
+    if let Some(kernel) = elliptical_outline_kernel(radius_x, radius_y) {
+        for y in 0..height {
+            for x in 0..width {
+                let value = glyph.bitmap[y * stride + x];
+                if value == 0 {
+                    continue;
+                }
+                let center_x = i32::try_from(x + radius_x).expect("checked outline center x");
+                let center_y = i32::try_from(y + radius_y).expect("checked outline center y");
+                for &(dx, dy) in &kernel {
+                    let outline_x = (center_x + dx) as usize;
+                    let outline_y = (center_y + dy) as usize;
                     let index = outline_y * new_width + outline_x;
                     bitmap[index] = bitmap[index].max(value);
+                }
+            }
+        }
+    } else {
+        // Extremely large hostile radii can make the offset table more expensive than the
+        // output bitmap. Retain the allocation-bounded reference path for those inputs.
+        let rx2 = (radius_x as f64 * radius_x as f64).max(1.0);
+        let ry2 = (radius_y as f64 * radius_y as f64).max(1.0);
+        for y in 0..height {
+            for x in 0..width {
+                let value = glyph.bitmap[y * stride + x];
+                if value == 0 {
+                    continue;
+                }
+                let center_x = x + radius_x;
+                let center_y = y + radius_y;
+                for outline_y in
+                    center_y.saturating_sub(radius_y)..=(center_y + radius_y).min(new_height - 1)
+                {
+                    for outline_x in
+                        center_x.saturating_sub(radius_x)..=(center_x + radius_x).min(new_width - 1)
+                    {
+                        let dx = (outline_x as i32 - center_x as i32) as f64;
+                        let dy = (outline_y as i32 - center_y as i32) as f64;
+                        let inside = if radius_x == 0 {
+                            dx == 0.0 && dy * dy <= ry2
+                        } else if radius_y == 0 {
+                            dy == 0.0 && dx * dx <= rx2
+                        } else {
+                            dx * dx / rx2 + dy * dy / ry2 <= 1.0 + f64::EPSILON
+                        };
+                        if !inside {
+                            continue;
+                        }
+                        let index = outline_y * new_width + outline_x;
+                        bitmap[index] = bitmap[index].max(value);
+                    }
                 }
             }
         }
@@ -1950,6 +2010,126 @@ mod tests {
             namespace,
             RasterCacheScope::enter(namespace, RasterCacheLimits::default()),
         )
+    }
+
+    fn reference_expand_outline_xy(
+        glyph: &RasterGlyph,
+        radius_x: i32,
+        radius_y: i32,
+    ) -> RasterGlyph {
+        let radius_x = radius_x.max(0);
+        let radius_y = radius_y.max(0);
+        if (radius_x <= 0 && radius_y <= 0)
+            || glyph.width <= 0
+            || glyph.height <= 0
+            || glyph.bitmap.is_empty()
+        {
+            return glyph.clone();
+        }
+
+        let radius_x = usize::try_from(radius_x).expect("nonnegative outline radius");
+        let radius_y = usize::try_from(radius_y).expect("nonnegative outline radius");
+        let Some((width, height, stride, new_width, new_height)) =
+            checked_padded_bitmap_dimensions(glyph, radius_x, radius_y)
+        else {
+            return empty_bitmap_glyph(glyph);
+        };
+        let Some(mut bitmap) = new_width.checked_mul(new_height).and_then(zeroed_bitmap) else {
+            return empty_bitmap_glyph(glyph);
+        };
+        let rx2 = (radius_x as f64 * radius_x as f64).max(1.0);
+        let ry2 = (radius_y as f64 * radius_y as f64).max(1.0);
+        for y in 0..height {
+            for x in 0..width {
+                let value = glyph.bitmap[y * stride + x];
+                if value == 0 {
+                    continue;
+                }
+                let center_x = x + radius_x;
+                let center_y = y + radius_y;
+                for outline_y in
+                    center_y.saturating_sub(radius_y)..=(center_y + radius_y).min(new_height - 1)
+                {
+                    for outline_x in
+                        center_x.saturating_sub(radius_x)..=(center_x + radius_x).min(new_width - 1)
+                    {
+                        let dx = (outline_x as i32 - center_x as i32) as f64;
+                        let dy = (outline_y as i32 - center_y as i32) as f64;
+                        let inside = if radius_x == 0 {
+                            dx == 0.0 && dy * dy <= ry2
+                        } else if radius_y == 0 {
+                            dy == 0.0 && dx * dx <= rx2
+                        } else {
+                            dx * dx / rx2 + dy * dy / ry2 <= 1.0 + f64::EPSILON
+                        };
+                        if !inside {
+                            continue;
+                        }
+                        let index = outline_y * new_width + outline_x;
+                        bitmap[index] = bitmap[index].max(value);
+                    }
+                }
+            }
+        }
+
+        RasterGlyph {
+            width: i32::try_from(new_width).expect("checked outline width"),
+            height: i32::try_from(new_height).expect("checked outline height"),
+            stride: i32::try_from(new_width).expect("checked outline stride"),
+            left: glyph
+                .left
+                .saturating_sub(i32::try_from(radius_x).expect("checked outline radius")),
+            top: glyph
+                .top
+                .saturating_add(i32::try_from(radius_y).expect("checked outline radius")),
+            bitmap,
+            ..glyph.clone()
+        }
+    }
+
+    fn test_random_byte(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
+        (*state >> 33) as u8
+    }
+
+    #[test]
+    fn precomputed_outline_kernel_matches_reference_randomized() {
+        let mut state = 0xA11C_E5E5_0FF5_E7A5;
+        for case in 0..160 {
+            let width = usize::from(test_random_byte(&mut state) % 8 + 1);
+            let height = usize::from(test_random_byte(&mut state) % 7 + 1);
+            let stride = width + usize::from(test_random_byte(&mut state) % 4);
+            let bitmap = (0..stride * height)
+                .map(|_| {
+                    let value = test_random_byte(&mut state);
+                    match value % 5 {
+                        0 | 1 => 0,
+                        2 => 255,
+                        _ => value,
+                    }
+                })
+                .collect();
+            let glyph = RasterGlyph {
+                glyph_id: case,
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                left: i32::from(test_random_byte(&mut state)) - 128,
+                top: i32::from(test_random_byte(&mut state)) - 128,
+                bitmap,
+                ..RasterGlyph::default()
+            };
+            let radius_x = i32::from(test_random_byte(&mut state) % 9) - 2;
+            let radius_y = i32::from(test_random_byte(&mut state) % 9) - 2;
+
+            assert_eq!(
+                expand_outline_xy(&glyph, radius_x, radius_y),
+                reference_expand_outline_xy(&glyph, radius_x, radius_y),
+                "case={case}, radius=({radius_x}, {radius_y})"
+            );
+        }
     }
 
     #[test]
@@ -2181,6 +2361,37 @@ mod tests {
             RasterCacheStats::default()
         );
         assert_eq!(cache.stats_for_namespace(second_namespace).glyph_entries, 2);
+    }
+
+    #[test]
+    fn entering_cache_scope_applies_stricter_limits_immediately() {
+        let (namespace, initial_scope) = isolated_cache_scope();
+        drop(initial_scope);
+        {
+            let mut cache = lock_glyph_cache();
+            cache.insert(
+                cache_test_key(namespace, 1),
+                cache_test_glyph(1, 4),
+                RasterCacheLimits::default(),
+            );
+        }
+        assert_eq!(
+            Rasterizer::cache_stats_for_namespace(namespace).glyph_entries,
+            1
+        );
+
+        let _scope = RasterCacheScope::enter(
+            namespace,
+            RasterCacheLimits {
+                glyph_max: 0,
+                bitmap_max_bytes: 0,
+            },
+        );
+        assert_eq!(
+            Rasterizer::cache_stats_for_namespace(namespace),
+            RasterCacheStats::default(),
+            "enter must enforce a lower limit even when no insertion follows"
+        );
     }
 
     #[test]

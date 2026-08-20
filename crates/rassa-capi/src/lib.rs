@@ -1,19 +1,19 @@
 #![allow(
     dead_code,
     clippy::missing_safety_doc,
-    clippy::vec_box,
     non_camel_case_types,
     non_snake_case,
     unsafe_op_in_unsafe_fn
 )]
 
 use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
+    collections::HashSet,
     ffi::{CStr, CString, c_char, c_double, c_int, c_void},
-    fs,
-    hash::{Hash, Hasher},
-    mem, ptr, slice,
-    sync::{Mutex, OnceLock},
+    fs, mem, ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -26,7 +26,7 @@ use rassa_core::{ImagePlane, Margins, RendererConfig, Size, ass};
 use rassa_fonts::validate_fontconfig_config;
 use rassa_fonts::{
     AttachedFontProvider, CrossfontProvider, DefaultFontFileProvider, DirectoryFontProvider,
-    FontAttachment as ProviderFontAttachment, FontProvider, MergedFontProvider, NullFontProvider,
+    FontProvider, MergedFontProvider, NullFontProvider,
 };
 use rassa_parse::{
     ParsedAttachment, ParsedEvent, ParsedStyle, ParsedTrack, parse_dialogue_text,
@@ -34,7 +34,7 @@ use rassa_parse::{
     parse_style_section_bytes_with_codepage,
 };
 use rassa_raster::{RasterCacheLimits, RasterCacheScope, Rasterizer};
-use rassa_render::RenderEngine;
+use rassa_render::{RenderEngine, RenderTrackCacheKey};
 
 const MESSAGE_LEVEL_ERROR: c_int = 1;
 const MESSAGE_LEVEL_WARNING: c_int = 2;
@@ -135,6 +135,7 @@ pub struct ASS_Library {
     message_cb: *mut c_void,
     message_data: *mut c_void,
     fonts: Vec<FontAttachment>,
+    font_provider_generation: u64,
 }
 
 pub struct ASS_Renderer {
@@ -159,8 +160,10 @@ pub struct ASS_Renderer {
     fontconfig_config: Option<String>,
     fontconfig_update: bool,
     fontselect_initialized: bool,
+    font_provider_generation: u64,
     selective_override_bits: c_int,
     selective_override_style: Option<OwnedStyleOverride>,
+    selective_override_cache: Option<CachedSelectiveOverrideTrack>,
     cache_limits: RasterCacheLimits,
     font_provider_cache: Option<CachedFontProvider>,
     frame_cache_signature: Option<RenderedFrameCacheSignature>,
@@ -325,8 +328,11 @@ struct TrackState {
     prune_delay: Option<i64>,
     parser_state: CapiParserState,
     cache_generation: u64,
-    parsed_cache_signature: Option<ParsedTrackCacheSignature>,
+    parsed_cache_backing_signature: Option<ParsedTrackBackingSignature>,
+    parsed_cache_active_event_indices: Vec<usize>,
     parsed_cache: Option<ParsedTrack>,
+    parsed_cache_active_events_static: bool,
+    parsed_cache_render_key: RenderTrackCacheKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -382,7 +388,7 @@ const ASS_STYLES_ALLOC: usize = 20;
 const LIBASS_MAX_READ_ORDER_ID: c_int = 10 * 1024 * 1024 * 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ParsedTrackCacheSignature {
+struct ParsedTrackBackingSignature {
     n_styles: c_int,
     styles: usize,
     n_events: c_int,
@@ -401,7 +407,11 @@ struct ParsedTrackCacheSignature {
     default_style: c_int,
     layout_res_x: c_int,
     layout_res_y: c_int,
-    content_fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedTrackCacheSignature {
+    backing: ParsedTrackBackingSignature,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -420,24 +430,28 @@ struct CachedFontProvider {
     provider: Box<dyn FontProvider>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedSelectiveOverrideTrack {
+    track: usize,
+    source_render_key: RenderTrackCacheKey,
+    bits: c_int,
+    style: OwnedStyleOverride,
+    active_event_indices: Vec<usize>,
+    parsed: Arc<ParsedTrack>,
+    render_key: RenderTrackCacheKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FontProviderCacheSignature {
     library: usize,
-    library_fonts_dir: Option<String>,
-    library_fonts_len: usize,
-    library_fonts_data: Vec<(usize, usize)>,
-    default_font: Option<String>,
-    default_family: Option<String>,
-    default_provider: c_int,
-    fontconfig_config: Option<String>,
-    fontconfig_update: bool,
+    library_generation: u64,
+    renderer_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct RenderedFrameCacheSignature {
     track: usize,
     track_generation: u64,
-    parsed_track: ParsedTrackCacheSignature,
+    render_track: RenderTrackCacheKey,
     renderer_config: RendererConfig,
     font_provider: FontProviderCacheSignature,
     selective_override_bits: c_int,
@@ -449,7 +463,7 @@ struct RenderedFrameCacheSignature {
 #[derive(Default)]
 struct OwnedImageList {
     bitmaps: Vec<Vec<u8>>,
-    nodes: Vec<Box<ASS_Image>>,
+    nodes: Vec<ASS_Image>,
 }
 
 impl OwnedImageList {
@@ -460,7 +474,7 @@ impl OwnedImageList {
         for plane in planes {
             bitmaps.push(plane.bitmap);
             let bitmap = bitmaps.last_mut().expect("bitmap just pushed");
-            nodes.push(Box::new(ASS_Image {
+            nodes.push(ASS_Image {
                 w: plane.size.width,
                 h: plane.size.height,
                 stride: plane.stride,
@@ -474,14 +488,17 @@ impl OwnedImageList {
                 dst_y: plane.destination.y,
                 next: ptr::null_mut(),
                 type_: plane.kind as c_int,
-            }));
+            });
         }
 
+        let nodes_ptr = nodes.as_mut_ptr();
         for index in 0..nodes.len() {
-            let next = nodes
-                .get_mut(index + 1)
-                .map(|node| &mut **node as *mut ASS_Image)
-                .unwrap_or(ptr::null_mut());
+            let next = if index + 1 < nodes.len() {
+                // `nodes` was allocated at its final capacity before any pointer is linked.
+                unsafe { nodes_ptr.add(index + 1) }
+            } else {
+                ptr::null_mut()
+            };
             nodes[index].next = next;
         }
 
@@ -491,7 +508,7 @@ impl OwnedImageList {
     fn head_ptr(&mut self) -> *mut ASS_Image {
         self.nodes
             .first_mut()
-            .map(|node| &mut **node as *mut ASS_Image)
+            .map(|node| node as *mut ASS_Image)
             .unwrap_or(ptr::null_mut())
     }
 }
@@ -539,14 +556,25 @@ fn render_frame_planes(
     library: *mut ASS_Library,
     now: i64,
     renderer_config: &RendererConfig,
+    render_key: &RenderTrackCacheKey,
+    active_event_indices: &[usize],
 ) -> Vec<ImagePlane> {
-    let _cache_scope =
-        RasterCacheScope::enter(renderer.raster_cache_namespace, renderer.cache_limits);
+    let _cache_scope = RasterCacheScope::enter_preconfigured(
+        renderer.raster_cache_namespace,
+        renderer.cache_limits,
+    );
     let provider = cached_font_provider(renderer, library);
     let provider: &dyn FontProvider = unsafe { &*provider };
     renderer
         .render_engine
-        .render_frame_with_provider_and_config(parsed, &provider, now, renderer_config)
+        .render_frame_with_provider_and_config_cached_selection(
+            parsed,
+            &provider,
+            now,
+            renderer_config,
+            render_key,
+            active_event_indices,
+        )
 }
 
 fn ass_color_to_rgba(color: u32) -> u32 {
@@ -579,6 +607,7 @@ impl Default for ASS_Library {
             message_cb: ptr::null_mut(),
             message_data: ptr::null_mut(),
             fonts: Vec::new(),
+            font_provider_generation: 1,
         }
     }
 }
@@ -607,8 +636,10 @@ impl Default for ASS_Renderer {
             fontconfig_config: None,
             fontconfig_update: true,
             fontselect_initialized: false,
+            font_provider_generation: 1,
             selective_override_bits: ass::override_bits::SELECTIVE_FONT_SCALE,
             selective_override_style: None,
+            selective_override_cache: None,
             cache_limits: RasterCacheLimits::default(),
             font_provider_cache: None,
             frame_cache_signature: None,
@@ -626,14 +657,12 @@ impl Drop for ASS_Renderer {
 }
 
 fn next_raster_cache_namespace() -> u64 {
-    static NEXT_NAMESPACE: OnceLock<Mutex<u64>> = OnceLock::new();
-    let mut next = NEXT_NAMESPACE
-        .get_or_init(|| Mutex::new(1))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let namespace = *next;
-    *next = next.wrapping_add(1).max(1);
-    namespace
+    static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+    NEXT_NAMESPACE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            Some(next.wrapping_add(1).max(1))
+        })
+        .expect("namespace update closure always succeeds")
 }
 
 fn raster_cache_limits_from_c(glyph_max: c_int, bitmap_max_size: c_int) -> RasterCacheLimits {
@@ -674,6 +703,7 @@ pub unsafe extern "C" fn ass_library_done(priv_: *mut ASS_Library) {
 pub unsafe extern "C" fn ass_set_fonts_dir(priv_: *mut ASS_Library, fonts_dir: *const c_char) {
     if let Some(library) = priv_.as_mut() {
         library.fonts_dir = string_option_from_ptr(fonts_dir);
+        bump_generation(&mut library.font_provider_generation);
     }
 }
 
@@ -971,6 +1001,7 @@ pub unsafe extern "C" fn ass_set_fonts(
         renderer.fontconfig_config = string_option_from_ptr(config);
         renderer.fontconfig_update = update != 0;
         renderer.fontselect_initialized = true;
+        bump_generation(&mut renderer.font_provider_generation);
     }
 }
 
@@ -981,6 +1012,7 @@ pub unsafe extern "C" fn ass_set_selective_style_override_enabled(
 ) {
     if let Some(renderer) = priv_.as_mut() {
         renderer.selective_override_bits = bits;
+        renderer.selective_override_cache = None;
     }
 }
 
@@ -991,6 +1023,7 @@ pub unsafe extern "C" fn ass_set_selective_style_override(
 ) {
     if let Some(renderer) = priv_.as_mut() {
         renderer.selective_override_style = OwnedStyleOverride::from_ffi(style);
+        renderer.selective_override_cache = None;
     }
 }
 
@@ -1008,6 +1041,8 @@ pub unsafe extern "C" fn ass_set_cache_limits(
     if let Some(renderer) = priv_.as_mut() {
         renderer.cache_limits = raster_cache_limits_from_c(glyph_max, bitmap_max_size);
         Rasterizer::set_cache_limits(renderer.raster_cache_namespace, renderer.cache_limits);
+        renderer.frame_cache_signature = None;
+        renderer.render_engine.clear_frame_cache();
     }
 }
 
@@ -1064,24 +1099,20 @@ pub unsafe extern "C" fn ass_render_frame(
         return ptr::null_mut();
     };
 
-    let parsed_track_signature = parsed_track_cache_signature(track_ref, &active_event_indices);
-    let cached = cached_parsed_track_from_ffi(track, track_ref, parsed_track_signature);
+    let parsed_track_signature = parsed_track_cache_signature(track_ref);
+    let (cached, active_events_static, cached_render_key) = cached_parsed_track_from_ffi(
+        track,
+        track_ref,
+        parsed_track_signature,
+        &active_event_indices,
+    );
     let override_active = selective_style_overrides_active(renderer);
-    let parsed_with_overrides;
-    let parsed = if override_active {
-        let mut parsed = cached.clone();
-        apply_selective_style_overrides(&mut parsed, renderer, &active_event_indices);
-        parsed_with_overrides = parsed;
-        &parsed_with_overrides
-    } else {
-        cached
-    };
     let track_features = track_state_ref(track)
         .map(|state| state.features)
         .unwrap_or_default();
     let renderer_config = renderer_config(
         renderer,
-        parsed,
+        cached,
         track_features[1], // ASS_FEATURE_BIDI_BRACKETS
         track_features[2], // ASS_FEATURE_WHOLE_TEXT_LAYOUT
         track_features[3], // ASS_FEATURE_WRAP_UNICODE
@@ -1090,11 +1121,12 @@ pub unsafe extern "C" fn ass_render_frame(
     let track_generation = track_state_ref(track)
         .map(|state| state.cache_generation)
         .unwrap_or_default();
-    let frame_time_key = frame_cache_time_key(parsed, &active_event_indices, now);
+    let frame_time_key =
+        frame_cache_time_key(cached, &active_event_indices, now, active_events_static);
     let frame_cache_signature = frame_time_key.map(|frame_time_key| RenderedFrameCacheSignature {
         track: track as usize,
         track_generation,
-        parsed_track: parsed_track_signature,
+        render_track: cached_render_key.clone(),
         renderer_config: renderer_config.clone(),
         font_provider: font_provider_signature,
         selective_override_bits: renderer.selective_override_bits,
@@ -1118,7 +1150,28 @@ pub unsafe extern "C" fn ass_render_frame(
         return head;
     }
 
-    let planes = render_frame_planes(parsed, renderer, track_ref.library, now, &renderer_config);
+    let parsed_with_overrides = override_active.then(|| {
+        cached_selective_override_track(
+            renderer,
+            track,
+            &cached_render_key,
+            cached,
+            &active_event_indices,
+        )
+    });
+    let (parsed, render_key) = parsed_with_overrides
+        .as_ref()
+        .map(|(parsed, key)| (parsed.as_ref(), key))
+        .unwrap_or((cached, &cached_render_key));
+    let planes = render_frame_planes(
+        parsed,
+        renderer,
+        track_ref.library,
+        now,
+        &renderer_config,
+        render_key,
+        &active_event_indices,
+    );
     let rendered_images = OwnedImageList::from_planes(planes);
     if let Some(detect_change) = detect_change.as_mut() {
         *detect_change =
@@ -1643,6 +1696,15 @@ pub unsafe extern "C" fn ass_prune_events(track: *mut ASS_Track, deadline: i64) 
         return;
     };
 
+    if track_ref.events.is_null()
+        || track_ref.n_events <= 0
+        || slice::from_raw_parts(track_ref.events, track_ref.n_events as usize)
+            .iter()
+            .all(|event| event.Start + event.Duration >= deadline)
+    {
+        return;
+    }
+
     let clear_read_order = track_state_ref(track)
         .map(|state| state.check_readorder)
         .unwrap_or(true);
@@ -1901,12 +1963,14 @@ pub unsafe extern "C" fn ass_add_font(
         name: string_from_ptr(name),
         data: slice::from_raw_parts(data as *const u8, data_size as usize).to_vec(),
     });
+    bump_generation(&mut library.font_provider_generation);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ass_clear_fonts(library: *mut ASS_Library) {
     if let Some(library) = library.as_mut() {
         library.fonts.clear();
+        bump_generation(&mut library.font_provider_generation);
     }
 }
 
@@ -1915,25 +1979,12 @@ fn font_provider_cache_signature(
     library: *mut ASS_Library,
 ) -> FontProviderCacheSignature {
     let library_ref = unsafe { library.as_ref() };
-    let library_fonts_data = library_ref
-        .map(|library| {
-            library
-                .fonts
-                .iter()
-                .map(|font| (font.data.as_ptr() as usize, font.data.len()))
-                .collect()
-        })
-        .unwrap_or_default();
     FontProviderCacheSignature {
         library: library as usize,
-        library_fonts_dir: library_ref.and_then(|library| library.fonts_dir.clone()),
-        library_fonts_len: library_ref.map(|library| library.fonts.len()).unwrap_or(0),
-        library_fonts_data,
-        default_font: renderer.default_font.clone(),
-        default_family: renderer.default_family.clone(),
-        default_provider: renderer.default_provider,
-        fontconfig_config: renderer.fontconfig_config.clone(),
-        fontconfig_update: renderer.fontconfig_update,
+        library_generation: library_ref
+            .map(|library| library.font_provider_generation)
+            .unwrap_or_default(),
+        renderer_generation: renderer.font_provider_generation,
     }
 }
 
@@ -1949,7 +2000,7 @@ fn cached_font_provider(
     {
         let provider = build_font_provider(renderer, library);
         renderer.font_provider_cache = Some(CachedFontProvider {
-            signature: signature.clone(),
+            signature,
             provider,
         });
     }
@@ -1988,17 +2039,14 @@ fn build_font_provider(
         return wrap_default_font_path(system_provider, renderer);
     };
 
-    let attachments = library_ref
-        .fonts
-        .iter()
-        .map(|font| ProviderFontAttachment {
-            name: font.name.clone(),
-            data: font.data.clone(),
-        })
-        .collect::<Vec<_>>();
-    let fonts_dir = library_ref.fonts_dir.clone();
-    let attached = AttachedFontProvider::from_attachments(&attachments);
-    let directory = if let Some(fonts_dir) = fonts_dir.as_deref().filter(|dir| !dir.is_empty()) {
+    let fonts_dir = library_ref.fonts_dir.as_deref();
+    let attached = AttachedFontProvider::from_attachment_slices(
+        library_ref
+            .fonts
+            .iter()
+            .map(|font| (font.name.as_str(), font.data.as_slice())),
+    );
+    let directory = if let Some(fonts_dir) = fonts_dir.filter(|dir| !dir.is_empty()) {
         let (provider, issues) = DirectoryFontProvider::scan(fonts_dir);
         for issue in issues {
             unsafe {
@@ -2154,6 +2202,7 @@ fn maybe_extract_fonts_to_library(library: *mut ASS_Library, attachments: &[Pars
         return;
     }
 
+    let mut added = false;
     for attachment in attachments {
         if attachment.data.is_empty() {
             continue;
@@ -2162,7 +2211,15 @@ fn maybe_extract_fonts_to_library(library: *mut ASS_Library, attachments: &[Pars
             name: attachment.name.clone(),
             data: attachment.data.clone(),
         });
+        added = true;
     }
+    if added {
+        bump_generation(&mut library.font_provider_generation);
+    }
+}
+
+fn bump_generation(generation: &mut u64) {
+    *generation = generation.wrapping_add(1);
 }
 
 unsafe fn maybe_extract_fonts_from_font_state_bytes(track: *mut ASS_Track, bytes: &[u8]) {
@@ -3389,20 +3446,26 @@ fn optional_event_string_to_c_ptr(value: &str, field_present: bool) -> *mut c_ch
 }
 
 fn string_to_c_ptr(value: &str) -> *mut c_char {
-    let sanitized = value.replace('\0', " ");
-    let bytes = sanitized.as_bytes();
+    let bytes = value.as_bytes();
     let Some(allocation_size) = bytes.len().checked_add(1) else {
         return ptr::null_mut();
     };
-    let allocation = unsafe { ass_malloc(allocation_size).cast::<c_char>() };
+    let allocation = unsafe { ass_malloc(allocation_size).cast::<u8>() };
     if allocation.is_null() {
         return ptr::null_mut();
     }
     unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), allocation, bytes.len());
+        ptr::copy_nonoverlapping(bytes.as_ptr(), allocation, bytes.len());
+        if let Some(first_nul) = bytes.iter().position(|byte| *byte == 0) {
+            for (index, byte) in bytes.iter().enumerate().skip(first_nul) {
+                if *byte == 0 {
+                    allocation.add(index).write(b' ');
+                }
+            }
+        }
         allocation.add(bytes.len()).write(0);
     }
-    allocation
+    allocation.cast()
 }
 
 unsafe fn string_option_from_ptr(value: *const c_char) -> Option<String> {
@@ -3430,8 +3493,11 @@ unsafe fn track_state_mut(track: *mut ASS_Track) -> Option<&'static mut TrackSta
 
 unsafe fn invalidate_parsed_track_cache(track: *mut ASS_Track) {
     if let Some(state) = track_state_mut(track) {
-        state.parsed_cache_signature = None;
+        state.parsed_cache_backing_signature = None;
+        state.parsed_cache_active_event_indices.clear();
         state.parsed_cache = None;
+        state.parsed_cache_active_events_static = false;
+        state.parsed_cache_render_key = RenderTrackCacheKey::new();
         state.cache_generation = state.cache_generation.wrapping_add(1);
     }
 }
@@ -3439,131 +3505,226 @@ unsafe fn invalidate_parsed_track_cache(track: *mut ASS_Track) {
 unsafe fn invalidate_parsed_track_cache_for_track(track: &mut ASS_Track) {
     if !track.parser_priv.is_null() {
         let state = &mut *(track.parser_priv as *mut TrackState);
-        state.parsed_cache_signature = None;
+        state.parsed_cache_backing_signature = None;
+        state.parsed_cache_active_event_indices.clear();
         state.parsed_cache = None;
+        state.parsed_cache_active_events_static = false;
+        state.parsed_cache_render_key = RenderTrackCacheKey::new();
         state.cache_generation = state.cache_generation.wrapping_add(1);
     }
 }
 
-unsafe fn parsed_track_cache_signature(
-    track: &ASS_Track,
-    active_event_indices: &[usize],
-) -> ParsedTrackCacheSignature {
+fn parsed_track_cache_signature(track: &ASS_Track) -> ParsedTrackCacheSignature {
     ParsedTrackCacheSignature {
-        n_styles: track.n_styles,
-        styles: track.styles as usize,
-        n_events: track.n_events,
-        events: track.events as usize,
-        style_format: track.style_format as usize,
-        event_format: track.event_format as usize,
-        track_type: track.track_type,
-        play_res_x: track.PlayResX,
-        play_res_y: track.PlayResY,
-        timer_bits: track.Timer.to_bits(),
-        wrap_style: track.WrapStyle,
-        scaled_border_and_shadow: track.ScaledBorderAndShadow,
-        kerning: track.Kerning,
-        language: track.Language as usize,
-        ycbcr_matrix: track.YCbCrMatrix,
-        default_style: track.default_style,
-        layout_res_x: track.LayoutResX,
-        layout_res_y: track.LayoutResY,
-        content_fingerprint: public_track_content_fingerprint(track, active_event_indices),
+        backing: ParsedTrackBackingSignature {
+            n_styles: track.n_styles,
+            styles: track.styles as usize,
+            n_events: track.n_events,
+            events: track.events as usize,
+            style_format: track.style_format as usize,
+            event_format: track.event_format as usize,
+            track_type: track.track_type,
+            play_res_x: track.PlayResX,
+            play_res_y: track.PlayResY,
+            timer_bits: track.Timer.to_bits(),
+            wrap_style: track.WrapStyle,
+            scaled_border_and_shadow: track.ScaledBorderAndShadow,
+            kerning: track.Kerning,
+            language: track.Language as usize,
+            ycbcr_matrix: track.YCbCrMatrix,
+            default_style: track.default_style,
+            layout_res_x: track.LayoutResX,
+            layout_res_y: track.LayoutResY,
+        },
     }
 }
 
-unsafe fn hash_c_string_for_cache(hasher: &mut DefaultHasher, value: *const c_char) {
+unsafe fn c_string_matches_parsed(value: *const c_char, parsed: &str) -> bool {
     if value.is_null() {
-        0_u8.hash(hasher);
+        parsed.is_empty()
     } else {
-        1_u8.hash(hasher);
-        CStr::from_ptr(value).to_bytes().hash(hasher);
+        CStr::from_ptr(value).to_string_lossy() == parsed
     }
 }
 
-unsafe fn hash_style_for_cache(hasher: &mut DefaultHasher, style: &ASS_Style) {
-    hash_c_string_for_cache(hasher, style.Name);
-    hash_c_string_for_cache(hasher, style.FontName);
-    style.FontSize.to_bits().hash(hasher);
-    style.PrimaryColour.hash(hasher);
-    style.SecondaryColour.hash(hasher);
-    style.OutlineColour.hash(hasher);
-    style.BackColour.hash(hasher);
-    style.Bold.hash(hasher);
-    style.Italic.hash(hasher);
-    style.Underline.hash(hasher);
-    style.StrikeOut.hash(hasher);
-    style.ScaleX.to_bits().hash(hasher);
-    style.ScaleY.to_bits().hash(hasher);
-    style.Spacing.to_bits().hash(hasher);
-    style.Angle.to_bits().hash(hasher);
-    style.BorderStyle.hash(hasher);
-    style.Outline.to_bits().hash(hasher);
-    style.Shadow.to_bits().hash(hasher);
-    style.Alignment.hash(hasher);
-    style.MarginL.hash(hasher);
-    style.MarginR.hash(hasher);
-    style.MarginV.hash(hasher);
-    style.Encoding.hash(hasher);
-    style.treat_fontname_as_pattern.hash(hasher);
-    style.Blur.to_bits().hash(hasher);
-    style.Justify.hash(hasher);
+unsafe fn public_style_matches_parsed(style: &ASS_Style, parsed: &ParsedStyle) -> bool {
+    c_string_matches_parsed(style.Name, &parsed.name)
+        && c_string_matches_parsed(style.FontName, &parsed.font_name)
+        && style.FontSize.to_bits() == parsed.font_size.to_bits()
+        && rgba_to_ass_color(style.PrimaryColour) == parsed.primary_colour
+        && rgba_to_ass_color(style.SecondaryColour) == parsed.secondary_colour
+        && rgba_to_ass_color(style.OutlineColour) == parsed.outline_colour
+        && rgba_to_ass_color(style.BackColour) == parsed.back_colour
+        && ffi_bold_is_active(style.Bold) == parsed.bold
+        && ffi_bold_weight(style.Bold) == parsed.font_weight
+        && (style.Italic != 0) == parsed.italic
+        && (style.Underline != 0) == parsed.underline
+        && (style.StrikeOut != 0) == parsed.strike_out
+        && style.ScaleX.to_bits() == parsed.scale_x.to_bits()
+        && style.ScaleY.to_bits() == parsed.scale_y.to_bits()
+        && style.Spacing.to_bits() == parsed.spacing.to_bits()
+        && style.Angle.to_bits() == parsed.angle.to_bits()
+        && style.BorderStyle == parsed.border_style
+        && style.Outline.to_bits() == parsed.outline.to_bits()
+        && style.Shadow.to_bits() == parsed.shadow.to_bits()
+        && style.Alignment == parsed.alignment
+        && style.MarginL == parsed.margin_l
+        && style.MarginR == parsed.margin_r
+        && style.MarginV == parsed.margin_v
+        && style.Encoding == parsed.encoding
+        && style.treat_fontname_as_pattern == parsed.treat_fontname_as_pattern
+        && style.Blur.to_bits() == parsed.blur.to_bits()
+        && style.Justify == parsed.justify
 }
 
-unsafe fn hash_event_for_cache(hasher: &mut DefaultHasher, event: &ASS_Event) {
-    event.Start.hash(hasher);
-    event.Duration.hash(hasher);
-    event.ReadOrder.hash(hasher);
-    event.Layer.hash(hasher);
-    event.Style.hash(hasher);
-    hash_c_string_for_cache(hasher, event.Name);
-    event.MarginL.hash(hasher);
-    event.MarginR.hash(hasher);
-    event.MarginV.hash(hasher);
-    hash_c_string_for_cache(hasher, event.Effect);
-    hash_c_string_for_cache(hasher, event.Text);
+unsafe fn public_event_matches_parsed(event: &ASS_Event, parsed: &ParsedEvent) -> bool {
+    event.Start == parsed.start
+        && event.Duration == parsed.duration
+        && event.ReadOrder == parsed.read_order
+        && event.Layer == parsed.layer
+        && event.Style == parsed.style
+        && c_string_matches_parsed(event.Name, &parsed.name)
+        && event.MarginL == parsed.margin_l
+        && event.MarginR == parsed.margin_r
+        && event.MarginV == parsed.margin_v
+        && c_string_matches_parsed(event.Effect, &parsed.effect)
+        && c_string_matches_parsed(event.Text, &parsed.text)
 }
 
-unsafe fn public_track_content_fingerprint(
+fn track_type_from_ffi(value: c_int) -> ass::TrackType {
+    match value {
+        value if value == ass::TrackType::Ass as c_int => ass::TrackType::Ass,
+        value if value == ass::TrackType::Ssa as c_int => ass::TrackType::Ssa,
+        _ => ass::TrackType::Unknown,
+    }
+}
+
+fn ycbcr_matrix_from_ffi(value: c_int) -> ass::YCbCrMatrix {
+    match value {
+        value if value == ass::YCbCrMatrix::None as c_int => ass::YCbCrMatrix::None,
+        value if value == ass::YCbCrMatrix::Bt601Tv as c_int => ass::YCbCrMatrix::Bt601Tv,
+        value if value == ass::YCbCrMatrix::Bt601Pc as c_int => ass::YCbCrMatrix::Bt601Pc,
+        value if value == ass::YCbCrMatrix::Bt709Tv as c_int => ass::YCbCrMatrix::Bt709Tv,
+        value if value == ass::YCbCrMatrix::Bt709Pc as c_int => ass::YCbCrMatrix::Bt709Pc,
+        value if value == ass::YCbCrMatrix::Smpte240mTv as c_int => ass::YCbCrMatrix::Smpte240mTv,
+        value if value == ass::YCbCrMatrix::Smpte240mPc as c_int => ass::YCbCrMatrix::Smpte240mPc,
+        value if value == ass::YCbCrMatrix::FccTv as c_int => ass::YCbCrMatrix::FccTv,
+        value if value == ass::YCbCrMatrix::FccPc as c_int => ass::YCbCrMatrix::FccPc,
+        value if value == ass::YCbCrMatrix::Unknown as c_int => ass::YCbCrMatrix::Unknown,
+        _ => ass::YCbCrMatrix::Default,
+    }
+}
+
+unsafe fn public_track_backing_matches_parsed(track: &ASS_Track, parsed: &ParsedTrack) -> bool {
+    let globals_match = c_string_matches_parsed(track.style_format, &parsed.style_format)
+        && c_string_matches_parsed(track.event_format, &parsed.event_format)
+        && c_string_matches_parsed(track.Language, &parsed.language)
+        && track_type_from_ffi(track.track_type) == parsed.track_type
+        && track.PlayResX == parsed.play_res_x
+        && track.PlayResY == parsed.play_res_y
+        && track.Timer.to_bits() == parsed.timer.to_bits()
+        && track.WrapStyle == parsed.wrap_style
+        && (track.ScaledBorderAndShadow != 0) == parsed.scaled_border_and_shadow
+        && (track.Kerning != 0) == parsed.kerning
+        && ycbcr_matrix_from_ffi(track.YCbCrMatrix) == parsed.ycbcr_matrix
+        && track.default_style == parsed.default_style
+        && track.LayoutResX == parsed.layout_res_x
+        && track.LayoutResY == parsed.layout_res_y;
+    if !globals_match {
+        return false;
+    }
+
+    let styles_match = if track.styles.is_null() || track.n_styles <= 0 {
+        parsed.styles.is_empty()
+    } else {
+        let styles = slice::from_raw_parts(track.styles, track.n_styles as usize);
+        styles.len() == parsed.styles.len()
+            && styles
+                .iter()
+                .zip(&parsed.styles)
+                .all(|(style, parsed)| public_style_matches_parsed(style, parsed))
+    };
+    if !styles_match {
+        return false;
+    }
+
+    if track.events.is_null() || track.n_events <= 0 {
+        return parsed.events.is_empty();
+    }
+    let events = slice::from_raw_parts(track.events, track.n_events as usize);
+    events.len() == parsed.events.len()
+        && events
+            .iter()
+            .zip(&parsed.events)
+            .all(|(event, parsed)| event.Start == parsed.start && event.Duration == parsed.duration)
+}
+
+unsafe fn public_active_events_match_parsed(
     track: &ASS_Track,
+    parsed: &ParsedTrack,
     active_event_indices: &[usize],
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hash_c_string_for_cache(&mut hasher, track.style_format);
-    hash_c_string_for_cache(&mut hasher, track.event_format);
-    hash_c_string_for_cache(&mut hasher, track.Language);
-
-    if !track.styles.is_null() && track.n_styles > 0 {
-        for style in slice::from_raw_parts(track.styles, track.n_styles as usize) {
-            hash_style_for_cache(&mut hasher, style);
-        }
+) -> bool {
+    if active_event_indices.is_empty() {
+        return true;
     }
-
-    active_event_indices.hash(&mut hasher);
-    if !track.events.is_null() && track.n_events > 0 {
-        let events = slice::from_raw_parts(track.events, track.n_events as usize);
-        for index in active_event_indices {
-            if let Some(event) = events.get(*index) {
-                hash_event_for_cache(&mut hasher, event);
-            }
-        }
+    if track.events.is_null() || track.n_events <= 0 {
+        return false;
     }
-    hasher.finish()
+    let events = slice::from_raw_parts(track.events, track.n_events as usize);
+    active_event_indices.iter().all(|index| {
+        events
+            .get(*index)
+            .zip(parsed.events.get(*index))
+            .is_some_and(|(event, parsed)| public_event_matches_parsed(event, parsed))
+    })
 }
 
 unsafe fn cached_parsed_track_from_ffi<'a>(
     track: *mut ASS_Track,
     track_ref: &ASS_Track,
     signature: ParsedTrackCacheSignature,
-) -> &'a ParsedTrack {
+    active_event_indices: &[usize],
+) -> (&'a ParsedTrack, bool, RenderTrackCacheKey) {
     let Some(state) = track_state_mut(track) else {
         panic!("ASS_Track missing parser state");
     };
-    if state.parsed_cache_signature != Some(signature) || state.parsed_cache.is_none() {
-        state.parsed_cache = Some(parsed_track_from_ffi(track_ref));
-        state.parsed_cache_signature = Some(signature);
+
+    let backing_changed = state.parsed_cache_backing_signature != Some(signature.backing)
+        || state
+            .parsed_cache
+            .as_ref()
+            .is_none_or(|parsed| !public_track_backing_matches_parsed(track_ref, parsed));
+    let active_content_changed = state.parsed_cache.as_ref().is_none_or(|parsed| {
+        !public_active_events_match_parsed(track_ref, parsed, active_event_indices)
+    });
+    let rebuild = backing_changed || active_content_changed || state.parsed_cache.is_none();
+
+    if rebuild {
+        let parsed = parsed_track_from_ffi(track_ref);
+        state.parsed_cache_active_events_static =
+            active_events_are_static(&parsed, active_event_indices);
+        state.parsed_cache_active_event_indices.clear();
+        state
+            .parsed_cache_active_event_indices
+            .extend_from_slice(active_event_indices);
+        state.parsed_cache = Some(parsed);
+        state.parsed_cache_backing_signature = Some(signature.backing);
+        state.parsed_cache_render_key = RenderTrackCacheKey::new();
+    } else if state.parsed_cache_active_event_indices != active_event_indices {
+        state.parsed_cache_active_events_static = active_events_are_static(
+            state.parsed_cache.as_ref().expect("parsed track cached"),
+            active_event_indices,
+        );
+        state.parsed_cache_active_event_indices.clear();
+        state
+            .parsed_cache_active_event_indices
+            .extend_from_slice(active_event_indices);
     }
-    state.parsed_cache.as_ref().expect("parsed track cached")
+    (
+        state.parsed_cache.as_ref().expect("parsed track cached"),
+        state.parsed_cache_active_events_static,
+        state.parsed_cache_render_key.clone(),
+    )
 }
 
 unsafe fn active_event_indices(track: *mut ASS_Track, now: i64) -> Vec<usize> {
@@ -3587,6 +3748,7 @@ fn frame_cache_time_key(
     track: &ParsedTrack,
     active_event_indices: &[usize],
     now: i64,
+    active_events_static: bool,
 ) -> Option<i64> {
     if active_event_indices
         .iter()
@@ -3595,7 +3757,7 @@ fn frame_cache_time_key(
         return None;
     }
 
-    if active_events_are_static(track, active_event_indices) {
+    if active_events_static {
         return Some(0);
     }
 
@@ -3654,11 +3816,7 @@ unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
         attachments: Vec::new(),
         style_format: string_option_from_ptr(track.style_format).unwrap_or_default(),
         event_format: string_option_from_ptr(track.event_format).unwrap_or_default(),
-        track_type: match track.track_type {
-            value if value == ass::TrackType::Ass as c_int => ass::TrackType::Ass,
-            value if value == ass::TrackType::Ssa as c_int => ass::TrackType::Ssa,
-            _ => ass::TrackType::Unknown,
-        },
+        track_type: track_type_from_ffi(track.track_type),
         play_res_x: track.PlayResX,
         play_res_y: track.PlayResY,
         timer: track.Timer,
@@ -3666,23 +3824,7 @@ unsafe fn parsed_track_from_ffi(track: &ASS_Track) -> ParsedTrack {
         scaled_border_and_shadow: track.ScaledBorderAndShadow != 0,
         kerning: track.Kerning != 0,
         language: string_option_from_ptr(track.Language).unwrap_or_default(),
-        ycbcr_matrix: match track.YCbCrMatrix {
-            value if value == ass::YCbCrMatrix::None as c_int => ass::YCbCrMatrix::None,
-            value if value == ass::YCbCrMatrix::Bt601Tv as c_int => ass::YCbCrMatrix::Bt601Tv,
-            value if value == ass::YCbCrMatrix::Bt601Pc as c_int => ass::YCbCrMatrix::Bt601Pc,
-            value if value == ass::YCbCrMatrix::Bt709Tv as c_int => ass::YCbCrMatrix::Bt709Tv,
-            value if value == ass::YCbCrMatrix::Bt709Pc as c_int => ass::YCbCrMatrix::Bt709Pc,
-            value if value == ass::YCbCrMatrix::Smpte240mTv as c_int => {
-                ass::YCbCrMatrix::Smpte240mTv
-            }
-            value if value == ass::YCbCrMatrix::Smpte240mPc as c_int => {
-                ass::YCbCrMatrix::Smpte240mPc
-            }
-            value if value == ass::YCbCrMatrix::FccTv as c_int => ass::YCbCrMatrix::FccTv,
-            value if value == ass::YCbCrMatrix::FccPc as c_int => ass::YCbCrMatrix::FccPc,
-            value if value == ass::YCbCrMatrix::Unknown as c_int => ass::YCbCrMatrix::Unknown,
-            _ => ass::YCbCrMatrix::Default,
-        },
+        ycbcr_matrix: ycbcr_matrix_from_ffi(track.YCbCrMatrix),
         default_style: track.default_style,
         layout_res_x: track.LayoutResX,
         layout_res_y: track.LayoutResY,
@@ -3726,6 +3868,43 @@ fn selective_style_overrides_active(renderer: &ASS_Renderer) -> bool {
         && renderer.selective_override_bits != ass::override_bits::DEFAULT
 }
 
+fn cached_selective_override_track(
+    renderer: &mut ASS_Renderer,
+    track: *mut ASS_Track,
+    source_render_key: &RenderTrackCacheKey,
+    base: &ParsedTrack,
+    active_event_indices: &[usize],
+) -> (Arc<ParsedTrack>, RenderTrackCacheKey) {
+    let style = renderer
+        .selective_override_style
+        .as_ref()
+        .expect("active selective override has a style");
+    if let Some(cached) = renderer.selective_override_cache.as_ref().filter(|cached| {
+        cached.track == track as usize
+            && cached.source_render_key == *source_render_key
+            && cached.bits == renderer.selective_override_bits
+            && cached.style == *style
+            && cached.active_event_indices == active_event_indices
+    }) {
+        return (Arc::clone(&cached.parsed), cached.render_key.clone());
+    }
+
+    let mut parsed = base.clone();
+    apply_selective_style_overrides(&mut parsed, renderer, active_event_indices);
+    let parsed = Arc::new(parsed);
+    let render_key = RenderTrackCacheKey::new();
+    renderer.selective_override_cache = Some(CachedSelectiveOverrideTrack {
+        track: track as usize,
+        source_render_key: source_render_key.clone(),
+        bits: renderer.selective_override_bits,
+        style: style.clone(),
+        active_event_indices: active_event_indices.to_vec(),
+        parsed: Arc::clone(&parsed),
+        render_key: render_key.clone(),
+    });
+    (parsed, render_key)
+}
+
 fn apply_selective_style_overrides(
     track: &mut ParsedTrack,
     renderer: &ASS_Renderer,
@@ -3752,28 +3931,39 @@ fn apply_selective_style_overrides(
             | ass::override_bits::ATTRIBUTES;
     }
 
-    let base_styles = track.styles.clone();
-    if base_styles.is_empty() {
+    let base_style_count = track.styles.len();
+    if base_style_count == 0 {
         return;
     }
 
     let scale = f64::from(track.play_res_y) / 288.0;
+    let mut overridden_style_indices = vec![None; base_style_count];
     for event_index in active_event_indices {
-        let Some(event) = track.events.get(*event_index).cloned() else {
+        let Some(event) = track.events.get(*event_index) else {
             continue;
         };
         let style_index =
-            parsed_event_style_index_from_len(base_styles.len(), track.default_style, event.style);
-        if event_is_explicit_for_selective_overrides(&base_styles, &event, style_index) {
+            parsed_event_style_index_from_len(base_style_count, track.default_style, event.style);
+        if event_is_explicit_for_selective_overrides(
+            &track.styles[..base_style_count],
+            event,
+            style_index,
+        ) {
             continue;
         }
 
-        let mut style = base_styles[style_index].clone();
-        apply_selective_style_override_fields(&mut style, user_style, requested, scale);
-        let Ok(cloned_style_index) = i32::try_from(track.styles.len()) else {
-            continue;
+        let cloned_style_index = if let Some(index) = overridden_style_indices[style_index] {
+            index
+        } else {
+            let mut style = track.styles[style_index].clone();
+            apply_selective_style_override_fields(&mut style, user_style, requested, scale);
+            let Ok(index) = i32::try_from(track.styles.len()) else {
+                continue;
+            };
+            track.styles.push(style);
+            overridden_style_indices[style_index] = Some(index);
+            index
         };
-        track.styles.push(style);
         if let Some(event) = track.events.get_mut(*event_index) {
             event.style = cloned_style_index;
         }
@@ -4036,6 +4226,276 @@ mod tests {
     }
 
     #[test]
+    fn owned_image_list_links_stable_contiguous_nodes() {
+        let planes = vec![
+            ImagePlane {
+                size: Size {
+                    width: 2,
+                    height: 1,
+                },
+                stride: 2,
+                color: rassa_core::RgbaColor(0x1122_3344),
+                destination: rassa_core::Point { x: 3, y: 4 },
+                kind: ass::ImageType::Character,
+                bitmap: vec![1, 2],
+            },
+            ImagePlane {
+                size: Size {
+                    width: 1,
+                    height: 1,
+                },
+                stride: 1,
+                color: rassa_core::RgbaColor(0x5566_7788),
+                destination: rassa_core::Point { x: 5, y: 6 },
+                kind: ass::ImageType::Outline,
+                bitmap: vec![3],
+            },
+            ImagePlane {
+                size: Size::default(),
+                stride: 0,
+                color: rassa_core::RgbaColor(0x99aa_bbcc),
+                destination: rassa_core::Point { x: 7, y: 8 },
+                kind: ass::ImageType::Shadow,
+                bitmap: Vec::new(),
+            },
+        ];
+        let mut images = OwnedImageList::from_planes(planes);
+        let nodes = images.nodes.as_mut_ptr();
+        let bitmap_pointers = images
+            .bitmaps
+            .iter_mut()
+            .map(|bitmap| {
+                if bitmap.is_empty() {
+                    ptr::null_mut()
+                } else {
+                    bitmap.as_mut_ptr()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(images.head_ptr(), nodes);
+        for (index, bitmap) in bitmap_pointers.into_iter().enumerate() {
+            let expected_next = if index + 1 < images.nodes.len() {
+                unsafe { nodes.add(index + 1) }
+            } else {
+                ptr::null_mut()
+            };
+            assert_eq!(images.nodes[index].next, expected_next);
+            assert_eq!(images.nodes[index].bitmap, bitmap);
+        }
+
+        let mut moved = images;
+        assert_eq!(moved.nodes.as_mut_ptr(), nodes);
+        let mut current = moved.head_ptr();
+        for index in 0..moved.nodes.len() {
+            assert_eq!(current, unsafe { nodes.add(index) });
+            current = unsafe { (*current).next };
+        }
+        assert!(current.is_null());
+    }
+
+    #[test]
+    fn no_op_prune_preserves_event_storage_and_cache_generation() {
+        unsafe {
+            let library = ass_library_init();
+            let track = ass_new_track(library);
+            assert_eq!(ass_alloc_event(track), 0);
+            let event = &mut *(*track).events;
+            event.Start = 100;
+            event.Duration = 50;
+            event.ReadOrder = 7;
+
+            let state = track_state_mut(track).expect("track state");
+            state.read_order_seen = Some(HashSet::from([7]));
+            let generation = state.cache_generation;
+            let events = (*track).events;
+            let max_events = (*track).max_events;
+
+            ass_prune_events(track, 150);
+            assert_eq!((*track).n_events, 1);
+            assert_eq!((*track).max_events, max_events);
+            assert_eq!((*track).events, events);
+            let state = track_state_ref(track).expect("track state");
+            assert_eq!(state.cache_generation, generation);
+            assert!(
+                state
+                    .read_order_seen
+                    .as_ref()
+                    .is_some_and(|seen| seen.contains(&7))
+            );
+
+            ass_prune_events(track, 151);
+            assert_eq!((*track).n_events, 0);
+            let state = track_state_ref(track).expect("track state");
+            assert_eq!(state.cache_generation, generation.wrapping_add(1));
+            assert!(
+                state
+                    .read_order_seen
+                    .as_ref()
+                    .is_some_and(HashSet::is_empty)
+            );
+
+            ass_free_track(track);
+            ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn parsed_track_cache_reuses_cues_and_rebuilds_for_public_mutations() {
+        let script = b"[Script Info]\n\
+            ScriptType: v4.00+\n\
+            PlayResX: 320\n\
+            PlayResY: 180\n\
+            [V4+ Styles]\n\
+            Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+            Style: Default,sans,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\
+            [Events]\n\
+            Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+            Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,STATIC\n\
+            Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\\move(10,10,20,20)}DYNAMIC\n";
+
+        unsafe {
+            let library = ass_library_init();
+            let track = ass_read_memory(
+                library,
+                script.as_ptr().cast::<c_char>().cast_mut(),
+                script.len(),
+                ptr::null(),
+            );
+            assert!(!track.is_null());
+
+            let first_active = active_event_indices(track, 500);
+            assert_eq!(first_active, [0]);
+            let first_signature = parsed_track_cache_signature(&*track);
+            let (first_cached, first_static, first_render_key) =
+                cached_parsed_track_from_ffi(track, &*track, first_signature, &first_active);
+            let first_events = first_cached.events.as_ptr();
+            assert!(first_static);
+
+            let second_active = active_event_indices(track, 2_500);
+            assert_eq!(second_active, [1]);
+            let second_signature = parsed_track_cache_signature(&*track);
+            assert_eq!(second_signature, first_signature);
+            let (second_cached, second_static, second_render_key) =
+                cached_parsed_track_from_ffi(track, &*track, second_signature, &second_active);
+            assert_eq!(second_cached.events.as_ptr(), first_events);
+            assert_eq!(second_render_key, first_render_key);
+            assert!(!second_static);
+
+            let first_active_again = active_event_indices(track, 500);
+            let first_signature_again = parsed_track_cache_signature(&*track);
+            assert_eq!(first_signature_again, first_signature);
+            let (first_cached_again, first_static_again, _) = cached_parsed_track_from_ffi(
+                track,
+                &*track,
+                first_signature_again,
+                &first_active_again,
+            );
+            assert_eq!(first_cached_again.events.as_ptr(), first_events);
+            assert!(first_static_again);
+
+            let second_event = (*track).events.add(1);
+            (*second_event).Start = 3_000;
+            let timing_signature = parsed_track_cache_signature(&*track);
+            assert_eq!(timing_signature, first_signature);
+            let (timing_cached, timing_static, timing_render_key) =
+                cached_parsed_track_from_ffi(track, &*track, timing_signature, &first_active_again);
+            let timing_events = timing_cached.events.as_ptr();
+            assert_ne!(timing_events, first_events);
+            assert_ne!(timing_render_key, first_render_key);
+            assert_eq!(timing_cached.events[1].start, 3_000);
+            assert!(timing_static);
+
+            replace_string(&mut (*second_event).Text, "SECOND");
+            let inactive_content_signature = parsed_track_cache_signature(&*track);
+            assert_eq!(inactive_content_signature, timing_signature);
+            let (inactive_cached, inactive_static, _) = cached_parsed_track_from_ffi(
+                track,
+                &*track,
+                inactive_content_signature,
+                &first_active_again,
+            );
+            assert_eq!(inactive_cached.events.as_ptr(), timing_events);
+            assert_ne!(inactive_cached.events[1].text, "SECOND");
+            assert!(inactive_static);
+
+            let mutated_active = active_event_indices(track, 3_500);
+            assert_eq!(mutated_active, [1]);
+            let mutated_signature = parsed_track_cache_signature(&*track);
+            let (mutated_cached, mutated_static, _) =
+                cached_parsed_track_from_ffi(track, &*track, mutated_signature, &mutated_active);
+            assert_ne!(mutated_cached.events.as_ptr(), timing_events);
+            assert_eq!(mutated_cached.events[1].text, "SECOND");
+            assert!(mutated_static);
+
+            let state = track_state_ref(track).expect("track state");
+            assert_eq!(state.parsed_cache_active_event_indices, [1]);
+
+            ass_free_track(track);
+            ass_library_done(library);
+        }
+    }
+
+    #[test]
+    fn selective_override_track_is_reused_and_deduplicates_styles() {
+        let mut renderer = ASS_Renderer::default();
+        renderer.selective_override_bits = ass::override_bits::JUSTIFY;
+        renderer.selective_override_style = Some(OwnedStyleOverride {
+            style: ParsedStyle {
+                justify: ass::ASS_JUSTIFY_LEFT,
+                ..ParsedStyle::default()
+            },
+        });
+        let base = ParsedTrack {
+            events: vec![
+                ParsedEvent {
+                    text: "first".to_string(),
+                    ..ParsedEvent::default()
+                },
+                ParsedEvent {
+                    text: "second".to_string(),
+                    ..ParsedEvent::default()
+                },
+            ],
+            ..ParsedTrack::default()
+        };
+        let source_key = RenderTrackCacheKey::new();
+        let active = [0, 1];
+
+        let (first, first_key) = cached_selective_override_track(
+            &mut renderer,
+            ptr::null_mut(),
+            &source_key,
+            &base,
+            &active,
+        );
+        assert_eq!(first.styles.len(), 2);
+        assert_eq!(first.events[0].style, 1);
+        assert_eq!(first.events[1].style, 1);
+
+        let (second, second_key) = cached_selective_override_track(
+            &mut renderer,
+            ptr::null_mut(),
+            &source_key,
+            &base,
+            &active,
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first_key, second_key);
+
+        let replacement_source_key = RenderTrackCacheKey::new();
+        let (replacement, replacement_key) = cached_selective_override_track(
+            &mut renderer,
+            ptr::null_mut(),
+            &replacement_source_key,
+            &base,
+            &active,
+        );
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert_ne!(first_key, replacement_key);
+    }
+
+    #[test]
     fn renderer_init_defaults_match_libass() {
         unsafe {
             let library = ass_library_init();
@@ -4228,10 +4688,17 @@ mod tests {
                 ass_free(allocation.cast());
             }
 
-            let internal = string_to_c_ptr("embedded\0nul");
-            assert!(!internal.is_null());
-            assert_eq!(CStr::from_ptr(internal).to_bytes(), b"embedded nul");
-            ass_free(internal.cast());
+            for (value, expected) in [
+                ("", b"".as_slice()),
+                ("ordinary", b"ordinary".as_slice()),
+                ("embedded\0nul", b"embedded nul".as_slice()),
+                ("\0two\0\0more\0", b" two  more ".as_slice()),
+            ] {
+                let internal = string_to_c_ptr(value);
+                assert!(!internal.is_null());
+                assert_eq!(CStr::from_ptr(internal).to_bytes(), expected);
+                ass_free(internal.cast());
+            }
 
             let bytes = b"caller-owned\0";
             let mut caller_owned = ass_malloc(bytes.len()).cast::<c_char>();

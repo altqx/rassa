@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fmt, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 mod legacy_arabic_charmap;
@@ -102,8 +102,80 @@ impl FontMatch {
     }
 }
 
+/// Collision-free identity for a font provider whose answers are stable.
+///
+/// The opaque allocation is compared by identity, so independent providers cannot accidentally
+/// alias one another. Providers must replace the key whenever an observable resolution result can
+/// change.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct FontProviderCacheKey(Arc<()>);
+
+impl FontProviderCacheKey {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl Default for FontProviderCacheKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for FontProviderCacheKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FontProviderCacheKey(..)")
+    }
+}
+
+impl PartialEq for FontProviderCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FontProviderCacheKey {}
+
+/// Best-effort identity for one live font-provider object.
+///
+/// Stable providers should prefer [`FontProvider::layout_cache_key`]. This fallback lets renderers
+/// keep short-lived state for an uncacheable provider without sharing it with another live object.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontProviderInstanceKey {
+    type_name: &'static str,
+    address: usize,
+}
+
+impl FontProviderInstanceKey {
+    fn of<T: ?Sized>(provider: &T) -> Self {
+        Self {
+            type_name: std::any::type_name::<T>(),
+            address: provider as *const T as *const () as usize,
+        }
+    }
+}
+
 pub trait FontProvider {
     fn resolve(&self, query: &FontQuery) -> FontMatch;
+
+    /// Stable, collision-free identity for timestamp-independent layout caching.
+    ///
+    /// Custom providers default to no caching because their answers may change through
+    /// interior state. An implementation that opts in must create a fresh key whenever any
+    /// resolution answer can change.
+    #[doc(hidden)]
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        None
+    }
+
+    /// Identity of this live provider object for state that cannot be shared across providers.
+    #[doc(hidden)]
+    fn instance_cache_key(&self) -> FontProviderInstanceKey {
+        FontProviderInstanceKey::of(self)
+    }
 
     fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
         let resolved = self.resolve(query);
@@ -127,6 +199,14 @@ impl<T: FontProvider + ?Sized> FontProvider for Box<T> {
     fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
         (**self).resolve_for_text(query, text)
     }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        (**self).layout_cache_key()
+    }
+
+    fn instance_cache_key(&self) -> FontProviderInstanceKey {
+        (**self).instance_cache_key()
+    }
 }
 
 impl<T: FontProvider + ?Sized> FontProvider for &T {
@@ -136,6 +216,14 @@ impl<T: FontProvider + ?Sized> FontProvider for &T {
 
     fn resolve_for_text(&self, query: &FontQuery, text: &str) -> FontMatch {
         (**self).resolve_for_text(query, text)
+    }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        (**self).layout_cache_key()
+    }
+
+    fn instance_cache_key(&self) -> FontProviderInstanceKey {
+        (**self).instance_cache_key()
     }
 }
 
@@ -150,12 +238,18 @@ impl FontProvider for NullFontProvider {
             FontProviderKind::Null,
         )
     }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        static KEY: OnceLock<FontProviderCacheKey> = OnceLock::new();
+        Some(KEY.get_or_init(FontProviderCacheKey::new).clone())
+    }
 }
 
 pub struct CrossfontProvider {
     fallback_family: Option<String>,
     config_path: Option<PathBuf>,
     resolve_cache: Mutex<HashMap<FontResolveKey, FontMatch>>,
+    layout_cache_key: FontProviderCacheKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -189,6 +283,7 @@ impl CrossfontProvider {
             fallback_family: Some("Arial".to_string()),
             config_path: None,
             resolve_cache: Mutex::new(HashMap::new()),
+            layout_cache_key: FontProviderCacheKey::new(),
         }
     }
 
@@ -197,6 +292,7 @@ impl CrossfontProvider {
             fallback_family: Some(fallback_family.into()),
             config_path: None,
             resolve_cache: Mutex::new(HashMap::new()),
+            layout_cache_key: FontProviderCacheKey::new(),
         }
     }
 
@@ -206,6 +302,7 @@ impl CrossfontProvider {
             fallback_family: Some("Arial".to_string()),
             config_path: Some(config_path.into()),
             resolve_cache: Mutex::new(HashMap::new()),
+            layout_cache_key: FontProviderCacheKey::new(),
         }
     }
 
@@ -217,6 +314,7 @@ impl CrossfontProvider {
             fallback_family: Some(fallback_family.into()),
             config_path: Some(config_path.into()),
             resolve_cache: Mutex::new(HashMap::new()),
+            layout_cache_key: FontProviderCacheKey::new(),
         }
     }
 
@@ -312,6 +410,10 @@ impl FontProvider for CrossfontProvider {
             .insert(cache_key, resolved.clone());
         resolved
     }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        Some(self.layout_cache_key.clone())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -324,9 +426,6 @@ fn resolve_system_font(
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     let _ = config_path;
 
-    let mut database = Database::new();
-    database.load_system_fonts();
-
     #[cfg(all(unix, not(target_os = "macos")))]
     if let Some((path, face_index)) =
         fontconfig_match_path(family, style, weight, None, config_path)
@@ -338,6 +437,9 @@ fn resolve_system_font(
             return Some((resolved_family, Some(path), face_index));
         }
     }
+
+    let mut database = Database::new();
+    database.load_system_fonts();
 
     let requested_style = style.map(normalize_font_key);
     let wants_bold = requested_style
@@ -438,11 +540,54 @@ pub fn font_match_supports_text(font: &FontMatch, text: &str) -> bool {
     let Some(path) = &font.path else {
         return false;
     };
-    text.chars()
+    font_file_supports_text_in_scope(
+        path,
+        FontFaceScope::Face(font.face_index.unwrap_or(0)),
+        text,
+    )
+}
+
+fn font_file_supports_text_in_scope(path: &Path, scope: FontFaceScope, text: &str) -> bool {
+    let characters = text
+        .chars()
         .filter(|character| !character.is_whitespace() && !character.is_control())
-        .all(|character| {
-            font_file_face_supports_char(path, font.face_index.unwrap_or(0), character)
+        .collect::<HashSet<_>>();
+    let mut missing = Vec::new();
+    let mut all_supported = true;
+    {
+        let cache = font_char_support_cache()
+            .lock()
+            .expect("font char support cache mutex poisoned");
+        for character in characters {
+            match cache.get(&(path.to_path_buf(), scope, character)) {
+                Some(false) => all_supported = false,
+                Some(true) => {}
+                None => missing.push(character),
+            }
+        }
+    }
+    if missing.is_empty() {
+        return all_supported;
+    }
+
+    let data = fs::read(path).ok();
+    let results = missing
+        .into_iter()
+        .map(|character| {
+            let supports = data
+                .as_deref()
+                .is_some_and(|data| font_data_supports_char(data, scope, character));
+            (character, supports)
         })
+        .collect::<Vec<_>>();
+    all_supported &= results.iter().all(|(_, supports)| *supports);
+    let mut cache = font_char_support_cache()
+        .lock()
+        .expect("font char support cache mutex poisoned");
+    for (character, supports) in results {
+        cache.insert((path.to_path_buf(), scope, character), supports);
+    }
+    all_supported
 }
 
 pub fn font_file_supports_char(path: &Path, character: char) -> bool {
@@ -476,15 +621,19 @@ fn font_file_supports_char_uncached(path: &Path, scope: FontFaceScope, character
     let Ok(data) = fs::read(path) else {
         return false;
     };
+    font_data_supports_char(&data, scope, character)
+}
+
+fn font_data_supports_char(data: &[u8], scope: FontFaceScope, character: char) -> bool {
     match scope {
         FontFaceScope::Any => {
-            let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
+            let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1).max(1);
             (0..face_count).any(|index| {
-                font_data_glyph_index(&data, index, character).is_some_and(|glyph| glyph.0 != 0)
+                font_data_glyph_index(data, index, character).is_some_and(|glyph| glyph.0 != 0)
             })
         }
         FontFaceScope::Face(index) => {
-            font_data_glyph_index(&data, index, character).is_some_and(|glyph| glyph.0 != 0)
+            font_data_glyph_index(data, index, character).is_some_and(|glyph| glyph.0 != 0)
         }
     }
 }
@@ -658,10 +807,28 @@ struct AttachedFontRecord {
     aliases: FontRecordAliases,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct AttachedFontProvider {
     fonts: Vec<AttachedFontRecord>,
+    layout_cache_key: FontProviderCacheKey,
 }
+
+impl fmt::Debug for AttachedFontProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachedFontProvider")
+            .field("fonts", &self.fonts)
+            .finish()
+    }
+}
+
+impl PartialEq for AttachedFontProvider {
+    fn eq(&self, other: &Self) -> bool {
+        self.fonts == other.fonts
+    }
+}
+
+impl Eq for AttachedFontProvider {}
 
 impl AttachedFontProvider {
     pub fn from_attachments(attachments: &[FontAttachment]) -> Self {
@@ -679,10 +846,32 @@ impl AttachedFontProvider {
         let _ = fs::create_dir_all(&root);
         let fonts = attachments
             .iter()
-            .flat_map(|attachment| AttachedFontRecord::from_attachment(attachment, &root))
+            .flat_map(|attachment| {
+                AttachedFontRecord::from_attachment_parts(&attachment.name, &attachment.data, &root)
+            })
             .collect();
 
-        Self { fonts }
+        Self {
+            fonts,
+            layout_cache_key: FontProviderCacheKey::new(),
+        }
+    }
+
+    /// Build from borrowed attachment payloads without copying multi-megabyte font buffers.
+    #[doc(hidden)]
+    pub fn from_attachment_slices<'a>(
+        attachments: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) -> Self {
+        let root = std::env::temp_dir().join("rassa-attached-fonts");
+        let _ = fs::create_dir_all(&root);
+        let fonts = attachments
+            .into_iter()
+            .flat_map(|(name, data)| AttachedFontRecord::from_attachment_parts(name, data, &root))
+            .collect();
+        Self {
+            fonts,
+            layout_cache_key: FontProviderCacheKey::new(),
+        }
     }
 }
 
@@ -742,6 +931,10 @@ impl FontProvider for AttachedFontProvider {
             synthetic_italic,
             provider: FontProviderKind::Attached,
         }
+    }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        Some(self.layout_cache_key.clone())
     }
 }
 
@@ -918,10 +1111,28 @@ impl fmt::Display for FontDirectoryIssue {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct DirectoryFontProvider {
     fonts: Vec<DirectoryFontRecord>,
+    layout_cache_key: FontProviderCacheKey,
 }
+
+impl fmt::Debug for DirectoryFontProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectoryFontProvider")
+            .field("fonts", &self.fonts)
+            .finish()
+    }
+}
+
+impl PartialEq for DirectoryFontProvider {
+    fn eq(&self, other: &Self) -> bool {
+        self.fonts == other.fonts
+    }
+}
+
+impl Eq for DirectoryFontProvider {}
 
 impl DirectoryFontProvider {
     /// Scan a libass font dir: skip hidden/subdirs; accept files by contents, not extension.
@@ -982,7 +1193,13 @@ impl DirectoryFontProvider {
             }
         }
 
-        (Self { fonts }, issues)
+        (
+            Self {
+                fonts,
+                layout_cache_key: FontProviderCacheKey::new(),
+            },
+            issues,
+        )
     }
 }
 
@@ -1043,6 +1260,10 @@ impl FontProvider for DirectoryFontProvider {
             provider: FontProviderKind::Attached,
         }
     }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        Some(self.layout_cache_key.clone())
+    }
 }
 
 fn directory_font_records(path: &Path, data: &[u8]) -> Vec<DirectoryFontRecord> {
@@ -1068,11 +1289,22 @@ fn directory_font_records(path: &Path, data: &[u8]) -> Vec<DirectoryFontRecord> 
 pub struct MergedFontProvider<P, S> {
     primary: P,
     secondary: S,
+    layout_cache_key: Mutex<
+        Option<(
+            FontProviderCacheKey,
+            FontProviderCacheKey,
+            FontProviderCacheKey,
+        )>,
+    >,
 }
 
 impl<P, S> MergedFontProvider<P, S> {
     pub fn new(primary: P, secondary: S) -> Self {
-        Self { primary, secondary }
+        Self {
+            primary,
+            secondary,
+            layout_cache_key: Mutex::new(None),
+        }
     }
 }
 
@@ -1094,12 +1326,31 @@ impl<P: FontProvider, S: FontProvider> FontProvider for MergedFontProvider<P, S>
             self.secondary.resolve_for_text(query, text)
         }
     }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        let primary_key = self.primary.layout_cache_key()?;
+        let secondary_key = self.secondary.layout_cache_key()?;
+        let mut cache = self
+            .layout_cache_key
+            .lock()
+            .expect("merged provider cache key mutex poisoned");
+        if let Some((cached_primary, cached_secondary, key)) = cache.as_ref()
+            && cached_primary == &primary_key
+            && cached_secondary == &secondary_key
+        {
+            return Some(key.clone());
+        }
+        let key = FontProviderCacheKey::new();
+        *cache = Some((primary_key, secondary_key, key.clone()));
+        Some(key)
+    }
 }
 
 pub struct DefaultFontFileProvider<P> {
     primary: P,
     path: PathBuf,
     family: Option<String>,
+    layout_cache_key: Mutex<Option<(FontProviderCacheKey, FontProviderCacheKey)>>,
 }
 
 impl<P> DefaultFontFileProvider<P> {
@@ -1108,11 +1359,13 @@ impl<P> DefaultFontFileProvider<P> {
             primary,
             path: path.into(),
             family: None,
+            layout_cache_key: Mutex::new(None),
         }
     }
 
     pub fn with_family(mut self, family: impl Into<String>) -> Self {
         self.family = Some(family.into());
+        self.layout_cache_key = Mutex::new(None);
         self
     }
 }
@@ -1159,6 +1412,22 @@ impl<P: FontProvider> FontProvider for DefaultFontFileProvider<P> {
             )
         }
     }
+
+    fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+        let primary_key = self.primary.layout_cache_key()?;
+        let mut cache = self
+            .layout_cache_key
+            .lock()
+            .expect("default-file provider cache key mutex poisoned");
+        if let Some((cached_primary, key)) = cache.as_ref()
+            && cached_primary == &primary_key
+        {
+            return Some(key.clone());
+        }
+        let key = FontProviderCacheKey::new();
+        *cache = Some((primary_key, key.clone()));
+        Some(key)
+    }
 }
 
 fn synthetic_style_flags(
@@ -1191,20 +1460,18 @@ fn bold_weight_is_active(weight: i32) -> bool {
 }
 
 impl AttachedFontRecord {
-    fn from_attachment(attachment: &FontAttachment, root: &Path) -> Vec<Self> {
-        if attachment.data.is_empty() {
+    fn from_attachment_parts(name: &str, data: &[u8], root: &Path) -> Vec<Self> {
+        if data.is_empty() {
             return Vec::new();
         }
 
-        let Some(path) = materialize_attachment(root, attachment) else {
+        let Some(path) = materialize_attachment(root, name, data) else {
             return Vec::new();
         };
-        let face_count = ttf_parser::fonts_in_collection(&attachment.data)
-            .unwrap_or(1)
-            .max(1);
+        let face_count = ttf_parser::fonts_in_collection(data).unwrap_or(1).max(1);
         (0..face_count)
             .filter_map(|index| {
-                let face = ttf_parser::Face::parse(&attachment.data, index).ok()?;
+                let face = ttf_parser::Face::parse(data, index).ok()?;
                 let metadata = font_face_metadata(&face)?;
                 Some(Self {
                     family: metadata.family,
@@ -1221,14 +1488,14 @@ impl AttachedFontRecord {
     }
 }
 
-fn materialize_attachment(root: &Path, attachment: &FontAttachment) -> Option<PathBuf> {
+fn materialize_attachment(root: &Path, name: &str, data: &[u8]) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
-    attachment.name.hash(&mut hasher);
-    attachment.data.hash(&mut hasher);
+    name.hash(&mut hasher);
+    data.hash(&mut hasher);
     let hash = hasher.finish();
-    let sanitized = sanitize_attachment_name(&attachment.name);
+    let sanitized = sanitize_attachment_name(name);
     let path = root.join(format!("{hash:016x}-{sanitized}"));
-    if !path.exists() && fs::write(&path, &attachment.data).is_err() {
+    if !path.exists() && fs::write(&path, data).is_err() {
         return None;
     }
     Some(path)
@@ -1424,6 +1691,129 @@ fn font_name_match_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UncacheableProvider;
+
+    impl FontProvider for UncacheableProvider {
+        fn resolve(&self, query: &FontQuery) -> FontMatch {
+            FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::Null,
+            )
+        }
+    }
+
+    struct InstanceProvider(u8);
+
+    impl FontProvider for InstanceProvider {
+        fn resolve(&self, query: &FontQuery) -> FontMatch {
+            let _marker = self.0;
+            FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::Null,
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct MutableKeyProvider {
+        key: Arc<Mutex<FontProviderCacheKey>>,
+    }
+
+    impl MutableKeyProvider {
+        fn new() -> Self {
+            Self {
+                key: Arc::new(Mutex::new(FontProviderCacheKey::new())),
+            }
+        }
+
+        fn invalidate(&self) {
+            *self.key.lock().expect("test provider key mutex poisoned") =
+                FontProviderCacheKey::new();
+        }
+    }
+
+    impl FontProvider for MutableKeyProvider {
+        fn resolve(&self, query: &FontQuery) -> FontMatch {
+            FontMatch::unresolved(
+                query.family.clone(),
+                query.style.clone(),
+                FontProviderKind::Null,
+            )
+        }
+
+        fn layout_cache_key(&self) -> Option<FontProviderCacheKey> {
+            Some(
+                self.key
+                    .lock()
+                    .expect("test provider key mutex poisoned")
+                    .clone(),
+            )
+        }
+    }
+
+    #[test]
+    fn provider_cache_keys_are_collision_free_and_clone_stable() {
+        let provider = AttachedFontProvider::default();
+        let cloned = provider.clone();
+        let independent = AttachedFontProvider::default();
+
+        assert_eq!(provider.layout_cache_key(), cloned.layout_cache_key());
+        assert_ne!(provider.layout_cache_key(), independent.layout_cache_key());
+        assert_eq!(
+            NullFontProvider.layout_cache_key(),
+            NullFontProvider.layout_cache_key()
+        );
+    }
+
+    #[test]
+    fn instance_keys_distinguish_live_providers_and_forward_through_wrappers() {
+        let first = InstanceProvider(1);
+        let second = InstanceProvider(2);
+        let first_key = FontProvider::instance_cache_key(&first);
+
+        assert_ne!(first_key, FontProvider::instance_cache_key(&second));
+
+        let borrowed = &first;
+        assert_eq!(first_key, FontProvider::instance_cache_key(&borrowed));
+
+        let boxed = Box::new(InstanceProvider(3));
+        let boxed_target_key = FontProvider::instance_cache_key(boxed.as_ref());
+        assert_eq!(boxed_target_key, FontProvider::instance_cache_key(&boxed));
+
+        let dynamic: &dyn FontProvider = &first;
+        assert_eq!(first_key, dynamic.instance_cache_key());
+    }
+
+    #[test]
+    fn wrappers_do_not_cache_an_uncacheable_child() {
+        let merged = MergedFontProvider::new(UncacheableProvider, NullFontProvider);
+        let default_file = DefaultFontFileProvider::new(UncacheableProvider, "fallback.ttf");
+
+        assert_eq!(merged.layout_cache_key(), None);
+        assert_eq!(default_file.layout_cache_key(), None);
+        assert!(
+            MergedFontProvider::new(NullFontProvider, NullFontProvider)
+                .layout_cache_key()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn wrapper_cache_keys_follow_cacheable_child_invalidation() {
+        let child = MutableKeyProvider::new();
+        let merged = MergedFontProvider::new(child.clone(), NullFontProvider);
+        let default_file = DefaultFontFileProvider::new(child.clone(), "fallback.ttf");
+        let merged_before = merged.layout_cache_key();
+        let default_before = default_file.layout_cache_key();
+
+        child.invalidate();
+
+        assert_ne!(merged.layout_cache_key(), merged_before);
+        assert_ne!(default_file.layout_cache_key(), default_before);
+    }
 
     fn read_be_u16(data: &[u8], offset: usize) -> u16 {
         u16::from_be_bytes([data[offset], data[offset + 1]])

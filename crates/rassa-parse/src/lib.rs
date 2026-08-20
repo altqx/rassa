@@ -955,8 +955,8 @@ pub fn parse_dialogue_text_with_wrap_style(
     while let Some(character) = characters.next() {
         match character {
             '{' => {
-                let remaining: String = characters.clone().collect();
-                if !remaining.contains('}') {
+                if !characters.clone().any(|next| next == '}') {
+                    let remaining: String = characters.clone().collect();
                     if block_has_libass_hard_override(&remaining) {
                         parsed.hard_override = true;
                     }
@@ -1930,8 +1930,10 @@ fn apply_override_block(
             continue;
         }
 
-        let previous = current_style.clone();
-        let previous_transforms = current_transforms.clone();
+        // A run snapshot is only observable when text is waiting to be flushed. Most override
+        // blocks precede their text, so avoid cloning the style and transform list for every tag.
+        let previous = (!buffer.is_empty()).then(|| current_style.clone());
+        let previous_transforms = (!buffer.is_empty()).then(|| current_transforms.clone());
         if let Some(rest) = tag.strip_prefix("fn") {
             current_style.font_name = parse_font_name_override(rest, &active_reset_style.font_name);
         } else if let Some(rest) = tag.strip_prefix("fe") {
@@ -1977,11 +1979,11 @@ fn apply_override_block(
                 }
                 flush_span_before_karaoke_tag(
                     buffer,
-                    &previous,
+                    previous.as_ref().unwrap_or(current_style),
                     pending_karaoke,
                     deferred_karaoke,
                     *drawing_scale,
-                    &previous_transforms,
+                    previous_transforms.as_deref().unwrap_or(current_transforms),
                     active_line,
                 );
                 *pending_karaoke = Some(ParsedKaraokeSpan {
@@ -2229,11 +2231,11 @@ fn apply_override_block(
         } else if let Some(rest) = tag.strip_prefix('p') {
             flush_span_for_run_break(
                 buffer,
-                &previous,
+                previous.as_ref().unwrap_or(current_style),
                 pending_karaoke,
                 deferred_karaoke,
                 *drawing_scale,
-                &previous_transforms,
+                previous_transforms.as_deref().unwrap_or(current_transforms),
                 active_line,
             );
             *drawing_scale = parse_override_i32_arg(rest).unwrap_or(0).max(0);
@@ -2249,14 +2251,19 @@ fn apply_override_block(
 
         suppress_transform_fields_for_override(tag, current_style, current_transforms);
 
-        if *current_style != previous || *current_transforms != previous_transforms {
+        if let Some(previous) = previous.as_ref()
+            && (*current_style != *previous
+                || previous_transforms
+                    .as_ref()
+                    .is_some_and(|transforms| *current_transforms != *transforms))
+        {
             flush_span_for_run_break(
                 buffer,
-                &previous,
+                previous,
                 pending_karaoke,
                 deferred_karaoke,
                 *drawing_scale,
-                &previous_transforms,
+                previous_transforms.as_deref().unwrap_or_default(),
                 active_line,
             );
         }
@@ -3462,38 +3469,40 @@ fn record_explicit_transform_tag(
     }
 }
 
-fn split_override_tags(block: &str) -> Vec<&str> {
-    let mut tags = Vec::new();
+fn split_override_tags(block: &str) -> impl Iterator<Item = &str> {
     let bytes = block.as_bytes();
     let mut cursor = 0;
 
-    while let Some(offset) = bytes[cursor..].iter().position(|byte| *byte == b'\\') {
-        let slash = cursor + offset;
-        let mut tag_start = slash + 1;
-        tag_start = skip_ass_tag_spaces(bytes, tag_start);
+    std::iter::from_fn(move || {
+        loop {
+            let offset = bytes
+                .get(cursor..)?
+                .iter()
+                .position(|byte| *byte == b'\\')?;
+            let slash = cursor + offset;
+            let mut tag_start = slash + 1;
+            tag_start = skip_ass_tag_spaces(bytes, tag_start);
 
-        let mut end = tag_start;
-        while end < bytes.len() && bytes[end] != b'(' && bytes[end] != b'\\' {
-            end += 1;
-        }
-        if end == tag_start {
+            let mut end = tag_start;
+            while end < bytes.len() && bytes[end] != b'(' && bytes[end] != b'\\' {
+                end += 1;
+            }
+            if end == tag_start {
+                cursor = end;
+                continue;
+            }
+
+            if end < bytes.len() && bytes[end] == b'(' {
+                end = consume_libass_parenthesized_tag(bytes, end);
+            }
+
+            let tag = trim_ass_tag(&block[tag_start..end]);
             cursor = end;
-            continue;
+            if !tag.is_empty() {
+                return Some(tag);
+            }
         }
-
-        if end < bytes.len() && bytes[end] == b'(' {
-            end = consume_libass_parenthesized_tag(bytes, end);
-        }
-
-        let tag = trim_ass_tag(&block[tag_start..end]);
-        if !tag.is_empty() {
-            tags.push(tag);
-        }
-
-        cursor = end;
-    }
-
-    tags
+    })
 }
 
 fn skip_ass_tag_spaces(bytes: &[u8], mut index: usize) -> usize {

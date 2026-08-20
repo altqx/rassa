@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rassa_core::{RassaError, RassaResult, Rect, ass};
 use rassa_fonts::{
     FontMatch, FontProvider, FontQuery, font_match_supports_text, resolve_system_font_for_char,
@@ -1259,15 +1261,20 @@ fn split_text_by_font<P: FontProvider>(
         weight: font_query_weight(weight),
     };
     let base_font = provider.resolve(&query);
+    // Populate coverage for the whole run with one font-file read. Cluster selection below then
+    // consults the character cache instead of reopening the same multi-megabyte font per glyph.
+    if base_font.path.is_some() {
+        let _ = font_match_supports_text(&base_font, text);
+    }
     let mut chunks: Vec<(String, FontMatch)> = Vec::new();
     let mut leading_ignorables = String::new();
 
     for grapheme in fallback_text_clusters(text) {
         if grapheme.chars().all(is_font_selection_ignorable) {
             if let Some((chunk, _)) = chunks.last_mut() {
-                chunk.push_str(&grapheme);
+                chunk.push_str(grapheme);
             } else {
-                leading_ignorables.push_str(&grapheme);
+                leading_ignorables.push_str(grapheme);
             }
             continue;
         }
@@ -1277,10 +1284,10 @@ fn split_text_by_font<P: FontProvider>(
             &base_font,
             selection_family,
             style.as_deref(),
-            &grapheme,
+            grapheme,
         );
         let mut cluster = std::mem::take(&mut leading_ignorables);
-        cluster.push_str(&grapheme);
+        cluster.push_str(grapheme);
 
         if let Some((chunk, chunk_font)) = chunks.last_mut()
             && same_font_match(chunk_font, &font)
@@ -1305,25 +1312,28 @@ fn font_selection_family(family: &str) -> &str {
     family.strip_prefix('@').unwrap_or(family)
 }
 
-fn fallback_text_clusters(text: &str) -> Vec<String> {
-    let mut clusters: Vec<String> = Vec::new();
-    for grapheme in text.graphemes(true) {
+fn fallback_text_clusters(text: &str) -> Vec<&str> {
+    let mut ranges = Vec::new();
+    let mut cluster_start = None;
+    let mut cluster_end = 0;
+    for (offset, grapheme) in text.grapheme_indices(true) {
         let joins_previous = grapheme.chars().next().is_some_and(is_shaping_control);
-        let joins_next = clusters
-            .last()
-            .and_then(|cluster| cluster.chars().next_back())
+        let joins_next = cluster_start
+            .map(|start| &text[start..cluster_end])
+            .and_then(|cluster: &str| cluster.chars().next_back())
             .is_some_and(is_shaping_control);
-        if joins_previous || joins_next {
-            if let Some(cluster) = clusters.last_mut() {
-                cluster.push_str(grapheme);
-            } else {
-                clusters.push(grapheme.to_owned());
-            }
-        } else {
-            clusters.push(grapheme.to_owned());
+        if cluster_start.is_some() && !(joins_previous || joins_next) {
+            ranges.push(cluster_start.expect("cluster start checked")..cluster_end);
+            cluster_start = Some(offset);
+        } else if cluster_start.is_none() {
+            cluster_start = Some(offset);
         }
+        cluster_end = offset + grapheme.len();
     }
-    clusters
+    if let Some(cluster_start) = cluster_start {
+        ranges.push(cluster_start..cluster_end);
+    }
+    ranges.into_iter().map(|range| &text[range]).collect()
 }
 
 fn is_shaping_control(character: char) -> bool {
@@ -1338,22 +1348,29 @@ fn resolve_font_for_cluster<P: FontProvider>(
     style: Option<&str>,
     cluster: &str,
 ) -> FontMatch {
-    let required = cluster
-        .chars()
-        .filter(|character| {
-            !character.is_whitespace()
-                && !character.is_control()
-                && !is_font_selection_ignorable(*character)
-        })
-        .collect::<String>();
+    let is_required = |character: char| {
+        !character.is_whitespace()
+            && !character.is_control()
+            && !is_font_selection_ignorable(character)
+    };
+    let required = if cluster.chars().all(is_required) {
+        Cow::Borrowed(cluster)
+    } else {
+        Cow::Owned(
+            cluster
+                .chars()
+                .filter(|character| is_required(*character))
+                .collect(),
+        )
+    };
     if base_font.path.is_none()
         || required.is_empty()
-        || font_match_supports_text(base_font, &required)
+        || font_match_supports_text(base_font, required.as_ref())
     {
         return base_font.clone();
     }
 
-    let local = provider.resolve_for_text(query, &required);
+    let local = provider.resolve_for_text(query, required.as_ref());
     if local.path.is_some() {
         return local;
     }
@@ -1377,7 +1394,7 @@ fn resolve_font_for_cluster<P: FontProvider>(
         if first_fallback.is_none() {
             first_fallback = Some(candidate.clone());
         }
-        if font_match_supports_text(&candidate, &required) {
+        if font_match_supports_text(&candidate, required.as_ref()) {
             return candidate;
         }
     }
